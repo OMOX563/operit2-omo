@@ -225,6 +225,13 @@ final class AppleRuntimeChannel: NSObject, UIDocumentInteractionControllerDelega
     UIDevice.current.isBatteryMonitoringEnabled = true
     hostEventObservers.append(
       NotificationCenter.default.addObserver(
+        forName: UIApplication.didBecomeActiveNotification,
+        object: nil,
+        queue: .main
+      ) { [weak self] _ in self?.emitIosBatteryState() }
+    )
+    hostEventObservers.append(
+      NotificationCenter.default.addObserver(
         forName: UIDevice.batteryLevelDidChangeNotification,
         object: nil,
         queue: nil
@@ -383,7 +390,7 @@ final class AppleRuntimeChannel: NSObject, UIDocumentInteractionControllerDelega
       data: [
         "connected": path.status == .satisfied,
         "networkType": networkType,
-        "metered": path.isExpensive,
+        "metered": path.isExpensive || path.isConstrained,
         "interfaceName": interfaceName ?? NSNull(),
       ]
     )
@@ -505,12 +512,19 @@ final class AppleRuntimeChannel: NSObject, UIDocumentInteractionControllerDelega
     let currentWithSuffix = current.appendingPathComponent("Library") as NSString
     guard let currentMatch = regex.firstMatch(in: currentWithSuffix as String,
       range: NSRange(location: 0, length: currentWithSuffix.length)) else { return response }
+    // /var and /private/var name the same iOS filesystem. Compare their
+    // container parents canonically even when an old container no longer exists.
+    func containerParent(_ path: NSString, _ match: NSTextCheckingResult) -> String {
+      let parent = path.substring(with: match.range(at: 1))
+      return parent.hasPrefix("/private/var/") ? String(parent.dropFirst("/private".count)) : parent
+    }
+    let currentParent = containerParent(currentWithSuffix, currentMatch)
     var changed = false
     for key in ["runtimeRoot", "workspaceRoot"] {
       guard let oldPath = config[key] as? String else { continue }
       let old = oldPath as NSString
       guard let match = regex.firstMatch(in: oldPath, range: NSRange(location: 0, length: old.length)),
-            old.substring(with: match.range(at: 1)) == currentWithSuffix.substring(with: currentMatch.range(at: 1))
+            containerParent(old, match) == currentParent
       else { continue }
       let suffix = old.substring(with: match.range(at: 2))
       guard !suffix.components(separatedBy: "/").contains("..") else { continue }

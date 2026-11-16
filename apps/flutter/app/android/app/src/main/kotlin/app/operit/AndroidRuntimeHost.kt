@@ -36,7 +36,7 @@ class AndroidRuntimeHost(context: Context) {
     private var runtimeStartupMessage = "正在准备本地运行时"
 
     private val documentFileSystem by lazy { AndroidDocumentFileSystem(applicationContext) }
-    private val terminalPrivileges by lazy { AndroidTerminalPrivileges(applicationContext) }
+    private val terminalPrivileges by lazy { AndroidTerminalPrivileges.shared(applicationContext) }
 
     /** Serves native terminal privilege probes and remote PTY lifecycle operations. */
     fun terminalPrivilegeOperation(request: String): String = terminalPrivileges.execute(request)
@@ -107,6 +107,7 @@ class AndroidRuntimeHost(context: Context) {
 
     /** Serializes native creation without blocking main-thread storage and lifecycle callbacks. */
     fun ensureRuntimeHandle(): Long {
+        check(!BuildConfig.OPERIT_EXTERNAL_RUNTIME) { "The module UI does not own an application Core" }
         synchronized(runtimeLock) {
             if (runtimeHandle != 0L) {
                 return runtimeHandle
@@ -143,6 +144,7 @@ class AndroidRuntimeHost(context: Context) {
                 val createdHandle = OperitRuntimeNative.create(
                     paths.runtimeRoot.absolutePath,
                     paths.workspaceRoot.absolutePath,
+                    defaultRuntimeRootPath(),
                     Build.MODEL,
                     this,
                 )

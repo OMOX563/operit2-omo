@@ -25,6 +25,8 @@ pub enum JsToolFacade {
     Promise,
     AsyncIterator,
     TerminalCallback,
+    TerminalRun,
+    TerminalWait,
     Storage,
 }
 
@@ -45,7 +47,7 @@ pub struct JsToolParameterRules {
 pub const JS_TOOL_PARAMETER_RULES: JsToolParameterRules = JsToolParameterRules {
     flatten_arguments: &["options", "params", "updates"],
     scalar_union_suffixes: &["OrOptions", "OrParams"],
-    preserve_object_namespaces: &["Net", "Media"],
+    preserve_object_namespaces: &["Net", "Media", "UI"],
     argument_names: &[
         ("Chat", "cancel", "chatId", "chatId"),
         ("Files", "writeBinary", "base64Content", "base64Content"),
@@ -76,6 +78,15 @@ pub struct JsToolApiVariant {
 /// Contains every active JavaScript Tools method binding.
 #[rustfmt::skip]
 pub const JS_TOOL_BINDINGS: &[JsToolBinding] = &[
+    JsToolBinding { namespace: "UI", method: "listWindows", target: BuiltinToolName::ListWindows, strict_arguments: false, facade: JsToolFacade::Promise, fixed_parameters: &[] },
+    JsToolBinding { namespace: "UI", method: "focusWindow", target: BuiltinToolName::FocusWindow, strict_arguments: false, facade: JsToolFacade::Promise, fixed_parameters: &[] },
+    JsToolBinding { namespace: "UI", method: "getPageInfo", target: BuiltinToolName::GetPageInfo, strict_arguments: false, facade: JsToolFacade::Promise, fixed_parameters: &[] },
+    JsToolBinding { namespace: "UI", method: "tap", target: BuiltinToolName::Tap, strict_arguments: false, facade: JsToolFacade::Promise, fixed_parameters: &[] },
+    JsToolBinding { namespace: "UI", method: "longPress", target: BuiltinToolName::LongPress, strict_arguments: false, facade: JsToolFacade::Promise, fixed_parameters: &[] },
+    JsToolBinding { namespace: "UI", method: "clickElement", target: BuiltinToolName::ClickElement, strict_arguments: false, facade: JsToolFacade::Promise, fixed_parameters: &[] },
+    JsToolBinding { namespace: "UI", method: "setText", target: BuiltinToolName::SetInputText, strict_arguments: false, facade: JsToolFacade::Promise, fixed_parameters: &[] },
+    JsToolBinding { namespace: "UI", method: "pressKey", target: BuiltinToolName::PressKey, strict_arguments: false, facade: JsToolFacade::Promise, fixed_parameters: &[] },
+    JsToolBinding { namespace: "UI", method: "swipe", target: BuiltinToolName::Swipe, strict_arguments: false, facade: JsToolFacade::Promise, fixed_parameters: &[] },
     JsToolBinding { namespace: "Net", method: "webSocket", target: BuiltinToolName::WebSocket, strict_arguments: true, facade: JsToolFacade::Promise, fixed_parameters: &[] },
     JsToolBinding { namespace: "Chat", method: "agentStatus", target: BuiltinToolName::AgentStatus, strict_arguments: false, facade: JsToolFacade::Promise, fixed_parameters: &[] },
     JsToolBinding { namespace: "Chat", method: "createNew", target: BuiltinToolName::CreateNewChat, strict_arguments: false, facade: JsToolFacade::Promise, fixed_parameters: &[] },
@@ -198,6 +209,8 @@ pub const JS_TOOL_BINDINGS: &[JsToolBinding] = &[
     JsToolBinding { namespace: "System.terminal", method: "exec", target: BuiltinToolName::ExecuteInTerminalSession, strict_arguments: false, facade: JsToolFacade::Promise, fixed_parameters: &[] },
     JsToolBinding { namespace: "System.terminal", method: "execStreaming", target: BuiltinToolName::TerminalObserve, strict_arguments: false, facade: JsToolFacade::TerminalCallback, fixed_parameters: &[] },
     JsToolBinding { namespace: "System.terminal", method: "execStream", target: BuiltinToolName::TerminalObserve, strict_arguments: false, facade: JsToolFacade::AsyncIterator, fixed_parameters: &[] },
+    JsToolBinding { namespace: "System.terminal", method: "run", target: BuiltinToolName::TerminalObserve, strict_arguments: true, facade: JsToolFacade::TerminalRun, fixed_parameters: &[] },
+    JsToolBinding { namespace: "System.terminal", method: "wait", target: BuiltinToolName::TerminalObserve, strict_arguments: true, facade: JsToolFacade::TerminalWait, fixed_parameters: &[] },
     JsToolBinding { namespace: "System.terminal", method: "hiddenExec", target: BuiltinToolName::ExecuteHiddenTerminalCommand, strict_arguments: false, facade: JsToolFacade::Promise, fixed_parameters: &[] },
     JsToolBinding { namespace: "System.terminal", method: "info", target: BuiltinToolName::GetTerminalInfo, strict_arguments: false, facade: JsToolFacade::Promise, fixed_parameters: &[] },
     JsToolBinding { namespace: "System.terminal", method: "input", target: BuiltinToolName::InputInTerminalSession, strict_arguments: false, facade: JsToolFacade::Promise, fixed_parameters: &[] },

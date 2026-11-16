@@ -44,7 +44,7 @@ use operit_tools::tools::ToolPermissionSystem::AiPermissionMode;
 use operit_util::stream::TextStreamRevisionTracker::TextStreamRevisionTracker;
 use operit_util::AppLogger::AppLogger;
 use operit_util::GithubReleaseUtil::{
-    FullUpdateProgressEvent, FullUpdateStage, FullUpdateTarget, ReleaseInfo,
+    FullUpdateProgressEvent, FullUpdateStage, ReleaseInfo,
 };
 use operit_util::MarkdownRenderStream::MarkdownStreamEvent;
 
@@ -74,7 +74,7 @@ use crate::cli::network_control_ui::{
 };
 use crate::cli::CliInstallProgress;
 use crate::tui::NetworkUiEvent;
-use crate::{build_attachment_info, parse_shell_args, ChatSendArgs, ShellArgs};
+use crate::{parse_shell_args, ChatSendArgs, ShellArgs};
 use operit_store::NetworkControlStore::{NetworkControlIdentityAssignment, NetworkControlRole};
 
 const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(16);
@@ -965,7 +965,7 @@ pub(super) enum FullUpdateDownloadState {
         speed_bytes_per_sec: u64,
     },
     Complete {
-        package_path: PathBuf,
+        package_path: String,
         install_status: Option<crate::cli::DownloadedUpdateInstallStatus>,
     },
     Error {
@@ -979,7 +979,7 @@ pub(super) enum FullUpdateDownloadState {
 #[derive(Debug, Clone)]
 pub(super) enum FullUpdateDownloadMessage {
     Progress(FullUpdateProgressEvent),
-    Complete(Result<(PathBuf, Option<crate::cli::DownloadedUpdateInstallStatus>), String>),
+    Complete(Result<(String, Option<crate::cli::DownloadedUpdateInstallStatus>), String>),
 }
 
 #[derive(Clone, Debug)]
@@ -1060,6 +1060,7 @@ impl OperitTui {
                     currentChatId: active_chat_id.clone(),
                     currentChatTitle: String::new(),
                     currentWorkspacePath: None,
+                    currentFileDirectory: None,
                     isLoading: false,
                     inputProcessingState: InputProcessingState::Error {
                         message: route_permission_error
@@ -2410,8 +2411,16 @@ impl OperitTui {
         Ok(())
     }
 
+    /// Downloads through shared Host streaming and keeps the completed package as a VFS path.
     fn start_full_update_download(&mut self) -> Result<(), String> {
         let text = self.text();
+        let context = self
+            .core
+            .application()
+            .generatedClientMut()
+            .0
+            .hostManager()
+            .clone();
         let Some(prompt) = self.startup_update_prompt.as_mut() else {
             return Ok(());
         };
@@ -2419,10 +2428,9 @@ impl OperitTui {
             return Ok(());
         };
         let (tx, rx) = mpsc::channel::<FullUpdateDownloadMessage>();
-        let package_url = release_info.downloadUrl.clone();
-        let package_file_name = release_info.assetName.clone();
-        let update_target = FullUpdateTarget::cliForCurrentHost()?;
-        let work_dir = std::env::temp_dir().join("operit2").join("full_update");
+        let release_info = release_info.clone();
+        let update_target = crate::cli::host_ops::cli_update_target()?;
+        let current_asset = update_target.assetNameForVersion(env!("CARGO_PKG_VERSION"))?;
         prompt.progress_rx = Some(rx);
         prompt.download_state = FullUpdateDownloadState::Downloading {
             stage: FullUpdateStage::DownloadingPackage,
@@ -2434,19 +2442,23 @@ impl OperitTui {
         self.status_message = text.downloading_full_update_package().to_string();
         tokio::spawn(async move {
             let progress_tx = tx.clone();
-            let result = operit_util::GithubReleaseUtil::GithubReleaseUtil::downloadAndPrepareFullUpdateWithProgress(
-                package_url,
-                package_file_name,
-                work_dir,
+            let result = operit_util::IncrementalUpdate::prepareUpdate(
+                release_info,
+                current_asset,
+                &context,
+                operit_host_api::HttpDownloadControl::new(),
                 move |event| {
                     let _ = progress_tx.send(FullUpdateDownloadMessage::Progress(event));
                 },
             )
             .await
-            .and_then(|package_path| {
+            .and_then(|storage_path| {
+                let package_path = operit_vfs::VisualFileSystem::VisualFileSystem::runtimePath(&storage_path)?;
+                let vfs = (&context).vfs()?;
+                let source = vfs.file(&package_path)?;
                 crate::cli::install_downloaded_cli_update(
                     &update_target,
-                    &package_path,
+                    &source,
                     crate::cli::InstallOutput::Silent,
                 )
                 .map(|status| (package_path, Some(status)))
@@ -2600,7 +2612,7 @@ impl OperitTui {
                 .map_err(|error| error.to_string())?;
         }
         let chat_id = self.current_chat_id()?;
-        let mut attachments = build_attachments(&send_args.attachmentPaths)?;
+        let mut attachments = build_attachments(&mut self.core, &chat_id, &send_args.attachmentPaths).await?;
         attachments.extend(inline_attachments);
         let reply_to_message = match send_args.replyToTimestamp {
             Some(timestamp) => Some(
@@ -3449,6 +3461,10 @@ impl OperitTui {
         let return_to_hub = modal.returnToHub;
         let transports = plan.transports.clone();
         let config = PeerHostConfig {
+            discovery: match self.networkControl.localHostConfig() {
+                Ok(config) => config.and_then(|config| config.discovery),
+                Err(error) => { self.set_listener_error(error); return; }
+            },
             bindAddress: plan.bindAddress.clone(),
             transports: transports.clone(),
             discoveryEnabled: plan.discoveryEnabled,
@@ -3463,7 +3479,7 @@ impl OperitTui {
             self.set_listener_error(error);
             return;
         }
-        if !transports.is_empty() {
+        if !transports.is_empty() || config.discovery.is_some() {
             if let Err(error) = self.networkControl.startListening(transports.clone()).await {
                 self.set_listener_error(error);
                 return;
@@ -7562,11 +7578,19 @@ fn chat_histories_to_list(chat_histories: Vec<ChatHistory>) -> Vec<ChatListItem>
         .collect()
 }
 
-fn build_attachments(paths: &[String]) -> Result<Vec<AttachmentInfo>, String> {
-    paths
-        .iter()
-        .map(|path| build_attachment_info(path))
-        .collect()
+async fn build_attachments(
+    core: &mut TuiCore, chat_id: &str, paths: &[String],
+) -> Result<Vec<AttachmentInfo>, String> {
+    let mut attachments = Vec::with_capacity(paths.len());
+    for path in paths {
+        let source = std::fs::canonicalize(path)
+            .map_err(|error| format!("Attachment source is unavailable: {path}: {error}"))?;
+        let attachment = core.services_attachment_transfer_manager()
+            .importNativeAttachment(chat_id.to_string(), source.to_string_lossy().into_owned())
+            .await.map_err(|error| error.to_string())?;
+        attachments.push(attachment);
+    }
+    Ok(attachments)
 }
 
 fn strip_attachment_tokens(
@@ -7998,6 +8022,7 @@ mod tests {
                 platform: "linux".to_string(),
                 model: String::new(),
                 coreVersion: None,
+                protocolVersion: None,
                 online,
                 relayHops: None,
                 relayPath: None,
@@ -8339,6 +8364,7 @@ mod tests {
             platform: "linux".to_string(),
             model: String::new(),
             coreVersion: None,
+            protocolVersion: None,
             online,
             relayHops: None,
             relayPath: None,

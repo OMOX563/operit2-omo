@@ -26,6 +26,7 @@ import '../../theme/OperitTheme.dart';
 import '../../window/DetachedChatWindowLauncher.dart';
 import '../../window/OperitWindowPlatform.dart';
 import 'CollapsedDrawerContent.dart';
+import 'ChatHistoryTree.dart';
 import '../../common/components/M3LoadingIndicator.dart';
 import 'DrawerContentDialogs.dart';
 import 'NavigationDrawerAppearance.dart';
@@ -33,6 +34,7 @@ import 'SidebarMoreMenu.dart';
 import 'SidebarChatCreation.dart';
 
 part 'DrawerContentGroups.dart';
+part 'DrawerContentDesktop.dart';
 
 enum _WorkspaceBindingChoice { existing, folder, create }
 
@@ -52,6 +54,7 @@ class DrawerContent extends StatefulWidget {
     required this.onNavigationEntrySelected,
     required this.onConversationActivated,
     this.onCollapseSidebar,
+    this.conversationsOnly = false,
     this.bridge = const ProxyCoreRuntimeBridge(),
   });
 
@@ -69,6 +72,9 @@ class DrawerContent extends StatefulWidget {
   final VoidCallback? onCollapseSidebar;
   final OperitRuntimeBridge bridge;
 
+  /// Hides global navigation when hosted beside the fixed desktop rail.
+  final bool conversationsOnly;
+
   /// Creates the native workspace consumer and real registered-tab surface.
   @override
   State<DrawerContent> createState() => _DrawerContentState();
@@ -83,9 +89,12 @@ class _DrawerContentState extends State<DrawerContent> {
     _rememberedCollapsedWorkspaces,
   );
   final Set<String> _expandedWorkspaces = <String>{};
+  final Set<String> _expandedChatBranches = <String>{};
   final Set<String> _collapsedGroups = <String>{};
   Set<SidebarDirectory> _pinnedDirectories = const <SidebarDirectory>{};
   bool _searchExpanded = false;
+  bool _recentHistoryCollapsed = false;
+  bool _recentHistoryExpanded = false;
   String? _errorMessage;
   bool _groupMutationPending = false;
   List<core_proxy.Workspace> _workspaces = const <core_proxy.Workspace>[];
@@ -108,6 +117,7 @@ class _DrawerContentState extends State<DrawerContent> {
   @override
   void initState() {
     super.initState();
+    if (widget.conversationsOnly) _collapsedWorkspaces.clear();
     _searchController.addListener(_onSearchChanged);
     unawaited(_loadWorkspaces());
     _workspacesSubscription = _clients.repositoryWorkspacePreferenceStore
@@ -142,6 +152,15 @@ class _DrawerContentState extends State<DrawerContent> {
   void didUpdateWidget(covariant DrawerContent oldWidget) {
     super.didUpdateWidget(oldWidget);
     if (oldWidget.errorMessage != widget.errorMessage) _errorMessage = null;
+    if (oldWidget.conversationsOnly != widget.conversationsOnly) {
+      _collapsedWorkspaces
+        ..clear()
+        ..addAll(
+          widget.conversationsOnly
+              ? const <String>{}
+              : _rememberedCollapsedWorkspaces,
+        );
+    }
     if (_workspaceMembershipFingerprint(oldWidget.histories) !=
         _workspaceMembershipFingerprint(widget.histories)) {
       unawaited(_loadWorkspaces());
@@ -185,11 +204,20 @@ class _DrawerContentState extends State<DrawerContent> {
   }
 
   /// Rebuilds the native workspace projection when the search query changes.
-  void _onSearchChanged() => setState(() {});
+  void _onSearchChanged() {
+    if (widget.conversationsOnly && _historyScrollController.hasClients) {
+      _historyScrollController.jumpTo(0);
+    }
+    setState(() {});
+  }
 
   /// Toggles only the native search control, not plugin registration parameters.
-  void _toggleSearchExpanded() =>
-      setState(() => _searchExpanded = !_searchExpanded);
+  void _toggleSearchExpanded() {
+    if (widget.conversationsOnly && _searchExpanded) {
+      _searchController.clear();
+    }
+    setState(() => _searchExpanded = !_searchExpanded);
+  }
 
   Future<void> _showBindWorkspaceDialog(
     core_proxy.ChatHistoryListItem history,
@@ -489,7 +517,10 @@ class _DrawerContentState extends State<DrawerContent> {
     if (workspaceId == null || _groupMutationPending) return;
     final confirmed = await showDialog<bool>(
       context: context,
-      builder: (context) => DeleteWorkspaceDialog(name: section.label),
+      builder: (context) => DeleteWorkspaceDialog(
+        name: section.label,
+        recordMissing: !section.canCreate,
+      ),
     );
     if (!mounted || confirmed != true) return;
     await _runGroupMutation(() async {
@@ -642,7 +673,7 @@ class _DrawerContentState extends State<DrawerContent> {
   String _workspaceLabel(core_proxy.ChatHistoryListItem history) {
     final id = history.workspaceId?.trim();
     if (id == null || id.isEmpty) {
-      return '未绑定项目';
+      return '未关联项目';
     }
     final name = history.workspaceName?.trim();
     if (name == null || name.isEmpty) {
@@ -672,17 +703,26 @@ class _DrawerContentState extends State<DrawerContent> {
           .add(history);
     }
 
+    // Retain matching descendants' ancestors before splitting chats into groups.
+    final matchingIds = <String>{};
+    for (final histories in historiesByWorkspace.values) {
+      matchingIds.addAll(
+        ChatHistoryTree(
+          histories,
+        ).matching((history) => !filter || _matchesHistory(history, query)),
+      );
+    }
     final sections = <_WorkspaceSection>[];
     final unbound =
         historiesByWorkspace[null] ?? const <core_proxy.ChatHistoryListItem>[];
-    if (unbound.any((history) => !filter || _matchesHistory(history, query))) {
+    if (unbound.any((history) => matchingIds.contains(history.id))) {
       final section = _WorkspaceSection(
         key: 'workspace:unbound',
-        label: '未绑定项目',
+        label: '未关联项目',
         canCreate: true,
       );
       section.histories.addAll(
-        unbound.where((history) => !filter || _matchesHistory(history, query)),
+        unbound.where((history) => matchingIds.contains(history.id)),
       );
       sections.add(section);
     }
@@ -704,7 +744,7 @@ class _DrawerContentState extends State<DrawerContent> {
           );
       final visibleHistories = workspaceMatches
           ? histories
-          : histories.where((history) => _matchesHistory(history, query));
+          : histories.where((history) => matchingIds.contains(history.id));
       if (!workspaceMatches && visibleHistories.isEmpty) continue;
       final section = _WorkspaceSection(
         key: 'workspace:$workspaceId',
@@ -725,7 +765,7 @@ class _DrawerContentState extends State<DrawerContent> {
         continue;
       }
       final visibleHistories = entry.value.where(
-        (history) => !filter || _matchesHistory(history, query),
+        (history) => matchingIds.contains(history.id),
       );
       if (visibleHistories.isEmpty) continue;
       final first = entry.value.first;
@@ -758,14 +798,24 @@ class _DrawerContentState extends State<DrawerContent> {
   /// Remembers workspace expansion without retaining deleted domain grouping state.
   void _toggleWorkspace(String key) => setState(() {
     if (!_collapsedWorkspaces.remove(key)) _collapsedWorkspaces.add(key);
-    _rememberedCollapsedWorkspaces
-      ..clear()
-      ..addAll(_collapsedWorkspaces);
+    if (!widget.conversationsOnly) {
+      _rememberedCollapsedWorkspaces
+        ..clear()
+        ..addAll(_collapsedWorkspaces);
+    }
   });
 
   /// Expands the native preview independently of its workspace header collapse state.
   void _togglePreview(String key) => setState(() {
     if (!_expandedWorkspaces.remove(key)) _expandedWorkspaces.add(key);
+  });
+
+  void _toggleRecentHistory() => setState(() {
+    _recentHistoryCollapsed = !_recentHistoryCollapsed;
+  });
+
+  void _toggleRecentPreview() => setState(() {
+    _recentHistoryExpanded = !_recentHistoryExpanded;
   });
 
   /// Limits native reordering to conversations within the same workspace.
@@ -832,45 +882,75 @@ class _DrawerContentState extends State<DrawerContent> {
       ScreenRouteRegistry.routeIdOf(ScreenRouteRegistry.aiChat);
 
   /// Builds a native row with the original pin, lock, title, delete and detached-window actions.
-  Widget _historyRow(core_proxy.ChatHistoryListItem history) =>
-      ConversationDrawerItem(
-        key: ValueKey('workspace-chat:${history.id}'),
-        history: history,
+  Widget _historyRow(
+    core_proxy.ChatHistoryListItem history, {
+    bool recent = false,
+    int childCount = 0,
+    bool childrenExpanded = false,
+  }) => ConversationDrawerItem(
+    key: ValueKey('${recent ? 'recent' : 'workspace'}-chat:${history.id}'),
+    history: history,
+    title: history.title,
+    selected: _isChatRouteSelected && widget.currentChatId == history.id,
+    isRunning: widget.activeStreamingChatIds.contains(history.id),
+    appearance: widget.appearance,
+    nested: false,
+    childToggle: childCount == 0
+        ? null
+        : Tooltip(
+            message: childrenExpanded ? '收起子会话' : '展开子会话（$childCount）',
+            child: SizedBox(
+              width: 20,
+              height: 20,
+              child: InkWell(
+                key: ValueKey('chat-children:${history.id}'),
+                borderRadius: BorderRadius.circular(6),
+                onTap: () => setState(() {
+                  if (!_expandedChatBranches.remove(history.id)) {
+                    _expandedChatBranches.add(history.id);
+                  }
+                }),
+                child: Icon(
+                  childrenExpanded
+                      ? Icons.keyboard_arrow_up
+                      : Icons.keyboard_arrow_down,
+                  size: 16,
+                  color: widget.appearance.itemColor.withValues(alpha: 0.78),
+                ),
+              ),
+            ),
+          ),
+    workspaceStyle: true,
+    onClick: () => unawaited(_switchConversation(history)),
+    onSearchMessages: () => unawaited(_openMessageLookup(history)),
+    onViewFavorites: () =>
+        unawaited(_openMessageLookup(history, favoritesOnly: true)),
+    onRename: () => unawaited(_showRenameConversationDialog(history)),
+    onBindWorkspace: () => unawaited(_showBindWorkspaceDialog(history)),
+    onTogglePinned: () => unawaited(_updateConversationPinned(history)),
+    onToggleLocked: () => unawaited(_updateConversationLocked(history)),
+    onDelete: () => unawaited(_deleteConversation(history)),
+    onSwipeDelete: () => unawaited(_showDeleteConversationDialog(history)),
+    onLongPress: () => unawaited(_showConversationActionDialog(history)),
+    canDetach: operitSupportsDesktopMultiWindow,
+    onDetach: () => unawaited(
+      DetachedChatWindowLauncher.openChat(
+        chatId: history.id,
         title: history.title,
-        selected: _isChatRouteSelected && widget.currentChatId == history.id,
-        isRunning: widget.activeStreamingChatIds.contains(history.id),
-        appearance: widget.appearance,
-        nested: true,
-        workspaceStyle: true,
-        onClick: () => unawaited(_switchConversation(history)),
-        onSearchMessages: () => unawaited(_openMessageLookup(history)),
-        onViewFavorites: () =>
-            unawaited(_openMessageLookup(history, favoritesOnly: true)),
-        onRename: () => unawaited(_showRenameConversationDialog(history)),
-        onBindWorkspace: () => unawaited(_showBindWorkspaceDialog(history)),
-        onTogglePinned: () => unawaited(_updateConversationPinned(history)),
-        onToggleLocked: () => unawaited(_updateConversationLocked(history)),
-        onDelete: () => unawaited(_deleteConversation(history)),
-        onSwipeDelete: () => unawaited(_showDeleteConversationDialog(history)),
-        onLongPress: () => unawaited(_showConversationActionDialog(history)),
-        canDetach: operitSupportsDesktopMultiWindow,
-        onDetach: () => unawaited(
-          DetachedChatWindowLauncher.openChat(
-            chatId: history.id,
-            title: history.title,
-            themePreferenceSnapshot: OperitTheme.of(
-              context,
-            ).themePreferenceSnapshot,
-          ).catchError((Object error, StackTrace stackTrace) {
-            if (mounted) setState(() => _errorMessage = error.toString());
-          }),
-        ),
-        onMoveTo: (moved) => unawaited(
-          _runGroupMutation(() => _moveConversationTo(moved, history)),
-        ),
-        canAcceptDrop: (moved) =>
-            _workspaceKey(moved) == _workspaceKey(history),
-      );
+        themePreferenceSnapshot: OperitTheme.of(
+          context,
+        ).themePreferenceSnapshot,
+      ).catchError((Object error, StackTrace stackTrace) {
+        if (mounted) setState(() => _errorMessage = error.toString());
+      }),
+    ),
+    onMoveTo: (moved) {
+      if (recent) return;
+      unawaited(_runGroupMutation(() => _moveConversationTo(moved, history)));
+    },
+    canAcceptDrop: (moved) =>
+        !recent && _workspaceKey(moved) == _workspaceKey(history),
+  );
 
   Widget _sidebarHeader(Widget tabs) {
     final onCollapse = widget.onCollapseSidebar;
@@ -890,7 +970,7 @@ class _DrawerContentState extends State<DrawerContent> {
           if (onCollapse != null) ...<Widget>[
             const SizedBox(width: 4),
             IconButton(
-              tooltip: '收起侧边栏',
+              tooltip: widget.conversationsOnly ? '收起会话列表' : '收起侧边栏',
               onPressed: onCollapse,
               icon: Icon(
                 Icons.chevron_left,
@@ -915,7 +995,7 @@ class _DrawerContentState extends State<DrawerContent> {
 
   /// Adds plugin navigation to the native workspace's existing scrolling surface.
   List<Widget> _pluginNavigationSlivers() => <Widget>[
-    if (widget.pluginEntries.isNotEmpty)
+    if (!widget.conversationsOnly && widget.pluginEntries.isNotEmpty)
       SliverToBoxAdapter(child: _pluginNavigationContent()),
   ];
 
@@ -942,7 +1022,7 @@ class _DrawerContentState extends State<DrawerContent> {
     ],
   );
 
-  /// Renders collapsible groups and their flat conversation rows within a project.
+  /// Renders collapsible groups and their conversation lists within a project.
   Widget _workspaceHistory(_WorkspaceSection section, bool searching) {
     final groups = _nativeGroups(section);
     return Column(
@@ -950,11 +1030,16 @@ class _DrawerContentState extends State<DrawerContent> {
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
         for (final group in groups) ...<Widget>[
+          if (widget.conversationsOnly && group != groups.first)
+            const SizedBox(height: 4),
           _GroupSectionHeader(
             key: ValueKey('workspace-group:${group.key}'),
             group: group,
             pinned: _pinnedDirectories.contains(group.directory),
-            expanded: !_collapsedGroups.contains(group.key),
+            expanded:
+                searching && widget.conversationsOnly ||
+                !_collapsedGroups.contains(group.key),
+            compact: widget.conversationsOnly,
             appearance: widget.appearance,
             canCreate: section.canCreate,
             onToggleExpanded: () => setState(() {
@@ -978,34 +1063,87 @@ class _DrawerContentState extends State<DrawerContent> {
               _runGroupMutation(() => _moveWorkspaceGroup(chat, group.name)),
             ),
           ),
-          if (!_collapsedGroups.contains(group.key)) ...<Widget>[
-            for (final chat
-                in searching || _expandedWorkspaces.contains(group.key)
-                    ? group.histories
-                    : _groupPreview(group.histories))
-              _historyRow(chat),
-            if (!searching &&
-                _groupPreview(group.histories).length < group.histories.length)
-              _HistoryLimitButton(
-                key: ValueKey('history-limit:${group.key}'),
-                icon: _expandedWorkspaces.contains(group.key)
-                    ? Icons.expand_less
-                    : Icons.expand_more,
-                label: _expandedWorkspaces.contains(group.key)
-                    ? '收起'
-                    : '展开更多 ${group.histories.length - _groupPreview(group.histories).length}',
-                workspaceStyle: true,
-                appearance: widget.appearance,
-                onClick: () => _togglePreview(group.key),
-              ),
-          ],
+          if (searching && widget.conversationsOnly ||
+              !_collapsedGroups.contains(group.key))
+            _workspaceGroupHistory(group, searching),
         ],
       ],
     );
   }
 
+  Widget _workspaceGroupHistory(_NativeWorkspaceGroup group, bool searching) {
+    final tree = ChatHistoryTree(group.histories);
+    final retained = tree.matching(
+      (chat) =>
+          chat.pinned ||
+          chat.id == widget.currentChatId ||
+          widget.activeStreamingChatIds.contains(chat.id),
+    );
+    final preview = [
+      for (var i = 0; i < tree.roots.length; i++)
+        if (i < _previewLimit || retained.contains(tree.roots[i].id))
+          tree.roots[i],
+    ];
+    final expanded = _expandedWorkspaces.contains(group.key);
+
+    Iterable<Widget> branch(
+      core_proxy.ChatHistoryListItem chat,
+      int depth,
+    ) sync* {
+      final children = tree.children[chat.id]!;
+      final open = searching || _expandedChatBranches.contains(chat.id);
+      yield Padding(
+        padding: EdgeInsetsDirectional.only(
+          start: (widget.conversationsOnly ? 20.0 : 16.0) + depth * 16,
+        ),
+        child: _historyRow(
+          chat,
+          childCount: children.length,
+          childrenExpanded: open,
+        ),
+      );
+      if (open) {
+        for (final child in children) {
+          yield* branch(child, depth + 1);
+        }
+      }
+    }
+
+    final content = Column(
+      mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: <Widget>[
+        for (final chat in searching || expanded ? tree.roots : preview)
+          ...branch(chat, 0),
+        if (!searching && preview.length < tree.roots.length)
+          Padding(
+            padding: EdgeInsetsDirectional.only(
+              start: widget.conversationsOnly ? 20 : 0,
+            ),
+            child: _HistoryLimitButton(
+              key: ValueKey('history-limit:${group.key}'),
+              icon: expanded ? Icons.expand_less : Icons.expand_more,
+              label: expanded
+                  ? '收起'
+                  : '展开更多 ${tree.roots.length - preview.length}',
+              workspaceStyle: true,
+              flat: widget.conversationsOnly,
+              appearance: widget.appearance,
+              onClick: () => _togglePreview(group.key),
+            ),
+          ),
+      ],
+    );
+    return widget.conversationsOnly
+        ? _DesktopGroupBody(appearance: widget.appearance, child: content)
+        : content;
+  }
+
   /// Uses the original native sliver layout, with no plugin UI route or loading substitution.
   Widget _workspaceContent(BuildContext context, {Widget? tabs}) {
+    if (widget.conversationsOnly) {
+      return _desktopWorkspaceContent(context, tabs: tabs);
+    }
     final sections = _workspaceSections();
     final searching = _searchController.text.trim().isNotEmpty;
     final error = _errorMessage ?? widget.errorMessage;
@@ -1084,6 +1222,7 @@ class _DrawerContentState extends State<DrawerContent> {
                 child: _WorkspaceHeader(
                   key: ValueKey('workspace-header:${section.key}'),
                   label: section.label,
+                  unbound: section.workspaceId == null,
                   subtitle: section.subtitle,
                   pinned: _pinnedDirectories.contains(
                     SidebarDirectory.workspace(section.workspaceId),
@@ -1091,7 +1230,7 @@ class _DrawerContentState extends State<DrawerContent> {
                   expanded: !_collapsedWorkspaces.contains(section.key),
                   appearance: widget.appearance,
                   canCreate: section.canCreate,
-                  onDelete: section.workspaceId != null && section.canCreate
+                  onDelete: section.workspaceId != null
                       ? () => unawaited(_deleteWorkspace(section))
                       : null,
                   onToggleExpanded: () => _toggleWorkspace(section.key),
@@ -1159,7 +1298,8 @@ class _DrawerContentState extends State<DrawerContent> {
             workspaceBuilder: _workspaceContent,
             workspaceWithTabsBuilder: (context, tabs) =>
                 _workspaceContent(context, tabs: tabs),
-            pluginFooter: widget.pluginEntries.isEmpty
+            pluginFooter:
+                widget.conversationsOnly || widget.pluginEntries.isEmpty
                 ? null
                 : _pluginNavigationContent(),
             onActivateChat: _activateChat,
@@ -1168,48 +1308,49 @@ class _DrawerContentState extends State<DrawerContent> {
                 : null,
           ),
         ),
-        Padding(
-          padding: const EdgeInsets.fromLTRB(14, 8, 14, 16),
-          child: Row(
-            children: <Widget>[
-              Expanded(
-                child: BottomSidebarAction(
-                  icon: Icons.inventory_2_outlined,
-                  label: '包管理',
-                  appearance: widget.appearance,
-                  selected:
-                      widget.selectedRouteId ==
-                      ScreenRouteRegistry.routeIdOf(
-                        ScreenRouteRegistry.packageManager,
-                      ),
-                  onClick: () => _openNavigation('main.package_manager'),
+        if (!widget.conversationsOnly)
+          Padding(
+            padding: const EdgeInsets.fromLTRB(14, 8, 14, 16),
+            child: Row(
+              children: <Widget>[
+                Expanded(
+                  child: BottomSidebarAction(
+                    icon: Icons.inventory_2_outlined,
+                    label: '包管理',
+                    appearance: widget.appearance,
+                    selected:
+                        widget.selectedRouteId ==
+                        ScreenRouteRegistry.routeIdOf(
+                          ScreenRouteRegistry.packageManager,
+                        ),
+                    onClick: () => _openNavigation('main.package_manager'),
+                  ),
                 ),
-              ),
-              const SizedBox(width: 8),
-              Expanded(
-                child: BottomSidebarAction(
-                  icon: Icons.settings_outlined,
-                  label: '设置',
-                  appearance: widget.appearance,
-                  selected:
-                      widget.selectedRouteId ==
-                      ScreenRouteRegistry.routeIdOf(
-                        ScreenRouteRegistry.settings,
-                      ),
-                  onClick: () => _openNavigation('main.settings'),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: BottomSidebarAction(
+                    icon: Icons.settings_outlined,
+                    label: '设置',
+                    appearance: widget.appearance,
+                    selected:
+                        widget.selectedRouteId ==
+                        ScreenRouteRegistry.routeIdOf(
+                          ScreenRouteRegistry.settings,
+                        ),
+                    onClick: () => _openNavigation('main.settings'),
+                  ),
                 ),
-              ),
-              const SizedBox(width: 8),
-              Builder(
-                builder: (buttonContext) => _BottomThemeToggleButton(
-                  appearance: widget.appearance,
-                  darkThemeActive: theme.isDark(context),
-                  onToggle: () => theme.toggle(buttonContext),
+                const SizedBox(width: 8),
+                Builder(
+                  builder: (buttonContext) => _BottomThemeToggleButton(
+                    appearance: widget.appearance,
+                    darkThemeActive: theme.isDark(context),
+                    onToggle: () => theme.toggle(buttonContext),
+                  ),
                 ),
-              ),
-            ],
+              ],
+            ),
           ),
-        ),
       ],
     );
   }
@@ -1217,16 +1358,21 @@ class _DrawerContentState extends State<DrawerContent> {
 
 class _WorkspaceCreateBar extends StatelessWidget {
   const _WorkspaceCreateBar({required this.onCreateConversation});
-  final VoidCallback onCreateConversation;
+  final VoidCallback? onCreateConversation;
 
   @override
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
-    final contentColor = scheme.onPrimaryContainer;
+    final enabled = onCreateConversation != null;
+    final contentColor = enabled
+        ? scheme.onPrimaryContainer
+        : scheme.onSurface.withValues(alpha: 0.38);
     return SizedBox(
       height: 34,
       child: Material(
-        color: scheme.primaryContainer,
+        color: enabled
+            ? scheme.primaryContainer
+            : scheme.onSurface.withValues(alpha: 0.08),
         shape: const StadiumBorder(),
         clipBehavior: Clip.antiAlias,
         child: Row(
@@ -1296,6 +1442,8 @@ class _WorkspaceHeader extends StatelessWidget {
     super.key,
     required this.label,
     this.subtitle,
+    this.unbound = false,
+    this.flat = false,
     required this.pinned,
     required this.expanded,
     required this.appearance,
@@ -1309,6 +1457,8 @@ class _WorkspaceHeader extends StatelessWidget {
 
   final String label;
   final String? subtitle;
+  final bool unbound;
+  final bool flat;
   final bool pinned;
   final bool expanded;
   final NavigationDrawerAppearance appearance;
@@ -1334,59 +1484,47 @@ class _WorkspaceHeader extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) => Padding(
-    padding: const EdgeInsetsDirectional.only(
-      start: 18,
+    padding: EdgeInsetsDirectional.only(
+      start: flat ? 14 : 18,
       end: 12,
-      top: 8,
-      bottom: 4,
+      top: flat ? 0 : 8,
+      bottom: flat ? 0 : 4,
     ),
     child: InkWell(
       borderRadius: BorderRadius.circular(8),
       onTap: onToggleExpanded,
       child: Padding(
-        padding: const EdgeInsetsDirectional.fromSTEB(2, 3, 4, 3),
+        padding: EdgeInsetsDirectional.fromSTEB(
+          flat ? 8 : 2,
+          flat ? 4 : 3,
+          flat ? 6 : 4,
+          flat ? 4 : 3,
+        ),
         child: Row(
           children: <Widget>[
-            Container(
-              width: 3,
-              height: 17,
-              decoration: BoxDecoration(
-                color: appearance.statusAvailableColor.withValues(alpha: 0.62),
-                borderRadius: BorderRadius.circular(2),
+            if (!unbound && !flat) ...<Widget>[
+              Icon(
+                Icons.folder_outlined,
+                size: 15,
+                color: appearance.itemColor.withValues(alpha: 0.82),
               ),
-            ),
-            const SizedBox(width: 9),
-            Icon(
-              Icons.work_outline,
-              size: 15,
-              color: appearance.itemColor.withValues(alpha: 0.82),
-            ),
-            const SizedBox(width: 7),
+              const SizedBox(width: 7),
+            ],
             Expanded(
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: <Widget>[
-                  Text(
-                    label,
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: Theme.of(context).textTheme.labelLarge?.copyWith(
-                      color: appearance.titleColor,
-                      fontWeight: FontWeight.w700,
-                    ),
+              child: Tooltip(
+                message: subtitle?.trim().isNotEmpty == true
+                    ? subtitle!
+                    : label,
+                child: Text(
+                  label,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: Theme.of(context).textTheme.labelLarge?.copyWith(
+                    color: flat ? appearance.titleColor : appearance.itemColor,
+                    fontSize: flat ? 12.5 : null,
+                    fontWeight: FontWeight.w600,
                   ),
-                  if (subtitle != null && subtitle!.trim().isNotEmpty)
-                    Text(
-                      subtitle!,
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: Theme.of(context).textTheme.labelSmall?.copyWith(
-                        color: appearance.itemColor.withValues(alpha: 0.56),
-                        fontSize: 10,
-                      ),
-                    ),
-                ],
+                ),
               ),
             ),
             if (pinned) ...<Widget>[
@@ -1398,40 +1536,12 @@ class _WorkspaceHeader extends StatelessWidget {
               ),
             ],
             const SizedBox(width: 4),
-            SidebarMoreMenuButton<_WorkspaceQuickAction>(
-              compact: true,
-              tooltip: '项目操作',
-              color: appearance.itemColor.withValues(alpha: 0.78),
+            _WorkspaceActionsMenu(
+              appearance: appearance,
+              pinned: pinned,
+              canCreate: canCreate,
               onSelected: _select,
-              actions: <SidebarMenuAction<_WorkspaceQuickAction>>[
-                SidebarMenuAction(
-                  value: _WorkspaceQuickAction.createChat,
-                  icon: Icons.add_comment_outlined,
-                  label: '新建对话',
-                  enabled: canCreate,
-                ),
-                SidebarMenuAction(
-                  value: _WorkspaceQuickAction.createGroup,
-                  icon: Icons.create_new_folder_outlined,
-                  label: '新建分组',
-                  enabled: canCreate,
-                ),
-                SidebarMenuAction(
-                  value: _WorkspaceQuickAction.togglePinned,
-                  icon: pinned
-                      ? Icons.push_pin_outlined
-                      : Icons.push_pin_rounded,
-                  label: pinned ? '取消置顶' : '置顶',
-                ),
-                if (onDelete != null)
-                  const SidebarMenuAction(
-                    value: _WorkspaceQuickAction.delete,
-                    icon: Icons.delete_outline_rounded,
-                    label: '删除工作区',
-                    dividerBefore: true,
-                    danger: true,
-                  ),
-              ],
+              canDelete: onDelete != null,
             ),
             const SizedBox(width: 4),
             Icon(
@@ -1499,6 +1609,7 @@ class _HistoryLimitButton extends StatelessWidget {
     required this.icon,
     required this.label,
     required this.workspaceStyle,
+    this.flat = false,
     required this.appearance,
     required this.onClick,
   });
@@ -1506,15 +1617,49 @@ class _HistoryLimitButton extends StatelessWidget {
   final IconData icon;
   final String label;
   final bool workspaceStyle;
+  final bool flat;
   final NavigationDrawerAppearance appearance;
   final VoidCallback onClick;
 
   /// Renders the reversible preview toggle inline with its conversation group.
   @override
   Widget build(BuildContext context) {
+    if (flat) {
+      return Padding(
+        padding: const EdgeInsetsDirectional.only(start: 28.5, end: 12),
+        child: TextButton(
+          onPressed: onClick,
+          style: TextButton.styleFrom(
+            padding: EdgeInsets.zero,
+            alignment: AlignmentDirectional.centerStart,
+            minimumSize: const Size(0, 26),
+            tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+            foregroundColor: appearance.itemColor.withValues(alpha: 0.6),
+            textStyle: Theme.of(context).textTheme.labelSmall?.copyWith(
+              fontSize: 11,
+              fontWeight: FontWeight.w400,
+            ),
+          ),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Flexible(
+                child: Text(
+                  label,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ),
+              const SizedBox(width: 3),
+              Icon(icon, size: 14),
+            ],
+          ),
+        ),
+      );
+    }
     return Padding(
       padding: EdgeInsetsDirectional.only(
-        start: workspaceStyle ? 50 : 56,
+        start: workspaceStyle ? 22 : 56,
         end: 12,
         top: 2,
       ),
@@ -1537,4 +1682,56 @@ class _HistoryLimitButton extends StatelessWidget {
       ),
     );
   }
+}
+
+class _WorkspaceActionsMenu extends StatelessWidget {
+  const _WorkspaceActionsMenu({
+    required this.appearance,
+    required this.pinned,
+    required this.canCreate,
+    required this.canDelete,
+    required this.onSelected,
+  });
+
+  final NavigationDrawerAppearance appearance;
+  final bool pinned;
+  final bool canCreate;
+  final bool canDelete;
+  final ValueChanged<_WorkspaceQuickAction> onSelected;
+
+  @override
+  Widget build(BuildContext context) =>
+      SidebarMoreMenuButton<_WorkspaceQuickAction>(
+        compact: true,
+        tooltip: '项目操作',
+        color: appearance.itemColor.withValues(alpha: 0.78),
+        onSelected: onSelected,
+        actions: <SidebarMenuAction<_WorkspaceQuickAction>>[
+          SidebarMenuAction(
+            value: _WorkspaceQuickAction.createChat,
+            icon: Icons.add_comment_outlined,
+            label: '新建对话',
+            enabled: canCreate,
+          ),
+          SidebarMenuAction(
+            value: _WorkspaceQuickAction.createGroup,
+            icon: Icons.create_new_folder_outlined,
+            label: '新建分组',
+            enabled: canCreate,
+          ),
+          SidebarMenuAction(
+            value: _WorkspaceQuickAction.togglePinned,
+            icon: pinned ? Icons.push_pin_outlined : Icons.push_pin_rounded,
+            label: pinned ? '取消置顶' : '置顶',
+          ),
+          if (canDelete)
+            const SidebarMenuAction(
+              value: _WorkspaceQuickAction.delete,
+              icon: Icons.delete_outline_rounded,
+              label: '删除工作区',
+              dividerBefore: true,
+              danger: true,
+            ),
+        ],
+      );
 }

@@ -7,6 +7,7 @@ use syn::{Expr, FnArg, Item, Lit, Pat, TraitItem};
 use tree_sitter::Parser;
 
 const HOST_TRAITS: &[(&str, &str, &str)] = &[
+    ("js_sdk/ui.rs", "UIHost", "UI"),
     ("js_sdk/files.rs", "FilesHost", "Files"),
     ("js_sdk/network.rs", "NetHost", "Net"),
     ("js_sdk/network.rs", "NetCookieManager", "Net.cookies"),
@@ -441,6 +442,8 @@ function __operitInvokeToolsBinding(namespace, method, toolName, overloads, args
             match binding.facade.as_str() {
                 "AsyncIterator" => Ok(format!("function({signature}) {{ if (arguments.length !== 1) throw new Error(\"{namespace}.{method} requires exactly one request\"); return __operitCreateToolStream(\"{}\", {signature}); }}", binding.tool)),
                 "TerminalCallback" => Ok("function(sessionId, command, options) { return __operitExecTerminalStreaming(sessionId, command, options); }".to_string()),
+                "TerminalRun" => Ok("function(request) { if (arguments.length !== 1) throw new TypeError('Terminal run requires one request'); return __operitRunTerminal(request); }".to_string()),
+                "TerminalWait" => Ok("function(sessionId, waitMs) { if (arguments.length !== 2) throw new TypeError('Terminal wait requires sessionId and waitMs'); return __operitWaitTerminal(sessionId, waitMs); }".to_string()),
                 "Promise" | "Storage" => {
                     let validation = if binding.strict_arguments {
                         Some(argument_checks(sdk_src, &namespace, &method)?)
@@ -500,6 +503,7 @@ var __operitCanonicalTools = __operitCopyToolsNamespaces(Tools);
         "compat/v1/workflow.js",
         "compat/v1/characters.js",
         "compat/v1/memory.js",
+        "compat/v1/internal_runtime.js",
         "compat/v1/runtime.js",
         "compat/v1/install.js",
         "DeviceTools.script.js",

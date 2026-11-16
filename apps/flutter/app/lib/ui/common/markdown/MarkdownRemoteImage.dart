@@ -11,6 +11,7 @@ import 'package:operit2/core/proxy/generated/CoreProxyModels.g.dart';
 import '../interactions/MessagePressShield.dart';
 import '../../features/packages/screens/ComposeDslImageSource.dart';
 import 'MarkdownImagePreview.dart';
+import 'MarkdownFileScope.dart';
 
 class MarkdownRemoteImage extends StatelessWidget {
   /// Creates a Markdown image backed by the runtime file or HTTP service.
@@ -31,10 +32,6 @@ class MarkdownRemoteImage extends StatelessWidget {
   final bool enablePreview;
   final bool decodeAtFullResolution;
 
-  /// Reads virtual image bytes through this renderer's owning Core connection.
-  Future<Uint8List> _readVfsBytes(String path) =>
-      readComposeDslVfsBytes(clients, path);
-
   /// Builds the image and its link interaction within the layout constraints.
   @override
   Widget build(BuildContext context) {
@@ -45,37 +42,49 @@ class MarkdownRemoteImage extends StatelessWidget {
     );
     return LayoutBuilder(
       builder: (context, constraints) {
+        // Sidebar animations change local constraints every frame. Decode for
+        // the window so they only relayout the existing image/cache entry.
+        final windowWidth = MediaQuery.sizeOf(context).width;
         final cacheWidth = decodeAtFullResolution
             ? null
-            : _markdownImageCacheExtent(context, constraints.maxWidth);
+            : _markdownImageCacheExtent(
+                context,
+                windowWidth > 0 ? windowWidth : constraints.maxWidth,
+              );
         final cacheHeight = !decodeAtFullResolution && cacheWidth == null
             ? _markdownImageCacheExtent(context, constraints.maxHeight)
             : null;
-        final trimmed = url.trim();
+        final scope = MarkdownFileScope.maybeOf(context);
+        final owner = scope?.clients ?? clients;
+        final trimmed = scope?.resolve(url) ?? url.trim();
+        Future<Uint8List> readBytes(String path) async {
+          try {
+            return await readComposeDslVfsBytes(owner, path);
+          } catch (_) {
+            final source = scope?.sourcePath(path);
+            if (source == null) rethrow;
+            return readComposeDslVfsBytes(owner, source);
+          }
+        }
+
         final isDataImage = trimmed.toLowerCase().startsWith('data:image/');
         final dataBytes = markdownDataImageBytes(trimmed);
         final vfsPath = composeDslVfsImagePath(trimmed);
         final Widget image;
-        if (isDataImage) {
-          image = dataBytes == null
-              ? error
-              : Image.memory(
-                  dataBytes,
-                  fit: fit,
-                  cacheWidth: cacheWidth,
-                  cacheHeight: cacheHeight,
-                  semanticLabel: alt.trim().isEmpty ? null : alt.trim(),
-                  errorBuilder: (context, failure, stackTrace) => error,
-                );
+        if (isDataImage && dataBytes == null) {
+          image = error;
         } else if (vfsPath != null) {
           image = Image(
+            key: ValueKey((trimmed, owner.bridge)),
+            gaplessPlayback: true,
             image: ResizeImage.resizeIfNeeded(
               cacheWidth,
               cacheHeight,
               ComposeDslVfsImage(
                 path: vfsPath,
-                owner: clients.bridge,
-                readBytes: _readVfsBytes,
+                owner: owner.bridge,
+                clients: owner,
+                readBytes: readBytes,
               ),
             ),
             fit: fit,
@@ -84,7 +93,7 @@ class MarkdownRemoteImage extends StatelessWidget {
           );
         } else {
           image = _RuntimeImage(
-            clients: clients,
+            clients: owner,
             url: trimmed,
             alt: alt,
             fit: fit,
@@ -102,16 +111,32 @@ class MarkdownRemoteImage extends StatelessWidget {
             onTap: () => showDialog<void>(
               context: context,
               useSafeArea: false,
-              builder: (_) => MarkdownImagePreview(
-                alt: alt,
-                image: MarkdownRemoteImage(
-                  url: url,
-                  alt: alt,
-                  clients: clients,
-                  enablePreview: false,
-                  decodeAtFullResolution: true,
-                ),
-              ),
+              builder: (_) => scope == null
+                  ? MarkdownImagePreview(
+                      alt: alt,
+                      image: MarkdownRemoteImage(
+                        url: trimmed,
+                        alt: alt,
+                        clients: owner,
+                        enablePreview: false,
+                        decodeAtFullResolution: true,
+                      ),
+                    )
+                  : MarkdownFileScope(
+                      basePath: scope.basePath,
+                      nodeId: scope.nodeId,
+                      clients: owner,
+                      child: MarkdownImagePreview(
+                        alt: alt,
+                        image: MarkdownRemoteImage(
+                          url: trimmed,
+                          alt: alt,
+                          clients: owner,
+                          enablePreview: false,
+                          decodeAtFullResolution: true,
+                        ),
+                      ),
+                    ),
             ),
             child: image,
           ),
@@ -173,6 +198,17 @@ class _RuntimeImageState extends State<_RuntimeImage> {
 
   /// Creates the cold proxy stream owned by the image subscription.
   void _load() {
+    final bytes = markdownDataImageBytes(widget.url);
+    if (bytes != null) {
+      _request =
+          Stream.fromFuture(
+            readImageDisplayBytes(bytes, clients: widget.clients),
+          ).map(
+            (bytes) =>
+                RuntimeImageData(bytes: bytes, displayUrl: null, error: null),
+          );
+      return;
+    }
     _request = widget.clients.servicesRuntimeHostInteractionService.imageBytes(
       url: widget.url,
     );
@@ -200,6 +236,8 @@ class _RuntimeImageState extends State<_RuntimeImage> {
           // The host selected direct display; no byte request is started here.
           return Image.network(
             displayUrl,
+            key: ValueKey((widget.url, widget.clients.bridge)),
+            gaplessPlayback: true,
             fit: widget.fit,
             webHtmlElementStrategy: WebHtmlElementStrategy.prefer,
             semanticLabel: widget.alt.trim().isEmpty ? null : widget.alt.trim(),
@@ -211,6 +249,8 @@ class _RuntimeImageState extends State<_RuntimeImage> {
         }
         return Image.memory(
           data.bytes,
+          key: ValueKey((widget.url, widget.clients.bridge)),
+          gaplessPlayback: true,
           fit: widget.fit,
           cacheWidth: widget.cacheWidth,
           cacheHeight: widget.cacheHeight,
@@ -280,14 +320,17 @@ class _MarkdownImageStatus extends StatelessWidget {
   }
 }
 
-/// Decodes an image data URI and reports malformed input as invalid data.
+final _markdownDataImages = ComposeDslDataImageCache();
+
+/// Reuses immutable data-URI bytes across rebuilds within a bounded cache.
+/// Malformed input is reported as invalid data.
 Uint8List? markdownDataImageBytes(String imageUrl) {
   final trimmed = imageUrl.trim();
   if (!trimmed.toLowerCase().startsWith('data:image/')) {
     return null;
   }
   try {
-    return UriData.parse(trimmed).contentAsBytes();
+    return _markdownDataImages.resolve(trimmed).bytes;
   } on FormatException {
     return null;
   }

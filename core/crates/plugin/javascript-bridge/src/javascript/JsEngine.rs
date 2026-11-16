@@ -669,7 +669,7 @@ fn remainingScriptRequestMillis(deadline: u128) -> JsExecutionResult<u64> {
 fn javaScriptExecutionErrorFromHost(error: HostError) -> JsExecutionError {
     match error.kind {
         HostErrorKind::Timeout => JsExecutionError::timeout(error.message),
-        HostErrorKind::General => JsExecutionError::worker_unavailable(error.message),
+        HostErrorKind::General | HostErrorKind::NotFound | HostErrorKind::PermissionDenied => JsExecutionError::worker_unavailable(error.message),
     }
 }
 
@@ -1228,6 +1228,7 @@ impl JsEngineState {
                 None => operit_plugin_sdk::toolpkg::ToolPkgApiVersion::CURRENT_TOOLPKG_API_VERSION
                     .to_string(),
             };
+            bindCallerContext(&mut effectiveParams, context.executionHost.as_deref());
             effectiveParams.insert(
                 "__operit_toolpkg_api_version".to_string(),
                 Value::String(apiVersion),
@@ -1323,6 +1324,7 @@ impl JsEngineState {
             None => operit_plugin_sdk::toolpkg::ToolPkgApiVersion::CURRENT_TOOLPKG_API_VERSION
                 .to_string(),
         };
+        bindCallerContext(&mut effectiveParams, context.executionHost.as_deref());
         effectiveParams.insert(
             "__operit_toolpkg_api_version".to_string(),
             Value::String(apiVersion),
@@ -1727,8 +1729,11 @@ impl JsEngineState {
             .as_bool()
             .ok_or("Detached-call predicate must return a boolean")?;
         if detached {
+            let mut context = pending.context.clone();
+            // The successful primary result ends its before-hook deadline; retained work owns its lifetime.
+            context.interrupt = HostJavaScriptExecutionInterrupt::unlimited();
             self.detachedCallContexts
-                .insert(pending.callId.clone(), pending.context.clone());
+                .insert(pending.callId.clone(), context);
         }
         Ok(())
     }
@@ -1884,6 +1889,8 @@ impl JsEngineState {
             )
             .map_err(|error| error.to_string())?;
         let syncNames = [
+            "__operitNativePrepareJavaScript",
+            "__operitNativeAsyncMethodKind",
             "__operitNativePrepareComposeModule",
             "__operitNativeReadBootstrapLibrary",
             "__operitNativeHashText",
@@ -1998,7 +2005,6 @@ impl JsEngineState {
                 "__operitNativeCallToolStructured",
                 Arc::new(move |requestId, arguments| {
                     dispatchStructuredToolCall(
-                        CURRENT_EXECUTION_HOST.with(|host| host.borrow().clone()),
                         toolSink.clone(),
                         requestId,
                         arguments,
@@ -2201,7 +2207,6 @@ type CoreRouteCompletion = Box<dyn FnOnce() -> JsExecutionFuture<Result<Value, S
 /// Only the JS continuation wake uses the cooperative reusable executor.
 #[allow(non_snake_case)]
 fn dispatchStructuredToolCall(
-    executionHost: Option<Arc<dyn JsExecutionHost>>,
     callbackSink: JsAsyncCallbackSink,
     requestId: u64,
     arguments: Vec<Value>,
@@ -2257,7 +2262,9 @@ fn dispatchStructuredToolCall(
             Err(error) => { fail(error); return; }
         }
     }
-    let Some(executionHost) = executionHost else {
+    // Promise continuations may run under the engine's default TLS context.
+    // The owning call retains the exact native turn, including its file directory.
+    let Some(executionHost) = context.executionHost.clone() else {
         fail("JavaScript execution host is unavailable".to_string());
         return;
     };
@@ -2908,6 +2915,16 @@ fn executeHostOperation(name: &str, arguments: Vec<impl Into<operit_host_api::Ho
             }
             Ok(Value::String(path))
         }
+        "__operitNativePrepareJavaScript" => {
+            let [source] = exactHostJavaScriptJsonArguments(name, arguments)?;
+            crate::javascript::JsAsyncCompiler::compile(&hostJavaScriptStringArgument(source)?)
+                .map(Value::String).map_err(HostError::new)
+        }
+        "__operitNativeAsyncMethodKind" => {
+            let [source] = exactHostJavaScriptJsonArguments(name, arguments)?;
+            crate::javascript::JsAsyncCompiler::method_kind(&hostJavaScriptStringArgument(source)?)
+                .map(|kind| Value::String(kind.into())).map_err(HostError::new)
+        }
         "__operitNativePrepareComposeModule" => {
             let [source, identity] = exactHostJavaScriptJsonArguments(name, arguments)?;
             crate::javascript::JsComposeCompiler::prepareComposeModule(
@@ -3350,6 +3367,32 @@ fn bindEnvironmentOwner(params: &mut BTreeMap<String, Value>, owner: Option<&JsE
             "__operit_environment_owner".into(),
             Value::String(owner.package_name().into()),
         );
+    }
+}
+
+/// Binds neutral native identity for all SDK versions; only the v1 adapter interprets card IDs.
+#[allow(non_snake_case)]
+fn bindCallerContext(params: &mut BTreeMap<String, Value>, host: Option<&dyn JsExecutionHost>) {
+    let Some(context) = host.and_then(JsExecutionHost::toolpkg_caller_context) else {
+        return;
+    };
+    for (field, key) in [
+        ("participantId", "__operit_package_caller_participant_id"),
+        ("extensionOwner", "__operit_package_caller_owner"),
+        ("chatId", "__operit_package_chat_id"),
+    ] {
+        // UI events can identify a target chat without being an AI turn. Keep that existing transport.
+        if field == "chatId" && context.get(field).is_none() {
+            continue;
+        }
+        params.remove(key);
+        if let Some(value) = context
+            .get(field)
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+        {
+            params.insert(key.into(), Value::String(value.into()));
+        }
     }
 }
 

@@ -19,7 +19,7 @@ use operit_plugin_sdk::javascript::{
 use operit_plugin_sdk::JsPackageLoader::JsPackageLoader;
 use operit_store::RuntimeStorageHost::setDefaultRuntimeStorageHost;
 use operit_util::RuntimeStorageLayout::{RUNTIME_ROOT_DIR_PATH, WORKSPACE_DIR_PATH};
-use operit_util::RuntimeStoreRoot::{setDefaultRuntimeStoreRootConfig, RuntimeStoreRootConfig};
+
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
@@ -180,6 +180,63 @@ fn newTestIpcEngine(executionHost: Arc<dyn JsExecutionHost>) -> super::JsEngine 
     ).expect("test engine must initialize")
 }
 
+/// Exercises the public getters through real scheduled engines for both legacy and current APIs.
+#[tokio::test]
+async fn hook_caller_getters_use_native_snapshot_in_v1_and_v2() {
+    const SCRIPT: &str = r#"
+        exports.inspect = async function(params) {
+            await Promise.resolve();
+            var card;
+            try { card = typeof getCallerCardId === 'function' ? getCallerCardId() : null; }
+            catch (error) { card = error.message; }
+            return { chatId: getChatId(), participantId: getCallerParticipantId(), cardId: card };
+        };
+    "#;
+    for version in ["1.0.0", "1.0.1", "2.0.0"] {
+        testJavaScriptRuntimeHost();
+        register_test_runtime_storage("js-engine-tests");
+        let host = Arc::new(TestPluginConfigExecutionHost::default());
+        let engine = super::JsEngine::new_toolpkg_execution_engine(host.clone(), ToolPkgExecutionContext {
+            context_key: format!("caller-test:{version}"),
+            container_package_name: "test.package".into(), api_version: version.into(),
+            text_resource_host: Arc::new(StaticToolPkgTextResourceHost { resources: BTreeMap::new() }),
+        }).unwrap();
+        *host.callerContext.lock().unwrap() = Some(serde_json::json!({
+            "chatId":"chat-a", "participantId":"participant-a", "extensionOwner":"com.operit.character_cards",
+        }));
+        let params = BTreeMap::from([
+            ("__operit_package_chat_id".into(), serde_json::json!("stale-chat")),
+            ("__operit_package_caller_participant_id".into(), serde_json::json!("stale-participant")),
+            ("__operit_package_caller_owner".into(), serde_json::json!("foreign.provider")),
+            ("eventPayload".into(), serde_json::json!({"metadata":{"executionContext":{"chatId":"forged-chat", "participantId":"forged-participant"}}})),
+        ]);
+        let pending = engine.execute_script_function(SCRIPT, "inspect", &params, &BTreeMap::new(), None, true, None);
+        // Changing the selected chat before polling must not change the submitted request.
+        *host.callerContext.lock().unwrap() = Some(serde_json::json!({
+            "chatId":"chat-b", "participantId":"participant-b", "extensionOwner":"foreign.provider",
+        }));
+        let output: Value = serde_json::from_str(&pending.await.unwrap().unwrap()).unwrap();
+        assert_eq!(output, serde_json::json!({
+            "chatId":"chat-a", "participantId":"participant-a",
+            "cardId": if version == "2.0.0" { Value::Null } else { serde_json::json!("participant-a") },
+        }), "API {version}");
+        let output = engine.execute_script_function(SCRIPT, "inspect", &params, &BTreeMap::new(), None, true, None).await.unwrap().unwrap();
+        let output: Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(output["chatId"], "chat-b");
+        assert_eq!(output["participantId"], "participant-b");
+        if version == "2.0.0" { assert!(output["cardId"].is_null()); }
+        else { assert!(output["cardId"].as_str().unwrap().contains("another provider participant")); }
+
+        *host.callerContext.lock().unwrap() = None;
+        let output = engine.execute_script_function(SCRIPT, "inspect", &params, &BTreeMap::new(), None, true, None).await.unwrap().unwrap();
+        let output: Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(output["chatId"], "stale-chat", "UI target chat remains available outside a turn");
+        assert!(output.get("participantId").is_none(), "No participant from a preceding turn or supplied parameters");
+        assert!(output.get("cardId").is_none_or(Value::is_null));
+        engine.destroy();
+    }
+}
+
 /// Returns the repository root above core/crates/plugin/javascript-bridge.
 #[allow(non_snake_case)]
 fn testRepositoryRoot() -> &'static Path {
@@ -232,6 +289,9 @@ struct TestPluginConfigExecutionHost {
     environment: Arc<Mutex<BTreeMap<String, String>>>,
     environmentOwners: Arc<Mutex<Vec<operit_plugin_sdk::javascript::JsEnvironmentOwner>>>,
     toolCatalogError: Arc<Mutex<Option<String>>>,
+    callerContext: Arc<Mutex<Option<Value>>>,
+    capturedCallerContext: Option<Value>,
+    legacyShellCalls: Arc<Mutex<Vec<Value>>>,
     #[cfg(not(target_arch = "wasm32"))]
     toolPkgIpcThreadName: Arc<Mutex<Option<String>>>,
     #[cfg(not(target_arch = "wasm32"))]
@@ -300,8 +360,14 @@ impl JsExecutionHost for TestPluginConfigExecutionHost {
         Ok(())
     }
 
-        /// Captures this fixture's shared state through the same native invocation boundary.
-        fn capture_tool_invocation_host(&self) -> Arc<dyn JsExecutionHost> { Arc::new(self.clone()) }
+    /// Freezes caller identity before work is submitted to the JavaScript scheduler.
+    fn capture_tool_invocation_host(&self) -> Arc<dyn JsExecutionHost> {
+        let mut host = self.clone();
+        host.capturedCallerContext = Some(self.callerContext.lock().unwrap().clone().unwrap_or(serde_json::json!({})));
+        Arc::new(host)
+    }
+
+    fn toolpkg_caller_context(&self) -> Option<Value> { self.capturedCallerContext.clone() }
 
 
 
@@ -329,6 +395,23 @@ impl JsExecutionHost for TestPluginConfigExecutionHost {
         &self,
         request: JsToolCallRequest,
     ) -> operit_plugin_sdk::javascript::JsExecutionCompletion<JsToolCallResult> {
+        if matches!(request.tool_name.as_str(), "create_terminal_session" | "execute_in_terminal_session" | "close_terminal_session") {
+            self.legacyShellCalls.lock().unwrap().push(serde_json::json!({
+                "tool": request.tool_name, "params": request.parameters,
+            }));
+            let data = match request.tool_name.as_str() {
+                "create_terminal_session" => {
+                    let terminal_type = request.parameters.get("type").unwrap();
+                    serde_json::json!({"sessionId":"native-shell", "terminalType":terminal_type, "platform":"android", "terminal":"android-system", "isNewSession":true})
+                }
+                "execute_in_terminal_session" => {
+                    let command = request.parameters.get("command").and_then(Value::as_str).unwrap();
+                    serde_json::json!({"command":command, "output":"raw native output\n", "exitCode":if command == "denied" { 1 } else { 0 }, "timedOut":command == "timeout"})
+                }
+                _ => serde_json::json!({"success":true, "sessionId":"native-shell", "message":"closed"}),
+            };
+            return Box::pin(async move { JsToolCallResult { success:true, data:JsToolCallResultData::Value(data), error:None } });
+        }
         if request.tool_name == "storage_request" {
             let decoded = request.parameters.get("request").cloned()
                 .ok_or_else(|| "Missing storage request".to_string())
@@ -479,7 +562,7 @@ impl JsExecutionHost for TestPluginConfigExecutionHost {
     fn plugin_config_dir(&self, plugin_id: &str) -> Result<String, String> {
         let safeBaseName = plugin_id.trim().replace(':', "_");
         Ok(format!(
-            "/app/data/extensions/device/plugins/configs/{safeBaseName}"
+            "/operitapp/data/extensions/device/plugins/configs/{safeBaseName}"
         ))
     }
 
@@ -511,7 +594,7 @@ impl JsExecutionHost for TestPluginConfigExecutionHost {
             format!("{root}/namespaces/{name}")
         };
         Ok(format!(
-            "/app/data/{}",
+            "/operitapp/data/{}",
             path.strip_prefix("runtime/")
                 .ok_or("invalid test config path")?
         ))
@@ -520,7 +603,7 @@ impl JsExecutionHost for TestPluginConfigExecutionHost {
     /// Returns actual Host-visible local data without acquiring the package manager lock.
     fn plugin_local_data_dir(&self, owner_id: &str) -> Result<String, String> {
         let path = operit_store::ExtensionStore::ExtensionStore::localDataPath(owner_id)?;
-        Ok(format!("/app/data/{}", path.strip_prefix("runtime/").ok_or("invalid local data path")?))
+        Ok(format!("/operitapp/data/{}", path.strip_prefix("runtime/").ok_or("invalid local data path")?))
     }
 
     /// Creates registration-local paths independently of the selected installation scope.
@@ -531,7 +614,7 @@ impl JsExecutionHost for TestPluginConfigExecutionHost {
     /// Returns shared data independently of the installed package scope.
     fn plugin_space_data_dir(&self, owner_id: &str) -> Result<String, String> {
         let path = operit_store::ExtensionStore::ExtensionStore::spaceDataPath(owner_id)?;
-        Ok(format!("/app/data/{}", path.strip_prefix("runtime/").ok_or("invalid shared data path")?))
+        Ok(format!("/operitapp/data/{}", path.strip_prefix("runtime/").ok_or("invalid shared data path")?))
     }
 
     /// Creates registration-shared paths without consulting installed state.
@@ -1212,7 +1295,7 @@ pub(super) fn ensure_test_runtime_root() {
         runtime_root.clone(),
         workspace_root.clone(),
     ));
-    setDefaultRuntimeStoreRootConfig(RuntimeStoreRootConfig::new(runtime_root, workspace_root));
+
     setDefaultRuntimeStorageHost(host);
 }
 
@@ -1369,6 +1452,27 @@ fn execute_function_with_active_module_context() {
     );
 }
 
+/// Initializes the complete generated Tools runtime and the v1 installer in one native context.
+#[test]
+fn bootstrap_initializes_internal_v1_runtime_with_generated_tools() {
+    let mut state = newTestJsEngineState(None);
+    let output = state.evalJavaScriptString(r#"
+        JSON.stringify({
+            internal: typeof globalThis.__operitV1InternalRuntime.create_session,
+            canonical: typeof __operitCanonicalTools.System.terminal.create,
+            public: typeof Tools.System.terminal.create,
+            installed: Tools.System.terminal.create !== __operitCanonicalTools.System.terminal.create
+        })
+    "#).expect("complete bootstrap must initialize without duplicate declarations");
+    let output: Value = serde_json::from_str(&output).unwrap();
+    assert_eq!(output, serde_json::json!({
+        "internal": "function",
+        "canonical": "function",
+        "public": "function",
+        "installed": true
+    }));
+}
+
 #[test]
 fn bootstrap_exposes_ui_android_okhttp_api() {
     let mut state = newTestJsEngineState(None);
@@ -1517,6 +1621,7 @@ fn toolpkg_ipc_local_call_returns_handler_result() {
     );
 }
 
+/// Serialized native async runners compile in the destination with registered context bindings.
 #[test]
 fn runtime_context_with_context_runs_local_main_runner() {
     let mut state = newTestJsEngineState(None);
@@ -1526,7 +1631,13 @@ fn runtime_context_with_context_runs_local_main_runner() {
                 return value + 1;
             }
             RuntimeContext.register({ addOne: addOne });
-            return await withContext('main', { value: 41 }, function() {
+            async function namedRunner() {
+                await Promise.resolve();
+                return { value: addOne(value) };
+            }
+            const named = await withContext('main', { value: 40 }, namedRunner);
+            return await withContext('main', { value: named.value }, async () => {
+                await Promise.resolve();
                 return { value: addOne(value) };
             });
         };
@@ -3558,13 +3669,13 @@ fn registration_config_directory_works_before_installation_without_reentering_ma
             .expect("registration must resolve paths while its caller holds the manager lock");
         let entry: Value = serde_json::from_str(&capture.navigationEntries[0]).unwrap();
         let root = format!(
-            "/app/data/extensions/{}/plugins/configs/first_import",
+            "/operitapp/data/extensions/{}/plugins/configs/first_import",
             scope.as_str()
         );
         assert_eq!(entry["directory"], root);
-        assert_eq!(entry["localDirectory"], "/app/data/plugin_data/device/first_import");
+        assert_eq!(entry["localDirectory"], "/operitapp/data/plugin_data/device/first_import");
         assert_eq!(entry["localAgain"], entry["localDirectory"]);
-        assert_eq!(entry["sharedDirectory"], "/app/data/plugin_data/space/first_import");
+        assert_eq!(entry["sharedDirectory"], "/operitapp/data/plugin_data/space/first_import");
         assert_eq!(
             entry["aliasDirectory"],
             format!("{root}/namespaces/named_alias")
@@ -3606,7 +3717,7 @@ async fn registration_config_context_does_not_leak_into_runtime_execution() {
         .expect("runtime configuration result");
     assert_eq!(
         serde_json::from_str::<String>(&output).unwrap(),
-        "/app/data/extensions/device/plugins/configs/first_import"
+        "/operitapp/data/extensions/device/plugins/configs/first_import"
     );
     assert_eq!(host.registrationConfigReads.load(Ordering::Relaxed), 1);
 }
@@ -3627,7 +3738,7 @@ async fn local_data_directory_is_stable_across_registration_and_runtime() {
         "exports.local_data = function() { return {local:ToolPkg.getLocalDataDir(),shared:ToolPkg.getSpaceDataDir()}; };",
         "local_data", &params, &BTreeMap::new(), None, true, None,
     ).await.expect("local runtime directory").expect("local directory output");
-    assert_eq!(serde_json::from_str::<Value>(&output).unwrap(), serde_json::json!({"local":"/app/data/plugin_data/device/first_import","shared":"/app/data/plugin_data/space/first_import"}));
+    assert_eq!(serde_json::from_str::<Value>(&output).unwrap(), serde_json::json!({"local":"/operitapp/data/plugin_data/device/first_import","shared":"/operitapp/data/plugin_data/space/first_import"}));
 }
 
 /// Rejects an unspecified registration scope instead of choosing an arbitrary storage location.
@@ -3747,7 +3858,7 @@ fn native_interface_resolves_plugin_config_dir() {
 
     assert_eq!(
         path,
-        "/app/data/extensions/device/plugins/configs/plugin_name"
+        "/operitapp/data/extensions/device/plugins/configs/plugin_name"
     );
 }
 
@@ -3897,7 +4008,7 @@ async fn completion_retains_detached_promise_context_until_host_event() {
         resumed,
         serde_json::json!({
             "owner": "original", "runs": 1,
-            "config": "/app/data/extensions/device/plugins/configs/workflow",
+            "config": "/operitapp/data/extensions/device/plugins/configs/workflow",
         })
     );
     assert_eq!(
@@ -3913,6 +4024,40 @@ async fn completion_retains_detached_promise_context_until_host_event() {
         progress.try_recv().is_err(),
         "continuation must execute exactly once"
     );
+    engine.destroy();
+}
+
+/// Successful before-hook completion ends its deadline while retained host work keeps the original owner.
+#[tokio::test(flavor = "current_thread")]
+async fn completed_before_hook_does_not_expire_detached_work() {
+    let host = Arc::new(TestPluginConfigExecutionHost::default());
+    let engine = newTestJsEngine(host.clone());
+    let (sender, mut progress) = tokio::sync::mpsc::unbounded_channel();
+    let output = engine.execute_script_function_with_timeout_millis(
+        r#"exports.main = function() {
+            toolCall('gate', {}).then(function() {
+                sendIntermediateResult({ owner: getEnv('CALL_OWNER') });
+            });
+            return 'admitted';
+        };"#,
+        "main", &testParams(),
+        &BTreeMap::from([("CALL_OWNER".into(), "group-submit".into())]),
+        Some(Arc::new(move |value| { sender.send(value).unwrap(); })),
+        true, 1_000, None,
+    ).await;
+    assert_eq!(expect_js_output(output, "before-hook admission"), "\"admitted\"");
+    host.gatedToolStarted.notified().await;
+    assert_eq!(executionSessionCounts(&engine).await, (0, 1));
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    finishGatedTool(&host);
+    let resumed: Value = serde_json::from_str(
+        &tokio::time::timeout(Duration::from_secs(2), progress.recv()).await
+            .expect("admitted work must outlive the before-hook deadline")
+            .expect("detached work must publish its result"),
+    ).unwrap();
+    assert_eq!(resumed, serde_json::json!({ "owner": "group-submit" }));
+    assert_eq!(executionSessionCounts(&engine).await, (0, 0));
+    assert!(progress.try_recv().is_err(), "the continuation must run exactly once");
     engine.destroy();
 }
 
@@ -4003,7 +4148,7 @@ async fn promise_jobs_restore_execution_host_for_native_calls() {
     assert_eq!(
         value,
         serde_json::json!({
-            "config": "/app/data/extensions/device/plugins/configs/workflow",
+            "config": "/operitapp/data/extensions/device/plugins/configs/workflow",
             "owner": "workflow",
         })
     );
@@ -4331,20 +4476,73 @@ fn chat_extension_owner_requires_real_execution_context() {
     assert!(context.validate().is_err());
 }
 
-/// Lowered async functions subscribing to one retained service Promise keep distinct call owners.
+/// Native async functions awaiting one retained service Promise keep distinct call owners.
 #[tokio::test(flavor = "current_thread")]
 async fn shared_initialization_promise_preserves_each_waiting_call_context() {
+    assert_shared_initialization_context(r#"exports.useService = async function() {
+        const owner = globalThis.__operitCurrentCallId;
+        sendIntermediateResult('awaiting-initialization');
+        async function* serviceOwners() {
+            await globalThis.sharedInitialization;
+            yield getEnv('CALL_OWNER');
+        }
+        for await (const value of serviceOwners()) {
+            if (value !== 'consumer') throw new Error('Async iterator resumed under a different execution call');
+        }
+        await Promise.resolve();
+        if (globalThis.__operitCurrentCallId !== owner) throw new Error('Shared Promise resumed under a different execution call');
+        return getEnv('CALL_OWNER');
+    };"#).await;
+}
+
+/// Embedded TypeScript and esbuild helpers remain compatible alongside native async callers.
+#[tokio::test(flavor = "current_thread")]
+async fn legacy_async_helpers_preserve_context_with_native_await() {
+    for (helper, invocation) in [
+        (r#"function __awaiter(thisArg, _arguments, P, generator) {
+            function adopt(value) { return value instanceof P ? value : new P(function(resolve) { resolve(value); }); }
+            return new (P || (P = Promise))(function(resolve, reject) {
+                function fulfilled(value) { try { step(generator.next(value)); } catch (e) { reject(e); } }
+                function rejected(value) { try { step(generator.throw(value)); } catch (e) { reject(e); } }
+                function step(result) { result.done ? resolve(result.value) : adopt(result.value).then(fulfilled, rejected); }
+                step((generator = generator.apply(thisArg, _arguments || [])).next());
+            });
+        }"#, "__awaiter(this, arguments, void 0, consume)"),
+        (r#"var __async = (__this, __arguments, generator) => new Promise((resolve, reject) => {
+            var fulfilled = value => { try { step(generator.next(value)); } catch (e) { reject(e); } };
+            var rejected = value => { try { step(generator.throw(value)); } catch (e) { reject(e); } };
+            var step = value => value.done ? resolve(value.value) : Promise.resolve(value.value).then(fulfilled, rejected);
+            step((generator = generator.apply(__this, __arguments)).next());
+        });"#, "__async(this, arguments, consume)"),
+    ] {
+        let script = format!(r#"{helper}
+            var babelHelpers = {{ tag: 'legacy' }};
+            function* consume() {{
+                const owner = globalThis.__operitCurrentCallId;
+                sendIntermediateResult('awaiting-initialization');
+                yield globalThis.sharedInitialization;
+                yield Promise.resolve();
+                if (globalThis.__operitCurrentCallId !== owner || babelHelpers.tag !== 'legacy') throw new Error('Legacy helper lost its owner or authored binding');
+                return getEnv('CALL_OWNER');
+            }}
+            exports.useService = function() {{ return {invocation}; }};
+        "#);
+        assert_shared_initialization_context(&script).await;
+    }
+}
+
+/// Interleaves a native initializer and another compiler output on the same retained Promise.
+async fn assert_shared_initialization_context(consumer_source: &str) {
     let host = Arc::new(TestPluginConfigExecutionHost::default());
     let engine = newTestJsEngine(host.clone());
     let first_engine = engine.clone();
     let first = tokio::spawn(first_engine.execute_script_function(
-        r#"exports.initialize = function() {
+        r#"exports.initialize = async function() {
             const owner = globalThis.__operitCurrentCallId;
             globalThis.sharedInitialization = toolCall('gate', {});
-            return globalThis.sharedInitialization.then(function() {
-                if (globalThis.__operitCurrentCallId !== owner) throw new Error('Shared Promise resumed under a different execution call');
-                return getEnv('CALL_OWNER');
-            });
+            await globalThis.sharedInitialization;
+            if (globalThis.__operitCurrentCallId !== owner) throw new Error('Shared Promise resumed under a different execution call');
+            return getEnv('CALL_OWNER');
         };"#,
         "initialize", &testParams(),
         &BTreeMap::from([("CALL_OWNER".to_string(), "initializer".to_string())]),
@@ -4354,14 +4552,7 @@ async fn shared_initialization_promise_preserves_each_waiting_call_context() {
     let (sender, mut started) = tokio::sync::mpsc::unbounded_channel();
     let second_engine = engine.clone();
     let second = tokio::spawn(second_engine.execute_script_function(
-        r#"exports.useService = function() {
-            const owner = globalThis.__operitCurrentCallId;
-            sendIntermediateResult('awaiting-initialization');
-            return globalThis.sharedInitialization.then(function() { return Promise.resolve().then(function() {
-                if (globalThis.__operitCurrentCallId !== owner) throw new Error('Shared Promise resumed under a different execution call');
-                return getEnv('CALL_OWNER');
-            }); });
-        };"#,
+        consumer_source,
         "useService", &testParams(),
         &BTreeMap::from([("CALL_OWNER".to_string(), "consumer".to_string())]),
         Some(Arc::new(move |value| { sender.send(value).unwrap(); })), true, None,
@@ -4372,6 +4563,97 @@ async fn shared_initialization_promise_preserves_each_waiting_call_context() {
     assert_eq!(expect_js_output(second.await.unwrap(), "shared initialization consumer"), "\"consumer\"");
     assert_eq!(executionSessionCounts(&engine).await, (0, 0));
     engine.destroy();
+}
+
+/// Loads the shipped Waifu merge queue with one controllable mode lookup dependency.
+fn waifu_merge_fixture() -> (super::JsEngine, Arc<TestPluginConfigExecutionHost>, String, BTreeMap<String, Value>) {
+    let host = Arc::new(TestPluginConfigExecutionHost::default());
+    testJavaScriptRuntimeHost();
+    register_test_runtime_storage("js-engine-tests");
+    let resources = BTreeMap::from([("dist/mode.js".into(), r#"
+        globalThis.waifuOwners = [];
+        exports.modeForChat = function() {
+            globalThis.waifuOwners.push(getEnv('CALL_OWNER'));
+            return globalThis.waifuOwners.length === 1
+                ? toolCall('gate', {}).then(function() { return null; })
+                : Promise.resolve(null);
+        };
+    "#.into())]);
+    let engine = super::JsEngine::new_toolpkg_execution_engine(host.clone(), ToolPkgExecutionContext {
+        context_key: "toolpkg_main:test.waifu".into(), container_package_name: "test.waifu".into(),
+        api_version: "2.0.0".into(), text_resource_host: Arc::new(StaticToolPkgTextResourceHost { resources }),
+    }).unwrap();
+    let source = std::fs::read_to_string(testRepositoryRoot().join("plugins/packages/external/waifu/dist/merge.js")).unwrap();
+    let script = format!("{source}\nexports.submit = function(event) {{ sendIntermediateResult('submitted'); return exports.mergeInput(event); }}; exports.inspect = function() {{ return globalThis.waifuOwners; }};");
+    let mut params = testParams();
+    params.insert("__operit_ui_package_name".into(), serde_json::json!("test.waifu"));
+    params.insert("__operit_script_screen".into(), serde_json::json!("dist/merge.js"));
+    params.insert("event".into(), serde_json::json!("submit_requested"));
+    params.insert("eventPayload".into(), serde_json::json!({"chatId":"same-chat","source":"User"}));
+    (engine, host, script, params)
+}
+
+/// The shipped Waifu merge queue must resume each submitted input under its own call identity.
+#[tokio::test(flavor = "current_thread")]
+async fn waifu_merge_queue_preserves_each_waiting_call_context() {
+    let (engine, host, script, params) = waifu_merge_fixture();
+    let mut first = tokio::spawn(engine.execute_script_function(
+        &script, "submit", &params, &BTreeMap::from([("CALL_OWNER".into(), "first".into())]),
+        None, true, None,
+    ));
+    tokio::select! {
+        _ = host.gatedToolStarted.notified() => {},
+        result = &mut first => panic!("First submission finished before the dependency gate: {result:?}"),
+        _ = tokio::time::sleep(Duration::from_secs(3)) => panic!("First submission did not reach the dependency gate"),
+    }
+    let (sender, mut started) = tokio::sync::mpsc::unbounded_channel();
+    let second = tokio::spawn(engine.execute_script_function(
+        &script, "submit", &params, &BTreeMap::from([("CALL_OWNER".into(), "second".into())]),
+        Some(Arc::new(move |value| { sender.send(value).unwrap(); })), true, None,
+    ));
+    tokio::time::timeout(Duration::from_secs(3), started.recv()).await.unwrap().unwrap();
+    finishGatedTool(&host);
+    let (first, second) = tokio::time::timeout(Duration::from_secs(3), async { tokio::join!(first, second) }).await
+        .expect("The queued input must finish after its predecessor");
+    let inspected = engine.execute_script_function(&script, "inspect", &params, &BTreeMap::new(), None, true, None).await;
+    engine.destroy();
+    expect_js_output(first.unwrap(), "first Waifu submission");
+    expect_js_output(second.unwrap(), "second Waifu submission");
+    assert_eq!(expect_js_output(inspected, "Waifu submission owners"), "[\"first\",\"second\"]");
+}
+
+/// Cancelling a blocked before hook must clear its queue before a later input is submitted.
+#[tokio::test(flavor = "current_thread")]
+async fn waifu_merge_queue_releases_after_before_hook_timeout() {
+    let (engine, host, script, params) = waifu_merge_fixture();
+    let mut first = tokio::spawn(engine.execute_script_function_with_timeout_millis(
+        &script, "submit", &params, &BTreeMap::from([("CALL_OWNER".into(), "timed-out".into())]),
+        None, true, 200, None,
+    ));
+    tokio::select! {
+        _ = host.gatedToolStarted.notified() => {},
+        result = &mut first => panic!("First submission did not wait for its dependency: {result:?}"),
+        _ = tokio::time::sleep(Duration::from_secs(3)) => panic!("First submission did not reach its dependency"),
+    }
+    let (sender, mut started) = tokio::sync::mpsc::unbounded_channel();
+    let second = tokio::spawn(engine.execute_script_function_with_timeout_millis(
+        &script, "submit", &params, &BTreeMap::from([("CALL_OWNER".into(), "queued".into())]),
+        Some(Arc::new(move |value| { sender.send(value).unwrap(); })), true, 2_000, None,
+    ));
+    tokio::time::timeout(Duration::from_secs(3), started.recv()).await.unwrap().unwrap();
+    let (first, second) = tokio::time::timeout(Duration::from_secs(3), async { tokio::join!(first, second) }).await
+        .expect("Cancellation must settle both the original and the queued submission");
+    assert_eq!(first.unwrap().unwrap_err().kind, JsExecutionErrorKind::Timeout);
+    assert!(second.unwrap().is_err(), "The queued submission must receive the predecessor's cancellation");
+    let third = tokio::time::timeout(Duration::from_secs(2), engine.execute_script_function(
+        &script, "submit", &params, &BTreeMap::from([("CALL_OWNER".into(), "after-timeout".into())]),
+        None, true, None,
+    )).await.expect("A later input must not remain behind the cancelled queue");
+    let inspected = engine.execute_script_function(&script, "inspect", &params, &BTreeMap::new(), None, true, None).await;
+    finishGatedTool(&host);
+    engine.destroy();
+    expect_js_output(third, "Waifu submission after timeout");
+    assert_eq!(expect_js_output(inspected, "Waifu owners after timeout"), "[\"timed-out\",\"after-timeout\"]");
 }
 
 /// A completed asynchronous call must not resurrect its cleaned id for a suspended caller.
@@ -5722,4 +6004,90 @@ async fn wasm_usearch_indexes_searches_deletes_and_restores_real_vectors() {
     }
     assert_eq!(host.wasmModuleReads.load(Ordering::Relaxed), 1);
     engine.destroy();
+}
+
+/// Exercises the actual compiled SDK/bootstrap and native boundary with no Android process execution.
+#[tokio::test(flavor = "current_thread")]
+async fn v1_android_shell_uses_native_system_terminal_and_cleans_up() {
+    testJavaScriptRuntimeHost();
+    register_test_runtime_storage("v1-shell");
+    for version in ["1.0.0", "1.0.1"] {
+        let host = Arc::new(TestPluginConfigExecutionHost::default());
+        let engine = super::JsEngine::new_toolpkg_execution_engine(host.clone(), ToolPkgExecutionContext {
+            context_key: format!("v1-shell:{version}"), container_package_name: "legacy.shell".into(),
+            api_version: version.into(), text_resource_host: Arc::new(StaticToolPkgTextResourceHost { resources:BTreeMap::new() }),
+        }).unwrap();
+        let mut params = testParams();
+        params.insert("__operit_package_state".into(), Value::String("android".into()));
+        let script = r#"
+            exports.run = async function() {
+                var receipt = await Tools.System.shell('dumpsys usagestats');
+                var errors = [];
+                for (var command of ['denied', 'timeout']) {
+                    try { await Tools.System.shell(command); }
+                    catch (error) { errors.push(error.message); }
+                }
+                return {command:receipt.command, output:receipt.output, exitCode:receipt.exitCode,
+                    text:String(receipt), terminal:typeof Tools.System.terminal, errors:errors};
+            };
+        "#;
+        let output = engine.execute_script_function(script, "run", &params, &BTreeMap::new(), None, true, None).await;
+        let result: Value = serde_json::from_str(&expect_js_output(output, "native v1 shell")).unwrap();
+        assert_eq!(result["command"], "dumpsys usagestats");
+        assert_eq!(result["output"], "raw native output\n");
+        assert_eq!(result["text"], result["output"]);
+        assert_eq!(result["exitCode"], 0);
+        assert_eq!(result["terminal"], "object");
+        assert!(result["errors"][0].as_str().unwrap().contains("code 1"));
+        assert!(result["errors"][1].as_str().unwrap().contains("timed out"));
+        let calls = host.legacyShellCalls.lock().unwrap();
+        assert_eq!(calls.len(), 9);
+        for chunk in calls.chunks(3) {
+            assert_eq!(chunk[0]["tool"], "create_terminal_session");
+            assert_eq!(chunk[0]["params"]["type"], "shell");
+            assert_eq!(chunk[1]["tool"], "execute_in_terminal_session");
+            assert_eq!(chunk[2]["tool"], "close_terminal_session");
+        }
+        drop(calls);
+        let legacy = engine.execute_script_function(
+            "exports.legacy = async function() { return await Tools.System.terminal.create('audit'); };",
+            "legacy", &params, &BTreeMap::new(), None, true, None,
+        ).await;
+        let legacy: Value = serde_json::from_str(&expect_js_output(legacy, "native legacy terminal")).unwrap();
+        assert_eq!(legacy["terminalType"], "bash");
+        engine.destroy();
+    }
+}
+
+/// Uses the existing environment host unchanged; v1 preference behavior lives entirely in the SDK adapter.
+#[tokio::test(flavor = "current_thread")]
+async fn v1_shared_preferences_use_existing_environment_host() {
+    testJavaScriptRuntimeHost();
+    register_test_runtime_storage("v1-preferences-config");
+    for version in ["1.0.0", "1.0.1"] {
+        let host = Arc::new(TestPluginConfigExecutionHost::default());
+        let make_engine = || super::JsEngine::new_toolpkg_execution_engine(host.clone(), ToolPkgExecutionContext {
+            context_key: format!("v1-preferences-config:{version}"), container_package_name: "com.raineiris.messenger".into(),
+            api_version: version.into(), text_resource_host: Arc::new(StaticToolPkgTextResourceHost { resources: BTreeMap::new() }),
+        }).unwrap();
+        let engine = make_engine();
+        let wrote = engine.execute_script_function(
+            "exports.write = function() { return Java.getContext().getSharedPreferences('toolpkg_messenger', 0).edit().putBoolean('bridge_enabled', true).putString('bridges_json', '[{\"id\":\"bridge_1\"}]').commit(); };",
+            "write", &testParams(), &BTreeMap::new(), None, true, None,
+        ).await;
+        assert_eq!(expect_js_output(wrote, "v1 preference config write"), "true");
+        engine.destroy();
+        assert_eq!(host.environment.lock().unwrap().len(), 1);
+        assert!(host.environment.lock().unwrap().keys().all(|key| key.starts_with("__OPERIT_V1_PREFS_")));
+        let engine = make_engine();
+        let fallback = "exports.bridge_status = function() { var p=Java.getApplicationContext().getSharedPreferences('toolpkg_messenger',0); return {global_enabled:p.getBoolean('bridge_enabled',false),bridge_count:JSON.parse(p.getString('bridges_json','[]')).length}; };";
+        let source = std::env::var("OPERIT_MARKET_MESSENGER_CORE").ok().map(|path| std::fs::read_to_string(path).unwrap()).unwrap_or_else(|| fallback.into());
+        let read = engine.execute_script_function(&source, "bridge_status", &testParams(), &BTreeMap::new(), None, true, None).await;
+        let read: Value = serde_json::from_str(&expect_js_output(read, "reopened v1 preference config")).unwrap();
+        assert_eq!(read["global_enabled"], true);
+        assert_eq!(read["bridge_count"], 1);
+        assert!(host.environmentOwners.lock().unwrap().iter().all(|owner| owner ==
+            &operit_plugin_sdk::javascript::JsEnvironmentOwner::Package("com.raineiris.messenger".into())));
+        engine.destroy();
+    }
 }

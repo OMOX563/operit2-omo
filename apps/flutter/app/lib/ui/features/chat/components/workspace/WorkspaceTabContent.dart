@@ -28,11 +28,14 @@ class WorkspaceTabContent extends StatelessWidget {
     super.key,
     required this.tab,
     required this.workspacePath,
+    this.fileDirectory,
     required this.workspaceUsage,
     required this.terminalSessionCountListenable,
     required this.browserSessionCountListenable,
     this.terminalSessionsListenable,
     required this.onListWorkspaceFiles,
+    this.onMutateWorkspaceFile,
+    this.fileClipboard,
     required this.onListWorkspaceBindingDirectories,
     required this.onReadWorkspaceTextFile,
     required this.onReadWorkspaceFileBytes,
@@ -51,7 +54,6 @@ class WorkspaceTabContent extends StatelessWidget {
     this.onSelectBrowserTab,
     this.onCloseBrowserSession,
     required this.onFinishWebVisit,
-    required this.onActivateCurrentTab,
     required this.onCloseCurrentTab,
     required this.onOpenWorkspaceCreator,
     required this.onBindWorkspace,
@@ -63,6 +65,7 @@ class WorkspaceTabContent extends StatelessWidget {
 
   final WorkspaceTab tab;
   final String? workspacePath;
+  final String? fileDirectory;
   final WorkspaceOverviewUsage workspaceUsage;
   final ValueListenable<int> terminalSessionCountListenable;
   final ValueListenable<int> browserSessionCountListenable;
@@ -70,6 +73,8 @@ class WorkspaceTabContent extends StatelessWidget {
   terminalSessionsListenable;
   final Future<List<WorkspaceFileEntry>> Function(String path)
   onListWorkspaceFiles;
+  final WorkspaceFileMutation? onMutateWorkspaceFile;
+  final WorkspaceFileClipboard? fileClipboard;
   final Future<List<WorkspaceFileEntry>> Function(String path)
   onListWorkspaceBindingDirectories;
   final Future<String> Function(String path) onReadWorkspaceTextFile;
@@ -96,7 +101,6 @@ class WorkspaceTabContent extends StatelessWidget {
   final ValueChanged<String>? onCloseBrowserSession;
   final void Function(WorkspaceTab tab, WebVisitResponse response)
   onFinishWebVisit;
-  final VoidCallback onActivateCurrentTab;
   final VoidCallback onCloseCurrentTab;
   final VoidCallback onOpenWorkspaceCreator;
   final Future<void> Function(String workspace) onBindWorkspace;
@@ -113,6 +117,7 @@ class WorkspaceTabContent extends StatelessWidget {
       case WorkspaceTabKind.home:
         return WorkspaceHomeContent(
           workspacePath: workspacePath,
+          fileDirectory: fileDirectory,
           workspaceUsage: workspaceUsage,
           terminalSessionCountListenable: terminalSessionCountListenable,
           browserSessionCountListenable: browserSessionCountListenable,
@@ -147,7 +152,7 @@ class WorkspaceTabContent extends StatelessWidget {
           },
         );
       case WorkspaceTabKind.files:
-        final rootPath = workspacePath?.trim();
+        final rootPath = fileDirectory?.trim() ?? workspacePath?.trim();
         if (rootPath == null || rootPath.isEmpty) {
           return _WorkspaceSimplePane(
             icon: Icons.folder_off_outlined,
@@ -161,6 +166,9 @@ class WorkspaceTabContent extends StatelessWidget {
           rootLabel: rootPath,
           rootRelativePath: initialRelativePath,
           onListWorkspaceFiles: onListWorkspaceFiles,
+          onMutateWorkspaceFile: onMutateWorkspaceFile,
+          fileClipboard: fileClipboard,
+          protectWorkspaceRoots: workspacePath?.trim().isNotEmpty == true,
           onOpenFile: onOpenFile,
         );
       case WorkspaceTabKind.terminal:
@@ -192,7 +200,6 @@ class WorkspaceTabContent extends StatelessWidget {
           onWriteWorkspaceFileBytes: onWriteWorkspaceFileBytes,
           onOpenWorkspaceFile: onOpenWorkspaceFile,
           onOpenBrowserTab: onOpenBrowser,
-          onActivateRequested: onActivateCurrentTab,
           onCloseRequested: onCloseCurrentTab,
         );
       case WorkspaceTabKind.webVisit:

@@ -6,7 +6,19 @@ import 'package:flutter/material.dart';
 
 import 'RetainedPage.dart';
 
-/// Hosts a resizable trailing panel on wide layouts and an overlay panel on phones.
+/// Selects whether the panel shares the host width or covers its content.
+enum SidePanelLayout {
+  /// Chooses between split and overlay layouts using the host width.
+  adaptive,
+
+  /// Reserves a resizable pane alongside the content at every host width.
+  split,
+
+  /// Covers the content with a full-width panel at every host width.
+  overlay,
+}
+
+/// Hosts a resizable split pane or a full-width overlay.
 class AdaptiveSidePanel extends StatefulWidget {
   /// Creates a responsive trailing panel around the primary content.
   const AdaptiveSidePanel({
@@ -15,6 +27,7 @@ class AdaptiveSidePanel extends StatefulWidget {
     required this.onOpenChanged,
     required this.panel,
     required this.child,
+    this.layout = SidePanelLayout.adaptive,
     this.breakpoint = 600,
     this.defaultWidth = 360,
     this.defaultWidthFraction,
@@ -24,6 +37,7 @@ class AdaptiveSidePanel extends StatefulWidget {
     this.resizeHandleVisualWidth = 3,
     this.resizeHandleHeight = 56,
     this.closedDropTarget,
+    this.overlayTopInset = 0,
     this.widePanelPadding = const EdgeInsets.all(8),
     this.animate = true,
   });
@@ -32,6 +46,11 @@ class AdaptiveSidePanel extends StatefulWidget {
   final ValueChanged<bool> onOpenChanged;
   final Widget panel;
   final Widget child;
+
+  /// Explicit split and overlay layouts are independent of window geometry.
+  final SidePanelLayout layout;
+
+  /// Applies only to [SidePanelLayout.adaptive].
   final double breakpoint;
   final double defaultWidth;
   final double? defaultWidthFraction;
@@ -41,6 +60,9 @@ class AdaptiveSidePanel extends StatefulWidget {
   final double resizeHandleVisualWidth;
   final double resizeHandleHeight;
   final Widget? closedDropTarget;
+
+  /// Leaves the host's existing toolbar visible and interactive above an overlay.
+  final double overlayTopInset;
 
   /// Embedded panes can meet the host edges without adding a second frame.
   final EdgeInsetsGeometry widePanelPadding;
@@ -74,22 +96,26 @@ class _AdaptiveSidePanelState extends State<AdaptiveSidePanel> {
     }
   }
 
-  /// Changes only geometry when the available width crosses the breakpoint.
+  /// Resolves pane dimensions without changing an explicit layout choice.
   @override
   Widget build(BuildContext context) {
     // Retain the content widget across LayoutBuilder's constraint-only frames.
     final content = widget.child;
     return LayoutBuilder(
       builder: (context, constraints) {
-        final useWideLayout = constraints.maxWidth >= widget.breakpoint;
-        final maximumPanelWidth = useWideLayout
+        final useSplitLayout = switch (widget.layout) {
+          SidePanelLayout.adaptive => constraints.maxWidth >= widget.breakpoint,
+          SidePanelLayout.split => true,
+          SidePanelLayout.overlay => false,
+        };
+        final maximumPanelWidth = useSplitLayout
             ? math.max(0.0, constraints.maxWidth - widget.minContentWidth)
             : constraints.maxWidth;
-        final minimumPanelWidth = useWideLayout
+        final minimumPanelWidth = useSplitLayout
             ? math.min(widget.minWidth, maximumPanelWidth)
             : constraints.maxWidth;
         final targetDefaultWidth =
-            widget.defaultWidthFraction != null && useWideLayout
+            widget.defaultWidthFraction != null && useSplitLayout
             ? math.max(
                 widget.defaultWidth,
                 constraints.maxWidth * widget.defaultWidthFraction!,
@@ -102,7 +128,7 @@ class _AdaptiveSidePanelState extends State<AdaptiveSidePanel> {
         );
         return _buildLayout(
           content: content,
-          useWideLayout: useWideLayout,
+          useSplitLayout: useSplitLayout,
           width: panelWidth,
           minimum: minimumPanelWidth,
           maximum: maximumPanelWidth,
@@ -121,11 +147,11 @@ class _AdaptiveSidePanelState extends State<AdaptiveSidePanel> {
     return rawWidth.clamp(minimum, maximum).toDouble();
   }
 
-  /// Uses the same ancestry for wide and overlay layouts so neither the chat
+  /// Uses the same ancestry for split and overlay layouts so neither the chat
   /// nor the panel is unmounted by a navigation sidebar width animation.
   Widget _buildLayout({
     required Widget content,
-    required bool useWideLayout,
+    required bool useSplitLayout,
     required double width,
     required double minimum,
     required double maximum,
@@ -143,13 +169,17 @@ class _AdaptiveSidePanelState extends State<AdaptiveSidePanel> {
             AnimatedContainer(
               duration: _animationDuration,
               curve: Curves.easeOutCubic,
-              width: useWideLayout && widget.open ? width : 0,
+              width: useSplitLayout && widget.open ? width : 0,
             ),
           ],
         ),
-        if (!useWideLayout && widget.open)
-          Positioned.fill(
+        if (!useSplitLayout && widget.open)
+          PositionedDirectional(
             key: const ValueKey<String>('sidePanelDismissBarrier'),
+            top: widget.overlayTopInset,
+            bottom: 0,
+            start: 0,
+            end: 0,
             child: GestureDetector(
               behavior: HitTestBehavior.opaque,
               onTap: () => widget.onOpenChanged(false),
@@ -162,7 +192,7 @@ class _AdaptiveSidePanelState extends State<AdaptiveSidePanel> {
           onEnd: _finishPanelTransition,
           duration: _animationDuration,
           curve: Curves.easeOutCubic,
-          top: 0,
+          top: useSplitLayout ? 0 : widget.overlayTopInset,
           bottom: 0,
           end: widget.open ? 0 : -width,
           width: width,
@@ -172,15 +202,15 @@ class _AdaptiveSidePanelState extends State<AdaptiveSidePanel> {
               Positioned.fill(
                 child: RetainedPage(
                   active: widget.open || _closing,
-                  child: useWideLayout
-                      ? Padding(
-                          padding: widget.widePanelPadding,
-                          child: widget.panel,
-                        )
-                      : widget.panel,
+                  child: Padding(
+                    padding: useSplitLayout
+                        ? widget.widePanelPadding
+                        : EdgeInsets.zero,
+                    child: widget.panel,
+                  ),
                 ),
               ),
-              if (useWideLayout && widget.open)
+              if (useSplitLayout && widget.open)
                 PositionedDirectional(
                   top: 0,
                   bottom: 0,
@@ -200,7 +230,7 @@ class _AdaptiveSidePanelState extends State<AdaptiveSidePanel> {
                     onDragEnd: _endResize,
                   ),
                 ),
-              if (useWideLayout &&
+              if (useSplitLayout &&
                   !widget.open &&
                   widget.closedDropTarget != null)
                 PositionedDirectional(

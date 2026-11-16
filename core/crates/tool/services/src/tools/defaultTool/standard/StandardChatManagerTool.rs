@@ -618,7 +618,7 @@ impl StandardChatManagerTool {
             Ok(None) => return toolError(tool, format!("Chat does not exist: {chatId}")),
             Err(error) => return toolError(tool, format!("Error loading chat: {error}")),
         }
-        match manager.loadChatMessagesWithOptions(chatId.clone(), Some(order.clone()), Some(limit))
+        match manager.loadChatMessagesRange(chatId.clone(), order.clone(), 0, limit - 1)
         {
             Ok(messages) => successData(
                 tool,
@@ -789,7 +789,7 @@ impl AsyncToolExecutor for ChatManagerToolExecutor {
     }
 
     /// Creates local runtime futures on their owning scheduler and awaits only a Send receipt.
-    fn invokeAndStreamAsync<'a>(&'a mut self, tool: &'a AITool, context: &'a ToolInvocationContext) -> ToolInvocationFuture<'a> {
+    fn invokeAndStreamAsync<'a>(&'a self, tool: &'a AITool, context: &'a ToolInvocationContext) -> ToolInvocationFuture<'a> {
         let tools = self.tools.clone();
         let operation = self.operation;
         let request = tool.clone();
@@ -1285,6 +1285,7 @@ fn parseSendAttachments(tool: &AITool) -> Result<Vec<AttachmentInfo>, String> {
             let records: Vec<ChatSendAttachment> = serde_json::from_str(&value)
                 .map_err(|error| format!("attachments must be a complete attachment array: {error}"))?;
             Ok(records.into_iter().map(|record| AttachmentInfo {
+                vfsPath: record.vfsPath.as_value().cloned(),
                 filePath: record.filePath, nodeId: record.nodeId.as_value().cloned(), fileName: record.fileName,
                 mimeType: record.mimeType, fileSize: record.fileSize, content: record.content,
             }).collect())

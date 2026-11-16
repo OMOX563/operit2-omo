@@ -3,9 +3,7 @@
 import 'dart:async';
 
 import 'package:desktop_drop/desktop_drop.dart';
-import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
 import 'package:operit_ui/operit_ui.dart';
 
 import '../../../../../../../core/logging/ClientLogger.dart';
@@ -22,8 +20,10 @@ import '../common/ChatAttachmentImagePreview.dart';
 import '../common/ChatAttachmentMenuPopup.dart';
 import '../common/ChatComposerSendActionMenu.dart';
 import '../common/ChatComposerSlotHost.dart';
+import '../common/ChatInputEnterShortcuts.dart';
 import '../common/ChatPendingMessageQueuePanel.dart';
 import '../common/ChatPastedImageHandler.dart';
+import '../common/InputProcessingStatusLane.dart';
 import '../common/PendingQueueMessageItem.dart';
 import 'AgentInputMenuPopup.dart';
 import 'AgentModelSelectorPopup.dart';
@@ -58,7 +58,7 @@ class AgentChatInputSection extends StatefulWidget {
     this.onGuidePendingQueueMessage,
     this.attachments = const <AttachmentInfo>[],
     this.onRemoveAttachment,
-    this.onInsertAttachment,
+    this.onPreviewAttachment,
     this.onAttachImage,
     this.onTakePhoto,
     this.onPluginAttachment,
@@ -99,7 +99,7 @@ class AgentChatInputSection extends StatefulWidget {
   final ValueChanged<int>? onGuidePendingQueueMessage;
   final List<AttachmentInfo> attachments;
   final ValueChanged<String>? onRemoveAttachment;
-  final ValueChanged<AttachmentInfo>? onInsertAttachment;
+  final ValueChanged<AttachmentInfo>? onPreviewAttachment;
   final VoidCallback? onAttachImage;
   final VoidCallback? onTakePhoto;
   final ChatAttachmentCompletion? onPluginAttachment;
@@ -218,6 +218,8 @@ class _AgentChatInputSectionState extends State<AgentChatInputSection>
     final overlay = Overlay.of(context);
     _mentionPopupEntry = OverlayEntry(
       builder: (context) {
+        final panel = widget.mentionSuggestionPanel;
+        if (!mounted || panel == null) return const SizedBox.shrink();
         final placement = _popupPlacement(
           context,
           targetKey: _mentionPopupTargetKey,
@@ -242,7 +244,7 @@ class _AgentChatInputSectionState extends State<AgentChatInputSection>
                 onTap: () {},
                 child: ConstrainedBox(
                   constraints: BoxConstraints(maxHeight: placement.maxHeight),
-                  child: widget.mentionSuggestionPanel!,
+                  child: panel,
                 ),
               ),
             ),
@@ -731,7 +733,7 @@ class _AgentChatInputSectionState extends State<AgentChatInputSection>
                     onToggleInputExpansion: _toggleInputExpansion,
                     attachments: widget.attachments,
                     onRemoveAttachment: widget.onRemoveAttachment,
-                    onInsertAttachment: widget.onInsertAttachment,
+                    onPreviewAttachment: widget.onPreviewAttachment,
                     onAttachFiles: widget.onAttachFiles,
                     onPasteImages: widget.onPasteImages,
                     draggingFiles: _draggingFiles,
@@ -762,6 +764,7 @@ class _ModelSelectorIdentity extends StatelessWidget {
     required this.expanded,
   });
   final String label;
+
   final TextStyle style;
   final String providerTypeId;
   final String fallbackName;
@@ -817,7 +820,7 @@ class _InputBody extends StatelessWidget {
     required this.onToggleInputExpansion,
     required this.attachments,
     required this.onRemoveAttachment,
-    required this.onInsertAttachment,
+    required this.onPreviewAttachment,
     required this.onAttachFiles,
     required this.onPasteImages,
     required this.draggingFiles,
@@ -834,6 +837,7 @@ class _InputBody extends StatelessWidget {
   final String modelLabel;
   final String modelProviderTypeId;
   final String modelProviderName;
+
   final bool modelSelectorOpen;
   final LayerLink modelSelectorLink;
   final GlobalKey modelSelectorKey;
@@ -858,7 +862,7 @@ class _InputBody extends StatelessWidget {
   final VoidCallback onToggleInputExpansion;
   final List<AttachmentInfo> attachments;
   final ValueChanged<String>? onRemoveAttachment;
-  final ValueChanged<AttachmentInfo>? onInsertAttachment;
+  final ValueChanged<AttachmentInfo>? onPreviewAttachment;
   final ValueChanged<List<String>>? onAttachFiles;
   final ValueChanged<List<PastedImageAttachmentPayload>>? onPasteImages;
   final bool draggingFiles;
@@ -897,11 +901,12 @@ class _InputBody extends StatelessWidget {
           _AttachmentStrip(
             attachments: attachments,
             onRemoveAttachment: onRemoveAttachment,
-            onInsertAttachment: onInsertAttachment,
+            onPreviewAttachment: onPreviewAttachment,
           ),
       ],
-      editor: _DesktopEnterSendShortcuts(
+      editor: ChatInputEnterShortcuts(
         controller: controller,
+        inputExpanded: inputExpanded,
         canSendMessage: canSendMessage,
         onSendMessage: onSendMessage,
         child: ChatPastedImageHandler(
@@ -918,11 +923,6 @@ class _InputBody extends StatelessWidget {
                 chatPastedImageContentInsertionConfiguration(
                   onPasteImages: onPasteImages,
                 ),
-            onSubmitted: (_) {
-              if (canSendMessage) {
-                onSendMessage();
-              }
-            },
             onToggleExpansion: onToggleInputExpansion,
             expandTooltip: l10n.expandInput,
             collapseTooltip: l10n.collapseInput,
@@ -1439,12 +1439,12 @@ class _AttachmentStrip extends StatelessWidget {
   const _AttachmentStrip({
     required this.attachments,
     required this.onRemoveAttachment,
-    required this.onInsertAttachment,
+    required this.onPreviewAttachment,
   });
 
   final List<AttachmentInfo> attachments;
   final ValueChanged<String>? onRemoveAttachment;
-  final ValueChanged<AttachmentInfo>? onInsertAttachment;
+  final ValueChanged<AttachmentInfo>? onPreviewAttachment;
 
   @override
   Widget build(BuildContext context) {
@@ -1465,7 +1465,7 @@ class _AttachmentStrip extends StatelessWidget {
             attachment: attachment,
             colorScheme: colorScheme,
             onRemoveAttachment: onRemoveAttachment,
-            onInsertAttachment: onInsertAttachment,
+            onPreviewAttachment: onPreviewAttachment,
           );
         },
       ),
@@ -1478,13 +1478,13 @@ class _AttachmentChip extends StatelessWidget {
     required this.attachment,
     required this.colorScheme,
     required this.onRemoveAttachment,
-    required this.onInsertAttachment,
+    required this.onPreviewAttachment,
   });
 
   final AttachmentInfo attachment;
   final ColorScheme colorScheme;
   final ValueChanged<String>? onRemoveAttachment;
-  final ValueChanged<AttachmentInfo>? onInsertAttachment;
+  final ValueChanged<AttachmentInfo>? onPreviewAttachment;
 
   @override
   Widget build(BuildContext context) {
@@ -1504,9 +1504,9 @@ class _AttachmentChip extends StatelessWidget {
                   borderRadius: BorderRadius.circular(12),
                   clipBehavior: Clip.antiAlias,
                   child: InkWell(
-                    onTap: onInsertAttachment == null
+                    onTap: onPreviewAttachment == null
                         ? null
-                        : () => onInsertAttachment!(attachment),
+                        : () => onPreviewAttachment!(attachment),
                     child: ChatAttachmentImagePreview(
                       attachmentPath: attachment.filePath,
                       fileName: attachment.fileName,
@@ -1540,9 +1540,9 @@ class _AttachmentChip extends StatelessWidget {
         ),
         clipBehavior: Clip.antiAlias,
         child: InkWell(
-          onTap: onInsertAttachment == null
+          onTap: onPreviewAttachment == null
               ? null
-              : () => onInsertAttachment!(attachment),
+              : () => onPreviewAttachment!(attachment),
           child: SizedBox(
             height: 26,
             child: Row(
@@ -1657,64 +1657,6 @@ IconData _attachmentIcon(String mimeType) {
   return Icons.description;
 }
 
-class _DesktopEnterSendShortcuts extends StatelessWidget {
-  const _DesktopEnterSendShortcuts({
-    required this.controller,
-    required this.canSendMessage,
-    required this.onSendMessage,
-    required this.child,
-  });
-
-  final TextEditingController controller;
-  final bool canSendMessage;
-  final VoidCallback onSendMessage;
-  final Widget child;
-
-  @override
-  Widget build(BuildContext context) {
-    if (!_usesDesktopEnterSend) {
-      return child;
-    }
-    return CallbackShortcuts(
-      bindings: <ShortcutActivator, VoidCallback>{
-        const SingleActivator(LogicalKeyboardKey.enter): _sendIfReady,
-        const SingleActivator(LogicalKeyboardKey.numpadEnter): _sendIfReady,
-        const SingleActivator(LogicalKeyboardKey.enter, control: true):
-            _insertNewline,
-        const SingleActivator(LogicalKeyboardKey.numpadEnter, control: true):
-            _insertNewline,
-      },
-      child: child,
-    );
-  }
-
-  bool get _usesDesktopEnterSend {
-    return defaultTargetPlatform == TargetPlatform.windows ||
-        defaultTargetPlatform == TargetPlatform.macOS;
-  }
-
-  void _sendIfReady() {
-    if (canSendMessage) {
-      onSendMessage();
-    }
-  }
-
-  void _insertNewline() {
-    final value = controller.value;
-    final text = value.text;
-    final selection = value.selection;
-    final range = selection.isValid
-        ? selection
-        : TextSelection.collapsed(offset: text.length);
-    final nextText = text.replaceRange(range.start, range.end, '\n');
-    controller.value = TextEditingValue(
-      text: nextText,
-      selection: TextSelection.collapsed(offset: range.start + 1),
-      composing: TextRange.empty,
-    );
-  }
-}
-
 class _PopupPlacement {
   const _PopupPlacement({
     required this.left,
@@ -1809,7 +1751,7 @@ double _progressFor(core_proxy.InputProcessingState state) {
   return switch (state.kind) {
     'Processing' => 0.3,
     'Connecting' => 0.6,
-    'Summarizing' => 0.05,
+    'Summarizing' => summaryStageProgress(state.message),
     'ToolProgress' => state.progress.clamp(0, 1),
     _ => 1,
   };

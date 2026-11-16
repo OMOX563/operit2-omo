@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
+use serde::Deserialize;
 use serde_json::Value;
 
 use operit_model::PromptTurn::PromptTurn;
@@ -8,6 +9,8 @@ use operit_model::PromptTurn::PromptTurn;
 #[derive(Clone, Debug)]
 pub struct SummaryHookContext {
     pub stage: String,
+    /// Conversation captured for this summary, independent of the currently open chat.
+    pub chat_id: Option<String>,
     pub use_english: Option<bool>,
     pub previous_summary: Option<String>,
     pub chat_history: Vec<PromptTurn>,
@@ -19,13 +22,15 @@ pub struct SummaryHookContext {
     pub metadata: HashMap<String, Value>,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SummaryHookMutation {
     pub chat_history: Option<Vec<PromptTurn>>,
     pub prepared_history: Option<Vec<PromptTurn>>,
     pub system_prompt: Option<String>,
     pub summary_prompt: Option<String>,
     pub summary_result: Option<String>,
+    #[serde(default)]
     pub metadata: HashMap<String, Value>,
 }
 
@@ -84,14 +89,16 @@ impl SummaryHookRegistry {
         let mut current = initial_context;
         for hook in snapshot {
             if let Some(mutation) = hook.on_event_async(&current).await? {
-                current = apply_mutation(current, mutation);
+                current = applySummaryHookMutation(current, mutation);
             }
         }
         Ok(current)
     }
 }
 
-fn apply_mutation(
+/// Applies one summary mutation for both native and sequential ToolPkg dispatchers.
+#[allow(non_snake_case)]
+pub fn applySummaryHookMutation(
     mut current: SummaryHookContext,
     mutation: SummaryHookMutation,
 ) -> SummaryHookContext {

@@ -32,6 +32,24 @@ ThemeData buildOperitThemeData(
   return ThemeData(
     colorScheme: colorScheme,
     scaffoldBackgroundColor: Colors.transparent,
+    // The scene background lives above the Navigator. A solid transition fill
+    // would cover it until the editor route finishes entering or leaving.
+    pageTransitionsTheme: PageTransitionsTheme(
+      builders: {
+        ...const PageTransitionsTheme().builders,
+        TargetPlatform.android:
+            const _ThemePredictiveBackPageTransitionsBuilder(),
+        TargetPlatform.windows: const ZoomPageTransitionsBuilder(
+          backgroundColor: Colors.transparent,
+        ),
+        TargetPlatform.linux: const ZoomPageTransitionsBuilder(
+          backgroundColor: Colors.transparent,
+        ),
+        TargetPlatform.fuchsia: const ZoomPageTransitionsBuilder(
+          backgroundColor: Colors.transparent,
+        ),
+      },
+    ),
     canvasColor: colorScheme.surface,
     textTheme: textTheme,
     inputDecorationTheme: _inputDecorationTheme(colorScheme, textTheme),
@@ -63,6 +81,40 @@ ThemeData buildOperitThemeData(
     fontFamilyFallback: fontFamilyFallback,
     useMaterial3: true,
   );
+}
+
+/// Preserves Android's predictive back gesture and keeps ordinary navigation
+/// transparent to the background shared by all routes.
+class _ThemePredictiveBackPageTransitionsBuilder
+    extends PredictiveBackPageTransitionsBuilder {
+  const _ThemePredictiveBackPageTransitionsBuilder();
+
+  @override
+  Widget buildTransitions<T>(
+    PageRoute<T> route,
+    BuildContext context,
+    Animation<double> animation,
+    Animation<double> secondaryAnimation,
+    Widget child,
+  ) {
+    final theme = Theme.of(context);
+    // Keep the framework's gesture observer mounted. Only its transition sees
+    // a transparent surface; the page retains the original Material colors.
+    return Theme(
+      data: theme.copyWith(
+        colorScheme: theme.colorScheme.copyWith(surface: Colors.transparent),
+      ),
+      child: Builder(
+        builder: (context) => super.buildTransitions(
+          route,
+          context,
+          animation,
+          secondaryAnimation,
+          Theme(data: theme, child: child),
+        ),
+      ),
+    );
+  }
 }
 
 /// Builds the shared theme for Material 3 DropdownMenu widgets.
@@ -154,16 +206,18 @@ DialogThemeData _dialogTheme(ColorScheme colorScheme, TextTheme textTheme) {
     surfaceTintColor: Colors.transparent,
     elevation: 6,
     shadowColor: colorScheme.shadow.withValues(alpha: 0.18),
-    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(28)),
+    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+    constraints: const BoxConstraints(minWidth: 280, maxWidth: 560),
     clipBehavior: Clip.antiAlias,
     insetPadding: const EdgeInsets.symmetric(horizontal: 24, vertical: 24),
     actionsPadding: const EdgeInsets.fromLTRB(24, 0, 24, 20),
-    titleTextStyle: textTheme.headlineSmall?.copyWith(
+    titleTextStyle: textTheme.titleLarge?.copyWith(
       color: colorScheme.onSurface,
-      fontWeight: FontWeight.w700,
+      fontWeight: FontWeight.w600,
     ),
     contentTextStyle: textTheme.bodyMedium?.copyWith(
       color: colorScheme.onSurfaceVariant,
+      height: 1.5,
     ),
     iconColor: colorScheme.primary,
     barrierColor: Colors.black.withValues(alpha: 0.38),
@@ -211,11 +265,11 @@ InputDecorationTheme _inputDecorationTheme(
     focusedErrorBorder: errorBorder.copyWith(
       borderSide: BorderSide(color: colorScheme.error, width: 1.4),
     ),
-    labelStyle: textTheme.labelSmall?.copyWith(
+    labelStyle: textTheme.labelMedium?.copyWith(
       color: colorScheme.onSurfaceVariant,
       fontWeight: FontWeight.w400,
     ),
-    floatingLabelStyle: textTheme.labelSmall?.copyWith(
+    floatingLabelStyle: textTheme.labelMedium?.copyWith(
       color: colorScheme.primary,
       fontWeight: FontWeight.w500,
     ),

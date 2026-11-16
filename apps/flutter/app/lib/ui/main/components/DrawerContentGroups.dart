@@ -31,8 +31,20 @@ enum _GroupQuickAction {
 extension _NativeWorkspaceGroups on _DrawerContentState {
   List<_NativeWorkspaceGroup> _nativeGroups(_WorkspaceSection section) {
     final groups = <String?, List<core_proxy.ChatHistoryListItem>>{};
-    for (final chat in section.histories) {
-      groups.putIfAbsent(_normalizedGroupName(chat), () => []).add(chat);
+    final tree = ChatHistoryTree(section.histories);
+    // A child follows its parent's group while it belongs to this workspace.
+    void addBranch(
+      core_proxy.ChatHistoryListItem chat,
+      List<core_proxy.ChatHistoryListItem> branch,
+    ) {
+      branch.add(chat);
+      for (final child in tree.children[chat.id]!) {
+        addBranch(child, branch);
+      }
+    }
+
+    for (final root in tree.roots) {
+      addBranch(root, groups.putIfAbsent(_normalizedGroupName(root), () => []));
     }
     final result = [
       for (final entry in groups.entries)
@@ -66,17 +78,6 @@ extension _NativeWorkspaceGroups on _DrawerContentState {
             _normalizedGroupName(chat) == name,
       )
       .toList(growable: false);
-
-  List<core_proxy.ChatHistoryListItem> _groupPreview(
-    List<core_proxy.ChatHistoryListItem> chats,
-  ) => [
-    for (var i = 0; i < chats.length; i++)
-      if (i < _DrawerContentState._previewLimit ||
-          chats[i].pinned ||
-          chats[i].id == widget.currentChatId ||
-          widget.activeStreamingChatIds.contains(chats[i].id))
-        chats[i],
-  ];
 
   Future<void> _runGroupMutation(Future<void> Function() mutation) async {
     if (_groupMutationPending) return;
@@ -246,6 +247,7 @@ class _GroupSectionHeader extends StatefulWidget {
     required this.group,
     required this.pinned,
     required this.expanded,
+    this.compact = false,
     required this.appearance,
     required this.canCreate,
     required this.onToggleExpanded,
@@ -261,6 +263,7 @@ class _GroupSectionHeader extends StatefulWidget {
   final _NativeWorkspaceGroup group;
   final bool pinned;
   final bool expanded;
+  final bool compact;
   final NavigationDrawerAppearance appearance;
   final bool canCreate;
   final VoidCallback onToggleExpanded;
@@ -311,10 +314,10 @@ class _GroupSectionHeaderState extends State<_GroupSectionHeader> {
           onExit: (_) => setState(() => _hovered = false),
           child: Padding(
             padding: EdgeInsetsDirectional.only(
-              start: 44,
+              start: widget.compact ? 14 : 16,
               end: 12,
-              top: 2,
-              bottom: widget.expanded ? 2 : 0,
+              top: widget.compact ? 0 : 2,
+              bottom: widget.compact ? 0 : (widget.expanded ? 2 : 0),
             ),
             child: DecoratedBox(
               decoration: BoxDecoration(
@@ -334,15 +337,22 @@ class _GroupSectionHeaderState extends State<_GroupSectionHeader> {
                   borderRadius: BorderRadius.circular(8),
                   onTap: widget.onToggleExpanded,
                   child: Padding(
-                    padding: const EdgeInsetsDirectional.fromSTEB(8, 4, 6, 4),
+                    padding: EdgeInsetsDirectional.fromSTEB(
+                      8,
+                      widget.compact ? 2 : 4,
+                      6,
+                      widget.compact ? 2 : 4,
+                    ),
                     child: Row(
                       children: <Widget>[
                         Icon(
                           Icons.folder_outlined,
-                          size: 14,
-                          color: appearance.itemColor.withValues(alpha: 0.76),
+                          size: widget.compact ? 13 : 14,
+                          color: appearance.itemColor.withValues(
+                            alpha: widget.compact ? 0.7 : 0.76,
+                          ),
                         ),
-                        const SizedBox(width: 7),
+                        SizedBox(width: widget.compact ? 7.5 : 7),
                         Expanded(
                           child: Text(
                             widget.group.label,
@@ -351,8 +361,9 @@ class _GroupSectionHeaderState extends State<_GroupSectionHeader> {
                             style: Theme.of(context).textTheme.bodySmall
                                 ?.copyWith(
                                   color: appearance.titleColor.withValues(
-                                    alpha: 0.86,
+                                    alpha: widget.compact ? 0.8 : 0.86,
                                   ),
+                                  fontSize: widget.compact ? 11.5 : null,
                                   fontWeight: FontWeight.w600,
                                 ),
                           ),

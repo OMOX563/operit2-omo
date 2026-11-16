@@ -11,6 +11,7 @@ import 'package:mime/mime.dart';
 
 import '../../../../core/application/PluginHotReload.dart';
 import '../../../../core/host/SelectedFileInput.dart';
+import '../../../../core/host/IncomingAttachmentService.dart';
 import '../../../../core/link/CoreLinkProtocol.dart';
 import '../../../../core/logging/ClientLogger.dart';
 import '../../../../core/proxy/generated/CoreProxyModels.g.dart' as core_proxy;
@@ -33,6 +34,7 @@ import '../components/ChatScrollNavigator.dart'
 import '../components/ChatMessageLocatorHost.dart';
 import '../components/ChatRuntimeScope.dart';
 import '../components/MessageEditorDialog.dart';
+import '../components/attachments/AttachmentViewerDialog.dart';
 import '../components/WorkspaceChangeConfirmDialog.dart';
 import '../components/WorkspaceShell.dart';
 import '../components/ChatMessageSlotHost.dart';
@@ -329,6 +331,7 @@ class _AIChatSurfaceState extends State<_AIChatSurface> {
   StreamSubscription<void>? _chatUiCatalogSubscription;
   String? _currentChatId;
   String? _currentWorkspacePath;
+  String? _currentFileDirectory;
   List<core_proxy.Workspace> _workspaces = const <core_proxy.Workspace>[];
   StreamSubscription<List<core_proxy.Workspace>>? _workspacesSubscription;
   String? _toastMessage;
@@ -417,6 +420,7 @@ class _AIChatSurfaceState extends State<_AIChatSurface> {
     _topBarController = TopBarScope.of(context);
     _mainLayoutController = MainLayoutScope.of(context);
     _isCurrentMainScreen = MainScreenActivityScope.isCurrentScreenOf(context);
+    _updateIncomingAttachmentReceiver();
     if (_isCurrentMainScreen) {
       _scheduleTopBarActionsUpdate();
     } else {
@@ -429,6 +433,7 @@ class _AIChatSurfaceState extends State<_AIChatSurface> {
   /// Releases chat state and subscriptions.
   @override
   void dispose() {
+    IncomingAttachmentService.instance.clearComposer(this);
     _saveCurrentInputDraft();
     ChatSelectionTransition.requests.removeListener(_onChatSelectionTransition);
     PendingChatDraftHandler.revision.removeListener(_consumePendingChatDraft);
@@ -1363,6 +1368,50 @@ class _AIChatSurfaceState extends State<_AIChatSurface> {
     await _refreshAttachments();
   }
 
+  /// Binds external delivery only after the selected main conversation is ready.
+  void _updateIncomingAttachmentReceiver() {
+    if (widget.embedded ||
+        !_isCurrentMainScreen ||
+        _isPreparingChatSwitch ||
+        _currentChatId == null ||
+        _requestedChatFlowChatId != _currentChatId ||
+        _chatFlowError != null) {
+      IncomingAttachmentService.instance.clearComposer(this);
+      return;
+    }
+    IncomingAttachmentService.instance.installComposer(
+      this,
+      _handleIncomingFiles,
+    );
+  }
+
+  /// Attaches a share batch to the captured conversation using the drop upload path.
+  Future<void> _handleIncomingFiles(List<SelectedFileInput> files) async {
+    final chatId = _currentChatId;
+    final generation = _chatSelectionGeneration;
+
+    /// Cancels the captured batch when its owning surface or selection expires.
+    bool cancelled() => !mounted || generation != _chatSelectionGeneration;
+    for (final file in files) {
+      try {
+        await _viewModel.attachSelectedFile(
+          file,
+          expectedChatId: chatId,
+          isCancelled: cancelled,
+        );
+      } catch (error, stack) {
+        ClientLogger.e(
+          'Failed to attach shared file ${file.name}',
+          tag: 'AIChatScreen',
+          error: error,
+          stackTrace: stack,
+        );
+        if (mounted) _showLocalToast('无法添加附件 ${file.name}: $error');
+      }
+    }
+    if (mounted) await _refreshAttachments();
+  }
+
   /// Adds pasted image payloads to the current attachment list.
   Future<void> _handlePastedImages(
     List<PastedImageAttachmentPayload> images,
@@ -1528,23 +1577,24 @@ class _AIChatSurfaceState extends State<_AIChatSurface> {
     await _refreshAttachments();
   }
 
-  void _insertAttachmentReference(AttachmentInfo attachment) {
-    final reference = _viewModel.createAttachmentReference(attachment);
-    final value = _messageController.value;
-    final text = value.text;
-    final selection = value.selection;
-    final range = selection.isValid
-        ? selection
-        : TextSelection.collapsed(offset: text.length);
-    final nextText = text.replaceRange(range.start, range.end, reference);
-    _messageController.value = TextEditingValue(
-      text: nextText,
-      selection: TextSelection.collapsed(
-        offset: range.start + reference.length,
+  void _previewAttachment(AttachmentInfo attachment) {
+    showDialog<void>(
+      context: context,
+      barrierColor: Colors.transparent,
+      builder: (dialogContext) => AttachmentViewerDialog(
+        visible: true,
+        attachment: ChatAttachment(
+          id: attachment.filePath,
+          filename: attachment.fileName,
+          mimeType: attachment.mimeType,
+          size: attachment.fileSize,
+          content: attachment.content,
+          path: attachment.vfsPath ?? attachment.filePath,
+          nodeId: attachment.nodeId,
+        ),
+        onDismiss: () => Navigator.of(dialogContext).pop(),
       ),
-      composing: TextRange.empty,
     );
-    _inputFocusNode.requestFocus();
   }
 
   void _watchToastEvent() {
@@ -1592,6 +1642,7 @@ class _AIChatSurfaceState extends State<_AIChatSurface> {
     }
     _hasBoundChatFlow = true;
     _requestedChatFlowChatId = chatId;
+    IncomingAttachmentService.instance.clearComposer(this);
     _chatSelectionGeneration += 1;
     _clearChatFlowError();
     final generation = ++_chatFlowBindingGeneration;
@@ -1743,6 +1794,7 @@ class _AIChatSurfaceState extends State<_AIChatSurface> {
           _isPreparingChatSwitch = false;
         });
       }
+      _updateIncomingAttachmentReceiver();
       return;
     }
     if (request.generation != _lastChatSelectionTransitionGeneration) {
@@ -1761,6 +1813,7 @@ class _AIChatSurfaceState extends State<_AIChatSurface> {
       _isMultiSelectMode = false;
       _selectedMessageTimestamps = const <int>{};
     });
+    _updateIncomingAttachmentReceiver();
   }
 
   /// Applies one routed chat-state change without replacing the message window.
@@ -1770,7 +1823,8 @@ class _AIChatSurfaceState extends State<_AIChatSurface> {
     }
     final chatChanged = _currentChatId != state.currentChatId;
     final workspaceChanged =
-        _currentWorkspacePath != state.currentWorkspacePath;
+        _currentWorkspacePath != state.currentWorkspacePath ||
+        _currentFileDirectory != state.currentFileDirectory;
     if (chatChanged) {
       _saveCurrentInputDraft();
       _currentChatId = state.currentChatId;
@@ -1788,6 +1842,7 @@ class _AIChatSurfaceState extends State<_AIChatSurface> {
       unawaited(_reloadChatUiContext());
     }
     _currentWorkspacePath = state.currentWorkspacePath;
+    _currentFileDirectory = state.currentFileDirectory;
     final chatFlowErrorMessage = _chatFlowErrorMessage;
     if (_chatFlowError != null) {
       _loading = false;
@@ -1818,6 +1873,7 @@ class _AIChatSurfaceState extends State<_AIChatSurface> {
       _mainLayoutController?.refreshAttachment(owner: _mainLayoutOwner);
     }
     _syncPendingQueueAfterSnapshot();
+    _updateIncomingAttachmentReceiver();
   }
 
   /// Clears the terminal error owned by the active chat-flow binding.
@@ -1849,6 +1905,7 @@ class _AIChatSurfaceState extends State<_AIChatSurface> {
         ? error.message
         : error.toString();
     _chatFlowError = error;
+    IncomingAttachmentService.instance.clearComposer(this);
     _chatFlowErrorMessage = errorMessage;
     _errorMessage = errorMessage;
     _loading = false;
@@ -2206,6 +2263,7 @@ class _AIChatSurfaceState extends State<_AIChatSurface> {
     _autoScrollToBottomNotifier.value = value;
   }
 
+  /// Reads the complete lightweight message index independently of the transcript window.
   Future<List<ChatMessageLocatorPreview>> _loadMessageLocatorEntries(
     String chatId,
     String query,
@@ -2395,6 +2453,7 @@ class _AIChatSurfaceState extends State<_AIChatSurface> {
         StackTrace stackTrace,
       ) {
         debugPrint('Failed to insert summary: $error\n$stackTrace');
+        _showLocalToast('插入总结失败：$error');
         return false;
       }),
     );
@@ -2682,8 +2741,10 @@ class _AIChatSurfaceState extends State<_AIChatSurface> {
         currentChatId: _currentChatId,
         hasBoundWorkspace: _currentWorkspacePath?.trim().isNotEmpty == true,
         workspacePath: _currentWorkspacePath,
+        fileDirectory: _currentFileDirectory,
         chatCore: _viewModel.chatCore,
         onListWorkspaceFiles: _viewModel.listWorkspaceFiles,
+        onMutateWorkspaceFile: _viewModel.mutateWorkspaceFile,
         onListWorkspaceBindingDirectories:
             _viewModel.listWorkspaceBindingDirectories,
         onReadWorkspaceTextFile: _viewModel.readWorkspaceTextFile,
@@ -2763,6 +2824,7 @@ class _AIChatSurfaceState extends State<_AIChatSurface> {
           mentionSuggestionPanel: _buildMentionSuggestionPanel(),
           viewModel: _viewModel,
           currentChatId: data.currentChatId,
+          fileDirectory: _currentFileDirectory,
           chatIdentity: data.chatUiContext?.identity,
           backgroundUri: data.chatUiContext?.backgroundUri,
           onIdentityTap: data.chatUiContext?.identity?.avatarAction == null
@@ -2882,7 +2944,7 @@ class _AIChatSurfaceState extends State<_AIChatSurface> {
               return null;
             });
           },
-          onInsertAttachment: _insertAttachmentReference,
+          onPreviewAttachment: _previewAttachment,
           toastMessageListenable: _toastMessageNotifier,
           onDismissToast: _dismissToast,
         );
@@ -2908,8 +2970,10 @@ class _AIChatSurfaceState extends State<_AIChatSurface> {
       currentChatId: _currentChatId,
       hasBoundWorkspace: _currentWorkspacePath?.trim().isNotEmpty == true,
       workspacePath: _currentWorkspacePath,
+      fileDirectory: _currentFileDirectory,
       chatCore: _viewModel.chatCore,
       onListWorkspaceFiles: _viewModel.listWorkspaceFiles,
+      onMutateWorkspaceFile: _viewModel.mutateWorkspaceFile,
       onListWorkspaceBindingDirectories:
           _viewModel.listWorkspaceBindingDirectories,
       onReadWorkspaceTextFile: _viewModel.readWorkspaceTextFile,

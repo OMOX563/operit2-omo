@@ -7,6 +7,8 @@
   "askOperitHint": "向 Operit 提问",
   "aiChat": "AI聊天",
   "fullscreenInput": "全屏输入",
+  "noticeExpand": "展开全文",
+  "noticeCollapse": "收起",
   "expandInput": "展开输入框",
   "collapseInput": "收起输入框",
   "settings": "设置",
@@ -59,6 +61,13 @@
   "receivingToolResultAiResponse": "正在接收工具执行后的 AI 响应...",
   "summarizingMemories": "正在总结记忆...",
   "summaryGenerating": "正在生成总结...",
+  "summaryStageCore": "正在整理核心任务...",
+  "summaryStageConstraints": "正在整理用户需求与约束...",
+  "summaryStageFiles": "正在整理关键文件与代码...",
+  "summaryStageErrors": "正在整理错误与修复...",
+  "summaryStageInteraction": "正在整理互动与设定...",
+  "summaryStageNext": "正在整理下一步...",
+  "summaryStageFormatting": "正在调整总结格式...",
   "chatCompressingHistory": "正在压缩历史记录...",
   "executingPlan": "正在执行计划...",
   "executingTool": "正在执行工具: {toolName}",
@@ -164,6 +173,8 @@
   "messageLocatorFavorites": "收藏",
   "messageLocatorNoFavorites": "还没有收藏的消息",
   "messageLocatorLoadFailed": "暂时无法加载消息，请重试",
+  "messageTransformFailed": "消息显示处理失败：{error}",
+  "@messageTransformFailed": { "placeholders": { "error": { "type": "String" } } },
   "messageLocatorFavoriteFailed": "收藏更新失败，请重试",
   "messageLocatorAddFavorite": "收藏消息",
   "messageLocatorRemoveFavorite": "取消收藏",
@@ -205,6 +216,7 @@
   },
   "messageSenderOther": "其他",
   "hiddenUserMessage": "隐藏的用户消息",
+  "autoTriggeredUserMessage": "自动触发",
   "workspaceSetupTitle": "设置工作区",
   "workspaceSetupSubtitle": "为您的AI项目提供一个专属的文件环境",
   "workspaceCreateTitle": "创建工作区",
@@ -389,6 +401,8 @@
   "searchHistory": "搜索历史",
   "noDownloadTasks": "还没有下载任务",
   "openFile": "打开文件",
+  "workspaceFileOpening": "正在打开文件…",
+  "workspaceFileOpenTimedOut": "打开文件超时，请重试。",
   "openLocation": "打开位置",
   "retry": "重试",
   "removeRecord": "移除记录",
@@ -511,8 +525,6 @@
   "settingsModelNoModels": "暂无模型",
   "settingsModelProviderModelCount": "{count} 个模型",
   "settingsModelSetCurrentActive": "设为当前",
-  "settingsChatThinkingMode": "思考模式",
-  "settingsChatThinkingModeDescription": "让支持的模型输出更稳的推理过程。",
   "settingsChatStreamOutput": "流式输出",
   "settingsChatStreamOutputDescription": "回复生成时逐步显示内容。",
   "settingsModelProfilesSection": "模型档案",
@@ -637,6 +649,8 @@
   "settingsModelApiEndpoint": "API 地址",
   "settingsModelModelNames": "模型名称",
   "settingsModelApiKey": "API Key",
+  "settingsModelShowApiKey": "显示 API Key",
+  "settingsModelHideApiKey": "隐藏 API Key",
   "settingsModelCodexLogin": "ChatGPT 登录",
   "settingsModelCodexLoginTitle": "登录 ChatGPT Codex",
   "settingsModelCodexLoginDescription": "OpenAI Codex 使用 ChatGPT 订阅登录，不使用 API Key。",
@@ -664,7 +678,7 @@
     }
   },
   "settingsModelApiKeyPool": "API Key 池",
-  "settingsModelApiKeyPoolDescription": "给同一个模型配置准备多个 Key，用于多 Key 轮换。",
+  "settingsModelApiKeyPoolDescription": "持续使用健康的 Key；遇到鉴权、额度、限流或临时故障时切换，并跳过冷却中的 Key。",
   "settingsModelApiKeyPoolCount": "{count} 个 Key",
   "@settingsModelApiKeyPoolCount": {
     "placeholders": {
@@ -673,11 +687,20 @@
       }
     }
   },
-  "settingsModelApiKeyPoolEmpty": "还没有 Key。添加后，运行时会按当前配置使用 Key 池。",
+  "settingsModelApiKeyPoolEmpty": "Key 池为空，请添加 Key 后再启用。",
   "settingsModelAddApiKey": "添加 Key",
   "settingsModelEditApiKey": "编辑 Key",
   "settingsModelApiKeyName": "Key 名称",
   "settingsModelApiKeyEnabled": "启用这个 Key",
+  "settingsModelPoolAddSingle": "添加当前单 Key",
+  "settingsModelPoolPaste": "每行粘贴一个 Key，可批量添加。",
+  "settingsModelPoolNoEligible": "请至少启用一个非空且未标记为不可用的 Key。",
+  "settingsModelPoolUntested": "未测试",
+  "settingsModelPoolAvailable": "可用",
+  "settingsModelPoolUnavailable": "不可用",
+  "settingsModelPoolClearMarks": "重置 Key 状态",
+  "settingsModelPoolTest": "测试未检测的 Key",
+  "settingsModelPoolNeedsModel": "保存供应商并添加模型后，即可测试 Key。",
   "settingsModelProviderId": "供应商 ID",
   "settingsModelProvidersSection": "LLM 供应商",
   "settingsModelProviderType": "供应商类型",
@@ -850,6 +873,36 @@
   "settingsModelAvailableSourceFetched": "已拉取",
   "settingsModelAvailableSourceHistory": "历史",
   "settingsModelAvailableEmptyFetched": "没有拉取到的模型。可选择「包含历史」查看目录中的模型 ID。",
+  "settingsModelUnrecognized": "未识别",
+  "settingsModelCatalogUpdatedAt": "能力和上下文信息来自 models.dev，{time} 更新",
+  "@settingsModelCatalogUpdatedAt": {
+    "placeholders": {
+      "time": {
+        "type": "String"
+      }
+    }
+  },
+  "settingsModelCatalogUpdateFailed": "模型信息下载失败：{error}",
+  "@settingsModelCatalogUpdateFailed": {
+    "placeholders": {
+      "error": {
+        "type": "String"
+      }
+    }
+  },
+  "settingsModelCatalogUpdateFailedUsing": "模型信息更新失败，暂用 {time} 的信息：{error}",
+  "@settingsModelCatalogUpdateFailedUsing": {
+    "placeholders": {
+      "time": {
+        "type": "String"
+      },
+      "error": {
+        "type": "String"
+      }
+    }
+  },
+  "settingsModelCatalogBundled": "使用内置模型信息，联网更新成功后自动替换",
+  "settingsModelCatalogRetry": "更新",
   "settingsModelCustomModel": "自定义模型",
   "settingsModelModelId": "模型 ID",
   "settingsModelDuplicateModelId": "该模型已添加到当前供应商。",
@@ -873,9 +926,7 @@
   "settingsModelContextLength": "上下文长度",
   "settingsModelMaxContextLength": "最大上下文长度",
   "settingsModelMaxContextLengthInvalid": "请输入大于 0 的最大上下文长度",
-  "settingsModelSummaryThreshold": "总结 Token 阈值",
-  "settingsModelSummaryByMessageCount": "按消息数总结",
-  "settingsModelSummaryMessageCount": "总结消息数阈值",
+  "settingsModelSummaryThreshold": "总结阈值",
   "settingsModelCustomHeaders": "自定义 Headers",
   "settingsModelCustomParameters": "自定义参数 JSON",
   "settingsModelToolCall": "工具调用",
@@ -888,22 +939,70 @@
   "settingsModelDirectVideoDescription": "支持视频能力的模型可直接接收视频。",
   "settingsModelGoogleSearch": "Google 搜索",
   "settingsModelGoogleSearchDescription": "启用供应商侧搜索能力。",
-  "settingsModelContext": "上下文窗口",
+  "settingsModelContext": "上下文",
   "settingsModelSummary": "自动总结",
   "settingsModelThinking": "思考",
-  "settingsModelThinkingOption": "思考档位",
-  "settingsModelThinkingRules": "思考规则 JSON",
+  "thinkingLevelLabel": "思考程度",
+  "thinkingAlwaysOn": "始终思考",
+  "thinkingChip": "思考",
+  "settingsModelThinkingSourceDeclared": "档位按你的描述",
+  "settingsModelThinkingSourceLocalRuntime": "本地运行：可以开关思考，模型本身不会思考时开关不起作用",
+  "settingsModelThinkingUnknown": "目录里没有这个模型的思考信息",
+  "settingsModelThinkingNotAdjustable": "当前接口不能调节这个模型的思考",
+  "settingsModelThinkingNotSupported": "这个模型不会思考",
+  "settingsModelThinkingCarried": "沿用你最近一次设置的档位",
+  "settingsModelThinkingDescribe": "手动描述",
+  "settingsModelThinkingUseCatalog": "改回目录描述",
+  "settingsModelThinkingDescribeTitle": "这个模型怎么思考",
+  "settingsModelThinkingKindNone": "不会思考",
+  "settingsModelThinkingKindAlways": "总是思考，不能调节",
+  "settingsModelThinkingKindSwitch": "只能开关",
+  "settingsModelThinkingKindLevels": "分档位",
+  "settingsModelThinkingKindBudget": "按 token 预算",
+  "settingsModelThinkingCanTurnOff": "可以关闭思考",
+  "settingsModelThinkingBudgetMin": "最少 token",
+  "settingsModelThinkingBudgetMax": "最多 token",
+  "settingsModelThinkingLevelsRequired": "至少选一个档位",
   "settingsModelMediaHistory": "媒体历史",
   "settingsModelCapabilities": "能力",
   "settingsModelBuiltinTools": "内置工具",
   "settingsModelBuiltinToolExclusive": "开启后会关闭外部工具调用",
-  "settingsModelConnectionTestSection": "连接测试",
   "settingsModelRunConnectionTest": "测试当前模型",
-  "settingsModelTestModel": "测试模型",
+  "settingsModelTestModel": "测试",
+  "settingsModelCapabilityToolCall": "工具调用",
+  "settingsModelCapabilityImage": "图片",
+  "settingsModelCapabilityAudio": "音频",
+  "settingsModelCapabilityVideo": "视频",
+  "settingsModelClaudeCache": "Claude 1 小时缓存",
+  "settingsModelClaudeCacheDescription": "为显式缓存断点设置 1 小时 TTL；关闭时使用默认 TTL。",
+  "settingsModelSummaryThresholdDescription": "上下文占用达到这个比例时自动总结，填 0 关闭。",
+  "settingsModelMoreActions": "更多操作",
+  "settingsModelRestoreDefaults": "恢复默认值",
+  "settingsModelDescribeThinking": "手动描述思考档位",
+  "settingsModelDeleteModel": "删除模型",
+  "settingsModelSaveFailed": "保存失败：{error}",
+  "settingsModelTestAll": "测试全部",
+  "settingsModelTestProgress": "测试中 {done}/{total}",
+  "settingsModelTestSummary": "{passed} 个通过，{failed} 个失败",
+  "settingsModelTestSummaryWithRestricted": "{passed} 个通过，{failed} 个失败，{restricted} 个受限",
+  "settingsModelTestAllPassed": "{count} 个全部通过",
+  "settingsModelTestCouldNotRun": "测试没能运行",
+  "settingsModelCopyError": "复制错误信息",
+  "settingsModelSelect": "多选",
+  "settingsModelCheckAll": "全选",
+  "settingsModelCheckedCount": "已选 {count} 个",
+  "settingsModelDeleteModelsTitle": "删除 {count} 个模型？",
+  "settingsModelDeleteModelsMessage": "这些模型的设置会一起删除。",
+  "settingsModelDeleteModelsKept": "{count} 个正在被功能使用，会保留：{names}",
+  "settingsModelDeleteModelsBlocked": "所选模型正在被这些功能使用，请先更改功能模型分配：{functions}",
+  "settingsModelDeletedCount": "已删除 {count} 个模型",
   "settingsModelTestingConnection": "正在测试当前模型连接…",
   "settingsModelTestedModel": "测试模型",
   "settingsModelConnectionTestPassed": "全部通过",
   "settingsModelConnectionTestFailed": "存在失败项",
+  "settingsModelConnectionTestRestricted": "检测受限",
+  "settingsModelTestCreditRestricted": "账户额度或输出预算受限",
+  "settingsModelTestRateRestricted": "上游限流或冷却中",
   "settingsModelCapabilitiesApplied": "已按测试结果更新模型能力开关。",
   "settingsModelCapabilitiesNeedChat": "聊天测试未通过，模型能力开关未更新。",
   "settingsModelConnectionTestError": "连接测试失败：{error}",
@@ -1394,7 +1493,11 @@
   "settingsAppearanceBubbleImageAdjustUser": "调整用户气泡图片",
   "settingsAppearanceBubbleImageAdjustAi": "调整 AI 气泡图片",
   "settingsAppearanceBubbleImagePreview": "预览",
-  "settingsAppearanceBubbleImagePreviewText": "这是一条气泡预览，切线展示九宫格区域",
+  "settingsAppearanceBubbleImagePreviewText": "这是一条气泡预览消息。\n可以查看边角和中间区域的实际效果。",
+  "settingsAppearanceBubbleImageSourceHint": "原图 · 白框为裁切边界，蓝线分出九宫格；可双指缩放、拖动查看",
+  "settingsAppearanceBubbleImageFitSource": "完整显示原图",
+  "settingsAppearanceBubbleImageGrid": "九宫格",
+  "settingsAppearanceBubbleImageGridHint": "两横两竖分出九块：四角保留，上下边横向重复、左右边纵向重复，中间双向重复；拉伸模式则拉伸对应区域。起点和终点相对于裁切后的图片。",
   "settingsAppearanceBubbleImageImportFailed": "气泡图片没有生效：{error}",
   "@settingsAppearanceBubbleImageImportFailed": {
     "placeholders": {
@@ -2063,6 +2166,14 @@
   "settingsPeerPortMode": "端口分配方式",
   "settingsPeerPortModeFixed": "固定监听地址和端口",
   "settingsPeerPortModeAutomatic": "自动分配端口",
+  "settingsPeerNetworkDiscoveryHelp": "跨网络发现需要共同的目录地址和组密钥。要由本机提供目录，请留空目录地址并设置组密钥。",
+  "settingsPeerDiscoveryDirectory": "发现目录地址（可选）",
+  "settingsPeerDiscoveryGroup": "发现组密钥",
+  "settingsPeerDiscoveryGenerateKey": "生成新的发现组密钥",
+  "settingsPeerDiscoveryCopyKey": "复制发现组密钥",
+  "settingsPeerDiscoveryPort": "目录监听端口",
+  "settingsPeerDiscoveryPortHelp": "仅目录设备使用此端口；其他设备使用目录地址中的端口。",
+  "settingsPeerNetworkDiscoveryInvalid": "请检查发现设置：目录为不含路径的 HTTP(S) 地址，密钥为 16–128 字节；本机提供目录时，监听端口应为 1–65535。",
   "settingsPeerAdvanced": "高级选项",
   "settingsPeerDiscoveryUnavailable": "当前 Host 不支持在局域网广播监听服务。支持的协议仍可通过地址直接连接。",
   "settingsPeerTransportUnavailable": "当前 Host 不支持 {transport} 监听。",
@@ -2138,7 +2249,7 @@
   "deviceSpaceAddDevice": "添加设备",
   "deviceSpaceDevices": "设备",
   "deviceSpaceMemberNotPaired": "空间成员 · 未直连",
-  "deviceSpaceMemberPaired": "空间成员 · 已直连",
+  "deviceSpaceMemberPaired": "空间成员 · 已配对",
   "deviceSpacePairedOnly": "已配对",
   "deviceSpaceDirectLink": "直连",
   "deviceSpaceRelayHops": "经中继 {hops} 跳",
@@ -2196,8 +2307,8 @@
   "settingsAppearanceThemeConfigDelete": "删除当前未启用的主题配置",
   "settingsAppearanceThemeConfigName": "主题名称",
   "settingsAppearanceThemeConfigNameRequired": "请输入主题名称",
-  "settingsAppearanceThemeConfigCustomHint": "点击 + 创建和管理独立的主题配置。",
-  "settingsAppearanceThemeConfigEditingHint": "修改外观会自动保存到当前主题配置。",
+  "settingsAppearanceThemeConfigCustomHint": "创建主题保存你的外观。点击卡片切换，点击编辑调整细节。",
+  "settingsAppearanceThemeConfigEditingHint": "点击卡片切换主题；上方明暗切换仅修改当前主题。编辑后自动保存。",
   "settingsAppearanceThemeConfigFailed": "主题操作失败：{detail}",
   "@settingsAppearanceThemeConfigFailed": {
     "placeholders": {
@@ -2307,7 +2418,7 @@
   "@deviceSpaceSyncCounting": {"placeholders": {"count": {"type": "int"}}},
   "deviceSpaceSyncFiles": "正在传输并校验文件",
   "deviceSpaceSyncRetrying": "同步暂时中断，稍后自动重试",
-  "deviceSpaceSyncPending": "部分数据尚未处理完成，稍后自动重试",
+  "deviceSpaceSyncPending": "部分数据尚未处理完成",
   "deviceSpaceSyncCurrentFile": "当前文件：{done} / {total}",
   "@deviceSpaceSyncCurrentFile": {
     "placeholders": {
@@ -2352,6 +2463,7 @@
   "peerQrPaste": "或粘贴连接信息",
   "peerQrRead": "识别连接信息",
   "peerQrWrongDevice": "此连接码属于其他设备，请扫描当前所选设备的连接码。",
+  "peerPairTimeoutHint": "连接超时：未能与对方设备建立连接。常见原因是对方设备的防火墙拦截了入站连接。可改由对方设备发起连接，或在对方设备的防火墙中放行 Operit（公用网络尤其需要）。",
   "peerQrImageInvalid": "未能从图片中识别二维码。请选择清晰的二维码图片（不超过 16 MB）。",
   "peerQrCameraUnavailable": "此设备暂时无法使用相机扫码，你可以导入二维码图片或粘贴连接信息。",
   "peerQrCameraPermission": "需要相机权限才能扫码。请在系统设置中允许相机访问，也可导入图片。",
@@ -2439,5 +2551,59 @@
         "type": "int"
       }
     }
-  }
+  },
+  "contextStatsSummaryLoadFailed": "无法加载上下文信息",
+  "contextStatsDevicesLoadFailed": "无法加载设备信息",
+  "settingsAppearanceThemeLibrary": "我的主题",
+  "settingsAppearanceThemeLibraryHint": "选一个喜欢的外观，再把它调成你的样子。",
+  "settingsAppearanceThemeActive": "使用中",
+  "settingsAppearanceThemeApply": "使用此主题",
+  "settingsAppearanceThemeMore": "更多主题操作",
+  "settingsAppearanceThemeDuplicate": "创建副本",
+  "settingsAppearanceThemeUnboundHint": "保留当前外观，自由调整，不绑定已保存的主题。",
+  "settingsAppearanceThemeDeleteTitle": "删除主题",
+  "settingsAppearanceThemeDeleteConfirm": "确定删除「{name}」？删除后无法恢复。",
+  "settingsAppearancePreviewCollapse": "收起",
+  "settingsAppearancePreviewExpand": "展开",
+  "@settingsAppearanceThemeDeleteConfirm": {"placeholders": {"name": {"type": "String"}}},
+  "settingsAppearanceThemeNew": "新建主题",
+  "settingsAppearanceDeviceFonts": "设备字体",
+  "settingsAppearanceChooseDeviceFont": "选择设备字体",
+  "settingsAppearanceNoDeviceFonts": "没有匹配的设备字体",
+  "settingsAppearanceDeviceFontPreview": "字体预览：你好，世界\nThe quick brown fox · 0123456789",
+  "workspaceFileRename": "重命名",
+  "workspaceFileCopy": "复制",
+  "workspaceFileCut": "剪切",
+  "workspaceFilePaste": "粘贴",
+  "workspaceFileName": "名称",
+  "workspaceFileInvalidName": "请输入有效名称，不能包含路径分隔符。",
+  "workspaceDeleteFolderTitle": "删除文件夹？",
+  "workspaceDeleteFolderMessage": "确定删除“{name}”及其全部内容？此操作无法撤销。",
+  "@workspaceDeleteFolderMessage": {
+    "placeholders": {
+      "name": {
+        "type": "String"
+      }
+    }
+  },
+  "workspaceFileOperationFailed": "文件操作失败：{error}",
+  "@workspaceFileOperationFailed": {
+    "placeholders": {
+      "error": {
+        "type": "String"
+      }
+    }
+  },
+  "workspaceFileCopyName": "{name}（副本 {index}）",
+  "@workspaceFileCopyName": {
+    "placeholders": {
+      "name": {
+        "type": "String"
+      },
+      "index": {
+        "type": "int"
+      }
+    }
+  },
+  "workspaceFileSaving": "文件正在保存，请保存完成后重试。"
 }

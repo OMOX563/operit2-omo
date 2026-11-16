@@ -7,8 +7,14 @@ import 'dart:ui' as ui;
 import 'package:file_selector/file_selector.dart';
 import 'package:flutter/material.dart';
 import 'package:operit_ui/operit_ui.dart'
-    show themeImageFittedSize, themeImageMaxDimension, themeImageMaxPixels;
+    show
+        ThemeGlassSurfaceGroup,
+        themeImageFittedSize,
+        themeImageMaxDimension,
+        themeImageMaxPixels;
 
+import '../../../../core/bridge/ProxyCoreRuntimeBridge.dart';
+import '../../../../core/proxy/generated/CoreProxyClients.g.dart';
 import '../../../../data/preferences/UserPreferencesManager.dart';
 import '../../../../l10n/generated/app_localizations.dart';
 import '../../chat/components/style/bubble/BubbleSurface.dart';
@@ -19,7 +25,9 @@ import '../../../theme/OperitTheme.dart';
 import '../../../theme/OperitThemeAssets.dart';
 import '../components/SettingsAssetTile.dart';
 import '../components/SettingsControlStyles.dart';
+import 'BubbleImageAdjustEditor.dart';
 import 'ChatAppearancePreview.dart';
+import 'DeviceFontPicker.dart';
 import 'ThemeConfigurationControl.dart';
 
 enum _AppearanceSettingsTab { theme, background, bubbles, interaction }
@@ -33,27 +41,82 @@ const List<_AppearanceSettingsTab> _appearanceSettingsTabs =
     ];
 
 class AppearanceSettingsPanel extends StatelessWidget {
-  const AppearanceSettingsPanel({super.key});
+  const AppearanceSettingsPanel({
+    super.key,
+    this.clients = const GeneratedCoreProxyClients(ProxyCoreRuntimeBridge()),
+  });
 
-  /// Builds the tabbed appearance settings editor with responsive layouts.
+  final GeneratedCoreProxyClients clients;
+
+  /// Opens appearance settings at the visual theme library.
+  @override
+  Widget build(BuildContext context) {
+    return ThemeConfigurationControl(
+      clients: clients,
+      onAppearanceChanged: OperitTheme.of(context).reloadTheme,
+      onEdit: (name) => Navigator.of(context).push<void>(
+        MaterialPageRoute<void>(
+          builder: (context) => Scaffold(
+            appBar: AppBar(title: Text(name)),
+            body: const ThemeGlassSurfaceGroup(child: _AppearanceThemeEditor()),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// Edits the selected theme with a live preview in each appearance category.
+class _AppearanceThemeEditor extends StatelessWidget {
+  const _AppearanceThemeEditor();
+
   @override
   Widget build(BuildContext context) {
     final l10n = AppLocalizations.of(context)!;
-    final themeController = OperitTheme.of(context);
-    final snapshot = themeController.themePreferenceSnapshot;
     return DefaultTabController(
       length: _appearanceSettingsTabs.length,
       child: Column(
         children: <Widget>[
-          const ThemeConfigurationControl(),
           const _AppearanceHeaderBar(),
           Expanded(
             child: TabBarView(
               children: <Widget>[
-                _buildThemeTab(context, l10n, themeController, snapshot),
-                _buildBackgroundTab(context, l10n, themeController, snapshot),
-                _buildBubblesTab(context, l10n, themeController, snapshot),
-                _buildInteractionTab(context, l10n, themeController, snapshot),
+                for (final tab in _appearanceSettingsTabs)
+                  _RetainedAppearanceTab(
+                    key: ValueKey(tab),
+                    builder: (context) {
+                      final controller = OperitTheme.of(context);
+                      final snapshot = controller.themePreferenceSnapshot;
+                      return switch (tab) {
+                        _AppearanceSettingsTab.theme => _buildThemeTab(
+                          context,
+                          l10n,
+                          controller,
+                          snapshot,
+                        ),
+                        _AppearanceSettingsTab.background =>
+                          _buildBackgroundTab(
+                            context,
+                            l10n,
+                            controller,
+                            snapshot,
+                          ),
+                        _AppearanceSettingsTab.bubbles => _buildBubblesTab(
+                          context,
+                          l10n,
+                          controller,
+                          snapshot,
+                        ),
+                        _AppearanceSettingsTab.interaction =>
+                          _buildInteractionTab(
+                            context,
+                            l10n,
+                            controller,
+                            snapshot,
+                          ),
+                      };
+                    },
+                  ),
               ],
             ),
           ),
@@ -70,11 +133,13 @@ class AppearanceSettingsPanel extends StatelessWidget {
   ) {
     final applicationZoom = ApplicationZoomScope.of(context);
     final hasCustomFont =
-        snapshot.customFontPath != null && snapshot.customFontPath!.isNotEmpty;
+        snapshot.fontType == UserPreferencesManager.FONT_TYPE_FILE &&
+        snapshot.customFontPath != null &&
+        snapshot.customFontPath!.isNotEmpty;
     return _ResponsivePreviewSplitTabView(
       previewCard: _ChatAppearanceLivePreviewCard(
         snapshot: snapshot,
-        showInputPreview: false,
+        showInputPreview: true,
       ),
       children: <Widget>[
         _SectionCard(
@@ -140,6 +205,9 @@ class AppearanceSettingsPanel extends StatelessWidget {
                 badge: _fontFamilyLabel(l10n, snapshot),
                 child: _FontFamilySelector(
                   value: _fontFamilyPresetFromSnapshot(snapshot),
+                  hasSelection:
+                      snapshot.fontType ==
+                      UserPreferencesManager.FONT_TYPE_SYSTEM,
                   onChanged: (value) {
                     unawaited(
                       themeController.saveThemeSettings(
@@ -155,13 +223,37 @@ class AppearanceSettingsPanel extends StatelessWidget {
               const SizedBox(height: 10),
               SettingsAssetTile(
                 icon: Icons.font_download_outlined,
+                title: l10n.settingsAppearanceDeviceFonts,
+                subtitle:
+                    snapshot.fontType == UserPreferencesManager.FONT_TYPE_DEVICE
+                    ? snapshot.systemFontName!
+                    : l10n.settingsAppearanceChooseDeviceFont,
+                actions: [
+                  FilledButton.tonalIcon(
+                    style: SettingsControlStyles.sectionTextButton(),
+                    icon: const Icon(Icons.text_fields, size: 16),
+                    label: Text(l10n.settingsAppearanceChooseDeviceFont),
+                    onPressed: () => _pickDeviceFont(
+                      context,
+                      themeController,
+                      snapshot.systemFontName,
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 10),
+              SettingsAssetTile(
+                icon: Icons.font_download_outlined,
                 title: l10n.settingsAppearanceCustomFont,
-                subtitle: _customFontLabel(l10n, snapshot.customFontPath),
+                subtitle: _customFontLabel(
+                  l10n,
+                  hasCustomFont ? snapshot.customFontPath : null,
+                ),
                 actions: <Widget>[
                   FilledButton.tonalIcon(
                     style: SettingsControlStyles.sectionTextButton(),
                     onPressed: () {
-                      unawaited(_pickCustomFont(themeController));
+                      unawaited(_pickCustomFont(context, themeController));
                     },
                     icon: const Icon(Icons.folder_open_outlined, size: 16),
                     label: Text(l10n.settingsAppearanceChooseCustomFont),
@@ -175,6 +267,8 @@ class AppearanceSettingsPanel extends StatelessWidget {
                           themeController.saveThemeSettings(
                             useCustomFont: false,
                             fontType: UserPreferencesManager.FONT_TYPE_SYSTEM,
+                            systemFontName:
+                                UserPreferencesManager.SYSTEM_FONT_DEFAULT,
                             customFontPath: '',
                           ),
                         );
@@ -256,7 +350,7 @@ class AppearanceSettingsPanel extends StatelessWidget {
     return _ResponsivePreviewSplitTabView(
       previewCard: _ChatAppearanceLivePreviewCard(
         snapshot: snapshot,
-        showInputPreview: false,
+        showInputPreview: true,
       ),
       children: <Widget>[
         _SectionCard(
@@ -439,7 +533,7 @@ class AppearanceSettingsPanel extends StatelessWidget {
     return _ResponsivePreviewSplitTabView(
       previewCard: _ChatAppearanceLivePreviewCard(
         snapshot: snapshot,
-        showInputPreview: false,
+        showInputPreview: true,
       ),
       children: <Widget>[
         _SectionCard(
@@ -945,6 +1039,32 @@ class AppearanceSettingsPanel extends StatelessWidget {
   }
 }
 
+/// Builds visited categories lazily and retains their preview and scroll state.
+class _RetainedAppearanceTab extends StatefulWidget {
+  /// Creates one category without constructing its controls before it is visited.
+  const _RetainedAppearanceTab({super.key, required this.builder});
+
+  final WidgetBuilder builder;
+
+  /// Creates the retained tab page.
+  @override
+  State<_RetainedAppearanceTab> createState() => _RetainedAppearanceTabState();
+}
+
+class _RetainedAppearanceTabState extends State<_RetainedAppearanceTab>
+    with AutomaticKeepAliveClientMixin<_RetainedAppearanceTab> {
+  /// Preserves already loaded background media when navigating to another tab.
+  @override
+  bool get wantKeepAlive => true;
+
+  /// Registers retention before building this category's current controls.
+  @override
+  Widget build(BuildContext context) {
+    super.build(context);
+    return widget.builder(context);
+  }
+}
+
 class _AppearanceHeaderBar extends StatelessWidget {
   /// Creates the independent appearance-category header.
   const _AppearanceHeaderBar();
@@ -1018,7 +1138,7 @@ class _ResponsivePreviewSplitTabView extends StatefulWidget {
     required this.children,
   });
 
-  final Widget previewCard;
+  final _ChatAppearanceLivePreviewCard previewCard;
   final List<Widget> children;
 
   @override
@@ -1028,7 +1148,7 @@ class _ResponsivePreviewSplitTabView extends StatefulWidget {
 
 class _ResponsivePreviewSplitTabViewState
     extends State<_ResponsivePreviewSplitTabView> {
-  bool _mobilePreviewExpanded = false;
+  bool _mobilePreviewExpanded = true;
 
   @override
   Widget build(BuildContext context) {
@@ -1070,66 +1190,74 @@ class _ResponsivePreviewSplitTabViewState
         return ListView(
           padding: const EdgeInsets.fromLTRB(16, 10, 16, 20),
           children: <Widget>[
-            Padding(
-              padding: const EdgeInsets.only(bottom: 8),
-              child: Material(
-                color: colorScheme.surfaceContainerHighest.withValues(
-                  alpha: 0.35,
-                ),
-                shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(12),
-                  side: BorderSide(
-                    color: colorScheme.outlineVariant.withValues(alpha: 0.22),
+            if (!_mobilePreviewExpanded)
+              Padding(
+                padding: const EdgeInsets.only(bottom: 8),
+                child: Material(
+                  color: colorScheme.surfaceContainerHighest.withValues(
+                    alpha: 0.35,
                   ),
-                ),
-                child: InkWell(
-                  borderRadius: BorderRadius.circular(12),
-                  onTap: () {
-                    setState(() {
-                      _mobilePreviewExpanded = !_mobilePreviewExpanded;
-                    });
-                  },
-                  child: Padding(
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 14,
-                      vertical: 10,
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(12),
+                    side: BorderSide(
+                      color: colorScheme.outlineVariant.withValues(alpha: 0.22),
                     ),
-                    child: Row(
-                      children: <Widget>[
-                        Icon(
-                          Icons.visibility_outlined,
-                          size: 18,
-                          color: colorScheme.primary,
-                        ),
-                        const SizedBox(width: 8),
-                        Expanded(
-                          child: Text(
-                            l10n.settingsAppearanceLivePreviewTitle,
-                            style: Theme.of(context).textTheme.titleSmall
-                                ?.copyWith(fontWeight: FontWeight.w600),
+                  ),
+                  child: InkWell(
+                    borderRadius: BorderRadius.circular(12),
+                    onTap: () {
+                      setState(() {
+                        _mobilePreviewExpanded = !_mobilePreviewExpanded;
+                      });
+                    },
+                    child: Padding(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 14,
+                        vertical: 10,
+                      ),
+                      child: Row(
+                        children: <Widget>[
+                          Icon(
+                            Icons.visibility_outlined,
+                            size: 18,
+                            color: colorScheme.primary,
                           ),
-                        ),
-                        SettingsInfoBadge(
-                          label: _mobilePreviewExpanded ? '折叠' : '展开',
-                        ),
-                        const SizedBox(width: 4),
-                        Icon(
-                          _mobilePreviewExpanded
-                              ? Icons.keyboard_arrow_up
-                              : Icons.keyboard_arrow_down,
-                          size: 18,
-                          color: colorScheme.onSurfaceVariant,
-                        ),
-                      ],
+                          const SizedBox(width: 8),
+                          Expanded(
+                            child: Text(
+                              l10n.settingsAppearanceLivePreviewTitle,
+                              style: Theme.of(context).textTheme.titleSmall
+                                  ?.copyWith(fontWeight: FontWeight.w600),
+                            ),
+                          ),
+                          SettingsInfoBadge(
+                            label: _mobilePreviewExpanded
+                                ? l10n.settingsAppearancePreviewCollapse
+                                : l10n.settingsAppearancePreviewExpand,
+                          ),
+                          const SizedBox(width: 4),
+                          Icon(
+                            _mobilePreviewExpanded
+                                ? Icons.keyboard_arrow_up
+                                : Icons.keyboard_arrow_down,
+                            size: 18,
+                            color: colorScheme.onSurfaceVariant,
+                          ),
+                        ],
+                      ),
                     ),
                   ),
                 ),
               ),
-            ),
             if (_mobilePreviewExpanded) ...<Widget>[
               Padding(
                 padding: const EdgeInsets.only(bottom: 12),
-                child: widget.previewCard,
+                child: _ChatAppearanceLivePreviewCard(
+                  snapshot: widget.previewCard.snapshot,
+                  showInputPreview: widget.previewCard.showInputPreview,
+                  onCollapse: () =>
+                      setState(() => _mobilePreviewExpanded = false),
+                ),
               ),
             ],
             ...widget.children,
@@ -1144,10 +1272,12 @@ class _ChatAppearanceLivePreviewCard extends StatelessWidget {
   const _ChatAppearanceLivePreviewCard({
     required this.snapshot,
     required this.showInputPreview,
+    this.onCollapse,
   });
 
   final ThemePreferenceSnapshot snapshot;
   final bool showInputPreview;
+  final VoidCallback? onCollapse;
 
   @override
   Widget build(BuildContext context) {
@@ -1155,11 +1285,18 @@ class _ChatAppearanceLivePreviewCard extends StatelessWidget {
     return _SectionCard(
       title: l10n.settingsAppearanceLivePreviewTitle,
       icon: Icons.preview_outlined,
-      action: SettingsInfoBadge(
-        label:
-            '${_messageStyleLabel(l10n, snapshot.userChatStyle)} / '
-            '${_messageStyleLabel(l10n, snapshot.aiChatStyle)}',
-      ),
+      action: onCollapse == null
+          ? SettingsInfoBadge(
+              label:
+                  '${_messageStyleLabel(l10n, snapshot.userChatStyle)} / '
+                  '${_messageStyleLabel(l10n, snapshot.aiChatStyle)}',
+            )
+          : IconButton(
+              tooltip: l10n.settingsAppearancePreviewCollapse,
+              onPressed: onCollapse,
+              visualDensity: VisualDensity.compact,
+              icon: const Icon(Icons.keyboard_arrow_up, size: 20),
+            ),
       children: <Widget>[
         ChatAppearancePreview(showInputPreview: showInputPreview),
       ],
@@ -1530,21 +1667,66 @@ Rect _themeImageCropRect(
   return Rect.fromLTWH(left, top, cropWidth, cropHeight);
 }
 
+/// Copies a selected device face into the existing synchronized theme resource owner.
+Future<void> _pickDeviceFont(
+  BuildContext context,
+  OperitThemeController themeController,
+  String? selectedName,
+) async {
+  try {
+    final selected = await showDeviceFontPicker(
+      context,
+      selectedName: selectedName,
+    );
+    if (selected == null || !context.mounted) return;
+    final imported = await ThemeAssetStore().importFontBytes(
+      bytes: selected.bytes,
+      fileName: 'device-font.ttf',
+    );
+    await themeController.saveThemeSettings(
+      useCustomFont: true,
+      fontType: UserPreferencesManager.FONT_TYPE_DEVICE,
+      systemFontName: selected.name,
+      customFontPath: imported.storagePath,
+    );
+  } catch (error) {
+    if (context.mounted) _showFontImportError(context, error);
+  }
+}
+
 /// Imports and saves a selected font as the active custom font asset.
-Future<void> _pickCustomFont(OperitThemeController themeController) async {
+Future<void> _pickCustomFont(
+  BuildContext context,
+  OperitThemeController themeController,
+) async {
+  try {
+    final imported = await _selectThemeFont();
+    if (imported == null || !context.mounted) return;
+    await themeController.saveThemeSettings(
+      useCustomFont: true,
+      fontType: UserPreferencesManager.FONT_TYPE_FILE,
+      customFontPath: imported.storagePath,
+    );
+  } catch (error) {
+    _showFontImportError(context, error);
+  }
+}
+
+Future<ThemeAssetImport?> _selectThemeFont() async {
   const fontGroup = XTypeGroup(
     label: 'font',
     extensions: <String>['ttf', 'otf', 'ttc'],
+    uniformTypeIdentifiers: <String>['public.font'],
   );
   final file = await openFile(acceptedTypeGroups: <XTypeGroup>[fontGroup]);
-  if (file == null) {
-    return;
-  }
-  final imported = await ThemeAssetStore().importFile(file);
-  await themeController.saveThemeSettings(
-    useCustomFont: true,
-    fontType: UserPreferencesManager.FONT_TYPE_FILE,
-    customFontPath: imported.storagePath,
+  return file == null ? null : ThemeAssetStore().importFontFile(file);
+}
+
+void _showFontImportError(BuildContext context, Object error) {
+  if (!context.mounted) return;
+  final l10n = AppLocalizations.of(context)!;
+  ScaffoldMessenger.of(context).showSnackBar(
+    SnackBar(content: Text(l10n.settingsAppearanceThemeConfigFailed('$error'))),
   );
 }
 
@@ -1575,22 +1757,17 @@ Future<void> _showBubbleFontDialog(
       return StatefulBuilder(
         builder: (context, setDialogState) {
           Future<void> pickFontFile() async {
-            const fontGroup = XTypeGroup(
-              label: 'font',
-              extensions: <String>['ttf', 'otf', 'ttc'],
-            );
-            final file = await openFile(
-              acceptedTypeGroups: <XTypeGroup>[fontGroup],
-            );
-            if (file == null) {
-              return;
+            try {
+              final imported = await _selectThemeFont();
+              if (imported == null || !context.mounted) return;
+              setDialogState(() {
+                useCustomFont = true;
+                fontType = UserPreferencesManager.FONT_TYPE_FILE;
+                customFontPath = imported.storagePath;
+              });
+            } catch (error) {
+              _showFontImportError(context, error);
             }
-            final imported = await ThemeAssetStore().importFile(file);
-            setDialogState(() {
-              useCustomFont = true;
-              fontType = UserPreferencesManager.FONT_TYPE_FILE;
-              customFontPath = imported.storagePath;
-            });
           }
 
           return OperitDialogScaffold(
@@ -1643,12 +1820,18 @@ Future<void> _showBubbleFontDialog(
                 const SizedBox(height: 8),
                 _AppearanceFieldBlock(
                   label: l10n.settingsAppearanceFontFamily,
-                  badge: _fontFamilyPresetLabel(
-                    l10n,
-                    _fontFamilyPresetFromSystemName(systemFontName),
-                  ),
+                  badge: fontType == UserPreferencesManager.FONT_TYPE_DEVICE
+                      ? systemFontName!
+                      : fontType == UserPreferencesManager.FONT_TYPE_FILE
+                      ? l10n.settingsAppearanceFontCustom
+                      : _fontFamilyPresetLabel(
+                          l10n,
+                          _fontFamilyPresetFromSystemName(systemFontName),
+                        ),
                   child: _FontFamilySelector(
                     value: _fontFamilyPresetFromSystemName(systemFontName),
+                    hasSelection:
+                        fontType == UserPreferencesManager.FONT_TYPE_SYSTEM,
                     onChanged: (value) {
                       setDialogState(() {
                         useCustomFont = true;
@@ -1660,9 +1843,52 @@ Future<void> _showBubbleFontDialog(
                 ),
                 const SizedBox(height: 10),
                 SettingsAssetTile(
+                  icon: Icons.text_fields,
+                  title: l10n.settingsAppearanceDeviceFonts,
+                  subtitle: fontType == UserPreferencesManager.FONT_TYPE_DEVICE
+                      ? systemFontName!
+                      : l10n.settingsAppearanceChooseDeviceFont,
+                  actions: [
+                    FilledButton.tonalIcon(
+                      style: SettingsControlStyles.sectionTextButton(),
+                      icon: const Icon(Icons.text_fields, size: 16),
+                      label: Text(l10n.settingsAppearanceChooseDeviceFont),
+                      onPressed: () async {
+                        try {
+                          final selected = await showDeviceFontPicker(
+                            context,
+                            selectedName: systemFontName,
+                          );
+                          if (selected == null || !context.mounted) return;
+                          final imported = await ThemeAssetStore()
+                              .importFontBytes(
+                                bytes: selected.bytes,
+                                fileName: 'device-font.ttf',
+                              );
+                          if (!context.mounted) return;
+                          setDialogState(() {
+                            useCustomFont = true;
+                            fontType = UserPreferencesManager.FONT_TYPE_DEVICE;
+                            systemFontName = selected.name;
+                            customFontPath = imported.storagePath;
+                          });
+                        } catch (error) {
+                          _showFontImportError(context, error);
+                        }
+                      },
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 10),
+                SettingsAssetTile(
                   icon: Icons.folder_open_outlined,
                   title: l10n.settingsAppearanceCustomFont,
-                  subtitle: _customFontLabel(l10n, customFontPath),
+                  subtitle: _customFontLabel(
+                    l10n,
+                    fontType == UserPreferencesManager.FONT_TYPE_FILE
+                        ? customFontPath
+                        : null,
+                  ),
                   actions: <Widget>[
                     FilledButton.tonalIcon(
                       style: SettingsControlStyles.sectionTextButton(),
@@ -1672,7 +1898,9 @@ Future<void> _showBubbleFontDialog(
                       icon: const Icon(Icons.file_upload_outlined, size: 16),
                       label: Text(l10n.settingsAppearanceChooseCustomFont),
                     ),
-                    if (customFontPath != null && customFontPath!.isNotEmpty)
+                    if (fontType == UserPreferencesManager.FONT_TYPE_FILE &&
+                        customFontPath != null &&
+                        customFontPath!.isNotEmpty)
                       SettingsEntityIconButton(
                         tooltip: l10n.settingsAppearanceClearCustomFont,
                         icon: Icons.close,
@@ -1680,6 +1908,8 @@ Future<void> _showBubbleFontDialog(
                           setDialogState(() {
                             customFontPath = '';
                             fontType = UserPreferencesManager.FONT_TYPE_SYSTEM;
+                            systemFontName =
+                                UserPreferencesManager.SYSTEM_FONT_DEFAULT;
                           });
                         },
                       ),
@@ -2028,6 +2258,7 @@ bool _isNinePatchMarker(ByteData bytes, int width, int x, int y) {
   return (start, endExclusive);
 }
 
+/// Opens a source-first image editor and saves only the accepted draft.
 Future<void> _showBubbleImageAdjustDialog(
   BuildContext context,
   OperitThemeController themeController,
@@ -2036,304 +2267,156 @@ Future<void> _showBubbleImageAdjustDialog(
 }) async {
   final l10n = AppLocalizations.of(context)!;
   final colorScheme = Theme.of(context).colorScheme;
-  final imagePath = isUser
-      ? snapshot.bubbleUserImageUri ?? ''
-      : snapshot.bubbleAiImageUri ?? '';
-  var cropLeft = isUser
-      ? snapshot.bubbleUserImageCropLeft
-      : snapshot.bubbleAiImageCropLeft;
-  var cropTop = isUser
-      ? snapshot.bubbleUserImageCropTop
-      : snapshot.bubbleAiImageCropTop;
-  var cropRight = isUser
-      ? snapshot.bubbleUserImageCropRight
-      : snapshot.bubbleAiImageCropRight;
-  var cropBottom = isUser
-      ? snapshot.bubbleUserImageCropBottom
-      : snapshot.bubbleAiImageCropBottom;
-  var repeatStart = isUser
-      ? snapshot.bubbleUserImageRepeatStart
-      : snapshot.bubbleAiImageRepeatStart;
-  var repeatEnd = isUser
-      ? snapshot.bubbleUserImageRepeatEnd
-      : snapshot.bubbleAiImageRepeatEnd;
-  var repeatYStart = isUser
-      ? snapshot.bubbleUserImageRepeatYStart
-      : snapshot.bubbleAiImageRepeatYStart;
-  var repeatYEnd = isUser
-      ? snapshot.bubbleUserImageRepeatYEnd
-      : snapshot.bubbleAiImageRepeatYEnd;
-  var imageScale = isUser
-      ? snapshot.bubbleUserImageScale
-      : snapshot.bubbleAiImageScale;
-
-  await showDialog<void>(
+  var draft = BubbleImageStyle(
+    imagePath: (isUser
+        ? snapshot.bubbleUserImageUri
+        : snapshot.bubbleAiImageUri)!,
+    cropLeftRatio: isUser
+        ? snapshot.bubbleUserImageCropLeft
+        : snapshot.bubbleAiImageCropLeft,
+    cropTopRatio: isUser
+        ? snapshot.bubbleUserImageCropTop
+        : snapshot.bubbleAiImageCropTop,
+    cropRightRatio: isUser
+        ? snapshot.bubbleUserImageCropRight
+        : snapshot.bubbleAiImageCropRight,
+    cropBottomRatio: isUser
+        ? snapshot.bubbleUserImageCropBottom
+        : snapshot.bubbleAiImageCropBottom,
+    repeatXStartRatio: isUser
+        ? snapshot.bubbleUserImageRepeatStart
+        : snapshot.bubbleAiImageRepeatStart,
+    repeatXEndRatio: isUser
+        ? snapshot.bubbleUserImageRepeatEnd
+        : snapshot.bubbleAiImageRepeatEnd,
+    repeatYStartRatio: isUser
+        ? snapshot.bubbleUserImageRepeatYStart
+        : snapshot.bubbleAiImageRepeatYStart,
+    repeatYEndRatio: isUser
+        ? snapshot.bubbleUserImageRepeatYEnd
+        : snapshot.bubbleAiImageRepeatYEnd,
+    imageScale: isUser
+        ? snapshot.bubbleUserImageScale
+        : snapshot.bubbleAiImageScale,
+    renderMode: isUser
+        ? snapshot.bubbleUserImageRenderMode
+        : snapshot.bubbleAiImageRenderMode,
+  );
+  final previewColorValue = isUser
+      ? snapshot.bubbleUserBubbleColor
+      : snapshot.bubbleAiBubbleColor;
+  final previewTextColorValue = isUser
+      ? snapshot.bubbleUserTextColor
+      : snapshot.bubbleAiTextColor;
+  final previewColor = previewColorValue == null
+      ? isUser
+            ? colorScheme.primary
+            : colorScheme.surfaceContainerHighest
+      : Color(previewColorValue);
+  final previewTextColor = previewTextColorValue == null
+      ? isUser
+            ? colorScheme.onPrimaryContainer
+            : colorScheme.onSurface
+      : Color(previewTextColorValue);
+  final result = await showDialog<BubbleImageStyle>(
     context: context,
+    useSafeArea: false,
     builder: (dialogContext) {
-      return StatefulBuilder(
-        builder: (context, setDialogState) {
-          void update(VoidCallback callback) {
-            setDialogState(callback);
-          }
-
-          final previewColor = isUser
-              ? snapshot.bubbleUserBubbleColor == null
-                    ? colorScheme.primary
-                    : Color(snapshot.bubbleUserBubbleColor!)
-              : snapshot.bubbleAiBubbleColor == null
-              ? colorScheme.surfaceContainerHighest
-              : Color(snapshot.bubbleAiBubbleColor!);
-          final previewTextColor = isUser
-              ? snapshot.bubbleUserTextColor == null
-                    ? colorScheme.onPrimaryContainer
-                    : Color(snapshot.bubbleUserTextColor!)
-              : snapshot.bubbleAiTextColor == null
-              ? colorScheme.onSurface
-              : Color(snapshot.bubbleAiTextColor!);
-          final previewStyle = BubbleImageStyle(
-            imagePath: imagePath,
-            cropLeftRatio: cropLeft,
-            cropTopRatio: cropTop,
-            cropRightRatio: cropRight,
-            cropBottomRatio: cropBottom,
-            repeatXStartRatio: repeatStart,
-            repeatXEndRatio: repeatEnd,
-            repeatYStartRatio: repeatYStart,
-            repeatYEndRatio: repeatYEnd,
-            imageScale: imageScale,
-            renderMode: isUser
-                ? snapshot.bubbleUserImageRenderMode
-                : snapshot.bubbleAiImageRenderMode,
-            showSliceGuides: true,
-          );
-
-          return OperitDialogScaffold(
-            title: isUser
+      final editor = Scaffold(
+        appBar: AppBar(
+          leading: IconButton(
+            tooltip: l10n.cancel,
+            onPressed: () => Navigator.of(dialogContext).pop(),
+            icon: const Icon(Icons.close),
+          ),
+          title: Text(
+            isUser
                 ? l10n.settingsAppearanceBubbleImageAdjustUser
                 : l10n.settingsAppearanceBubbleImageAdjustAi,
-            maxWidth: 520,
-            maxHeight: 660,
-            showCloseButton: true,
-            actions: <Widget>[
-              TextButton(
-                onPressed: () => Navigator.of(dialogContext).pop(),
-                child: Text(l10n.cancel),
+            style: Theme.of(dialogContext).textTheme.titleMedium,
+          ),
+          actions: <Widget>[
+            TextButton(
+              onPressed: () => Navigator.of(dialogContext).pop(draft),
+              child: Text(l10n.save),
+            ),
+            const SizedBox(width: 8),
+          ],
+        ),
+        body: SafeArea(
+          top: false,
+          child: BubbleImageAdjustEditor(
+            initialStyle: draft,
+            onChanged: (value) => draft = value,
+            previewBuilder: (context, style) => BubbleSurface(
+              color: previewColor,
+              borderRadius: BorderRadius.circular(
+                (isUser
+                        ? snapshot.bubbleUserRoundedCornersEnabled
+                        : snapshot.bubbleAiRoundedCornersEnabled)
+                    ? 12
+                    : 4,
               ),
-              FilledButton(
-                onPressed: () {
-                  unawaited(
-                    isUser
-                        ? themeController.saveThemeSettings(
-                            bubbleUserImageCropLeft: cropLeft,
-                            bubbleUserImageCropTop: cropTop,
-                            bubbleUserImageCropRight: cropRight,
-                            bubbleUserImageCropBottom: cropBottom,
-                            bubbleUserImageRepeatStart: repeatStart,
-                            bubbleUserImageRepeatEnd: repeatEnd,
-                            bubbleUserImageRepeatYStart: repeatYStart,
-                            bubbleUserImageRepeatYEnd: repeatYEnd,
-                            bubbleUserImageScale: imageScale,
-                          )
-                        : themeController.saveThemeSettings(
-                            bubbleAiImageCropLeft: cropLeft,
-                            bubbleAiImageCropTop: cropTop,
-                            bubbleAiImageCropRight: cropRight,
-                            bubbleAiImageCropBottom: cropBottom,
-                            bubbleAiImageRepeatStart: repeatStart,
-                            bubbleAiImageRepeatEnd: repeatEnd,
-                            bubbleAiImageRepeatYStart: repeatYStart,
-                            bubbleAiImageRepeatYEnd: repeatYEnd,
-                            bubbleAiImageScale: imageScale,
-                          ),
-                  );
-                  Navigator.of(dialogContext).pop();
-                },
-                child: Text(l10n.save),
-              ),
-            ],
-            child: SingleChildScrollView(
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                crossAxisAlignment: CrossAxisAlignment.stretch,
-                children: <Widget>[
-                  ClipRRect(
-                    borderRadius: BorderRadius.circular(12),
-                    child: ColoredBox(
-                      color: colorScheme.surfaceContainerHighest,
-                      child: SizedBox(
-                        height: 220,
-                        width: double.infinity,
-                        child: BubbleSliceSourceGuide(imageStyle: previewStyle),
-                      ),
-                    ),
-                  ),
-                  const SizedBox(height: 12),
-                  SizedBox(
-                    height: 104,
-                    width: double.infinity,
-                    child: BubbleSurface(
-                      color: previewColor,
-                      borderRadius: BorderRadius.circular(
-                        isUser
-                            ? snapshot.bubbleUserRoundedCornersEnabled
-                                  ? 12
-                                  : 4
-                            : snapshot.bubbleAiRoundedCornersEnabled
-                            ? 12
-                            : 4,
-                      ),
-                      imageStyle: previewStyle,
-                      child: Padding(
-                        padding: EdgeInsets.fromLTRB(
-                          isUser
-                              ? snapshot.bubbleUserContentPaddingLeft
-                              : snapshot.bubbleAiContentPaddingLeft,
-                          12,
-                          isUser
-                              ? snapshot.bubbleUserContentPaddingRight
-                              : snapshot.bubbleAiContentPaddingRight,
-                          12,
-                        ),
-                        child: Align(
-                          alignment: Alignment.centerLeft,
-                          child: Text(
-                            l10n.settingsAppearanceBubbleImagePreviewText,
-                            style: Theme.of(context).textTheme.bodyMedium
-                                ?.copyWith(color: previewTextColor),
-                          ),
-                        ),
-                      ),
-                    ),
-                  ),
-                  const SizedBox(height: 12),
-                  _DialogSectionTitle(l10n.settingsAppearanceBubbleImageCrop),
-                  _TwoColumnSliderGrid(
-                    children: <Widget>[
-                      SettingsSliderRow(
-                        compact: true,
-                        label: l10n.settingsAppearanceBubbleImageCropLeft,
-                        value: cropLeft,
-                        min: 0,
-                        max: 0.45,
-                        divisions: 45,
-                        valueText: '${(cropLeft * 100).round()}%',
-                        onChanged: (value) => update(() => cropLeft = value),
-                      ),
-                      SettingsSliderRow(
-                        compact: true,
-                        label: l10n.settingsAppearanceBubbleImageCropTop,
-                        value: cropTop,
-                        min: 0,
-                        max: 0.45,
-                        divisions: 45,
-                        valueText: '${(cropTop * 100).round()}%',
-                        onChanged: (value) => update(() => cropTop = value),
-                      ),
-                      SettingsSliderRow(
-                        compact: true,
-                        label: l10n.settingsAppearanceBubbleImageCropRight,
-                        value: cropRight,
-                        min: 0,
-                        max: 0.45,
-                        divisions: 45,
-                        valueText: '${(cropRight * 100).round()}%',
-                        onChanged: (value) => update(() => cropRight = value),
-                      ),
-                      SettingsSliderRow(
-                        compact: true,
-                        label: l10n.settingsAppearanceBubbleImageCropBottom,
-                        value: cropBottom,
-                        min: 0,
-                        max: 0.45,
-                        divisions: 45,
-                        valueText: '${(cropBottom * 100).round()}%',
-                        onChanged: (value) => update(() => cropBottom = value),
-                      ),
-                    ],
-                  ),
-                  const SizedBox(height: 10),
-                  _DialogSectionTitle(l10n.settingsAppearanceBubbleImageRepeat),
-                  _TwoColumnSliderGrid(
-                    children: <Widget>[
-                      SettingsSliderRow(
-                        compact: true,
-                        label: l10n.settingsAppearanceBubbleImageRepeatStart,
-                        value: repeatStart,
-                        min: 0.05,
-                        max: 0.9,
-                        divisions: 85,
-                        valueText: '${(repeatStart * 100).round()}%',
-                        onChanged: (value) => update(() {
-                          repeatStart = value;
-                          if (repeatEnd <= repeatStart + 0.01) {
-                            repeatEnd = (repeatStart + 0.01).clamp(0.06, 0.95);
-                          }
-                        }),
-                      ),
-                      SettingsSliderRow(
-                        compact: true,
-                        label: l10n.settingsAppearanceBubbleImageRepeatEnd,
-                        value: repeatEnd,
-                        min: repeatStart + 0.01,
-                        max: 0.95,
-                        divisions: ((0.95 - (repeatStart + 0.01)) * 100)
-                            .round()
-                            .clamp(1, 100),
-                        valueText: '${(repeatEnd * 100).round()}%',
-                        onChanged: (value) => update(() => repeatEnd = value),
-                      ),
-                      SettingsSliderRow(
-                        compact: true,
-                        label: l10n.settingsAppearanceBubbleImageRepeatYStart,
-                        value: repeatYStart,
-                        min: 0.05,
-                        max: 0.9,
-                        divisions: 85,
-                        valueText: '${(repeatYStart * 100).round()}%',
-                        onChanged: (value) => update(() {
-                          repeatYStart = value;
-                          if (repeatYEnd <= repeatYStart + 0.01) {
-                            repeatYEnd = (repeatYStart + 0.01).clamp(
-                              0.06,
-                              0.95,
-                            );
-                          }
-                        }),
-                      ),
-                      SettingsSliderRow(
-                        compact: true,
-                        label: l10n.settingsAppearanceBubbleImageRepeatYEnd,
-                        value: repeatYEnd,
-                        min: repeatYStart + 0.01,
-                        max: 0.95,
-                        divisions: ((0.95 - (repeatYStart + 0.01)) * 100)
-                            .round()
-                            .clamp(1, 100),
-                        valueText: '${(repeatYEnd * 100).round()}%',
-                        onChanged: (value) => update(() => repeatYEnd = value),
-                      ),
-                    ],
-                  ),
-                  const SizedBox(height: 10),
-                  _DialogSectionTitle(l10n.settingsAppearanceBubbleImageScale),
-                  SettingsSliderRow(
-                    compact: true,
-                    label: l10n.settingsAppearanceBubbleImageScale,
-                    value: imageScale,
-                    min: 0.2,
-                    max: 3,
-                    divisions: 28,
-                    valueText: '${imageScale.toStringAsFixed(1)}x',
-                    onChanged: (value) => update(() => imageScale = value),
-                  ),
-                ],
+              imageStyle: style,
+              child: Padding(
+                padding: EdgeInsets.fromLTRB(
+                  isUser
+                      ? snapshot.bubbleUserContentPaddingLeft
+                      : snapshot.bubbleAiContentPaddingLeft,
+                  12,
+                  isUser
+                      ? snapshot.bubbleUserContentPaddingRight
+                      : snapshot.bubbleAiContentPaddingRight,
+                  12,
+                ),
+                child: Text(
+                  l10n.settingsAppearanceBubbleImagePreviewText,
+                  style: Theme.of(
+                    context,
+                  ).textTheme.bodyMedium?.copyWith(color: previewTextColor),
+                ),
               ),
             ),
-          );
-        },
+          ),
+        ),
+      );
+      if (MediaQuery.sizeOf(dialogContext).width < 720) {
+        return Dialog.fullscreen(child: editor);
+      }
+      return Dialog(
+        insetPadding: const EdgeInsets.all(24),
+        constraints: const BoxConstraints(maxWidth: 1100, maxHeight: 850),
+        clipBehavior: Clip.antiAlias,
+        child: editor,
       );
     },
   );
+  if (result == null) return;
+  if (isUser) {
+    await themeController.saveThemeSettings(
+      bubbleUserImageCropLeft: result.cropLeftRatio,
+      bubbleUserImageCropTop: result.cropTopRatio,
+      bubbleUserImageCropRight: result.cropRightRatio,
+      bubbleUserImageCropBottom: result.cropBottomRatio,
+      bubbleUserImageRepeatStart: result.repeatXStartRatio,
+      bubbleUserImageRepeatEnd: result.repeatXEndRatio,
+      bubbleUserImageRepeatYStart: result.repeatYStartRatio,
+      bubbleUserImageRepeatYEnd: result.repeatYEndRatio,
+      bubbleUserImageScale: result.imageScale,
+    );
+  } else {
+    await themeController.saveThemeSettings(
+      bubbleAiImageCropLeft: result.cropLeftRatio,
+      bubbleAiImageCropTop: result.cropTopRatio,
+      bubbleAiImageCropRight: result.cropRightRatio,
+      bubbleAiImageCropBottom: result.cropBottomRatio,
+      bubbleAiImageRepeatStart: result.repeatXStartRatio,
+      bubbleAiImageRepeatEnd: result.repeatXEndRatio,
+      bubbleAiImageRepeatYStart: result.repeatYStartRatio,
+      bubbleAiImageRepeatYEnd: result.repeatYEndRatio,
+      bubbleAiImageScale: result.imageScale,
+    );
+  }
 }
 
 class _ThemeColorPreset {
@@ -2435,6 +2518,9 @@ String _bubbleFontLabel(
       : snapshot.bubbleAiCustomFontPath;
   if (!useCustomFont) {
     return l10n.settingsAppearanceFontDefault;
+  }
+  if (fontType == UserPreferencesManager.FONT_TYPE_DEVICE) {
+    return systemFontName!;
   }
   if (fontType == UserPreferencesManager.FONT_TYPE_FILE &&
       customFontPath != null &&
@@ -3659,16 +3745,22 @@ String _bubbleImageRenderModeLabel(AppLocalizations l10n, String value) {
 enum _FontFamilyPreset { defaultFont, serif, monospace }
 
 class _FontFamilySelector extends StatelessWidget {
-  const _FontFamilySelector({required this.value, required this.onChanged});
+  const _FontFamilySelector({
+    required this.value,
+    required this.onChanged,
+    required this.hasSelection,
+  });
 
   final _FontFamilyPreset value;
   final ValueChanged<_FontFamilyPreset> onChanged;
+  final bool hasSelection;
 
   @override
   Widget build(BuildContext context) {
     final l10n = AppLocalizations.of(context)!;
     return SettingsSegmentedSelector<_FontFamilyPreset>(
       value: value,
+      hasSelection: hasSelection,
       onChanged: onChanged,
       segments: <ButtonSegment<_FontFamilyPreset>>[
         ButtonSegment<_FontFamilyPreset>(
@@ -3714,6 +3806,9 @@ String _fontFamilyLabel(
   AppLocalizations l10n,
   ThemePreferenceSnapshot snapshot,
 ) {
+  if (snapshot.fontType == UserPreferencesManager.FONT_TYPE_DEVICE) {
+    return snapshot.systemFontName!;
+  }
   if (snapshot.fontType == UserPreferencesManager.FONT_TYPE_FILE &&
       snapshot.customFontPath != null &&
       snapshot.customFontPath!.isNotEmpty) {
@@ -3926,41 +4021,6 @@ class _AppearanceFieldBlock extends StatelessWidget {
   }
 }
 
-class _TwoColumnSliderGrid extends StatelessWidget {
-  const _TwoColumnSliderGrid({required this.children});
-
-  final List<Widget> children;
-
-  @override
-  Widget build(BuildContext context) {
-    return LayoutBuilder(
-      builder: (context, constraints) {
-        if (constraints.maxWidth >= 380) {
-          final rows = <Widget>[];
-          for (var i = 0; i < children.length; i += 2) {
-            rows.add(
-              Row(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: <Widget>[
-                  Expanded(child: children[i]),
-                  const SizedBox(width: 12),
-                  Expanded(
-                    child: i + 1 < children.length
-                        ? children[i + 1]
-                        : const SizedBox.shrink(),
-                  ),
-                ],
-              ),
-            );
-          }
-          return Column(mainAxisSize: MainAxisSize.min, children: rows);
-        }
-        return Column(mainAxisSize: MainAxisSize.min, children: children);
-      },
-    );
-  }
-}
-
 class _InfoLine extends StatelessWidget {
   const _InfoLine({required this.label, required this.value});
 
@@ -4019,26 +4079,6 @@ class _SettingSwitch extends StatelessWidget {
       value: value,
       onChanged: onChanged,
       dense: true,
-    );
-  }
-}
-
-class _DialogSectionTitle extends StatelessWidget {
-  const _DialogSectionTitle(this.text);
-
-  final String text;
-
-  @override
-  Widget build(BuildContext context) {
-    return Padding(
-      padding: const EdgeInsets.only(top: 8, bottom: 4),
-      child: Text(
-        text,
-        style: Theme.of(context).textTheme.titleSmall?.copyWith(
-          fontWeight: FontWeight.w700,
-          color: Theme.of(context).colorScheme.primary,
-        ),
-      ),
     );
   }
 }

@@ -1,5 +1,5 @@
 import { compileComposeModule } from "../../../../../plugins/tools/compile_compose_module.mjs";
-import { productionBootstrap, bootstrapLibrarySource } from '../../../../../tools/tests/fixtures/production_bootstrap.mjs';
+import { productionBootstrap, bootstrapLibrarySource, installTestJavaScriptCompiler } from '../../../../../tools/tests/fixtures/production_bootstrap.mjs';
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { createRequire } from "node:module";
@@ -8,7 +8,7 @@ import { fileURLToPath } from "node:url";
 import vm from "node:vm";
 
 const root = new URL("../../../../../", import.meta.url);
-const require = createRequire(new URL("../../workflow/package.json", import.meta.url));
+const require = createRequire(import.meta.url);
 const { buildSync } = require("esbuild");
 
 /** Reads the exact production source used by the native JavaScript execution boundary. */
@@ -83,7 +83,7 @@ export function createNativeToolRuntime(globals, dispatchIpc) {
     );
   });
   context.__operitNativePrepareComposeModule = compileComposeModule;
-  vm.runInContext("globalThis.__operitNativeCompileModuleFactory = body => new Function('module','exports','require','__operit_call_runtime',body);", context);
+  installTestJavaScriptCompiler(context);
   vm.runInContext(productionBootstrap(),context);
 
   /** Invokes the production engine entry point with exactly the supplied converted native parameters. */

@@ -32,9 +32,9 @@ export async function buildUpstreamReference() {
   }
 }
 
-/** Compiles the readable ToolPkg entry and independent Compose screen using the host's Promise contract. */
+/** Bundles the readable ToolPkg entry and independent Compose screen for engine compilation. */
 export async function buildPluginScripts(prompt) {
-  const shared = { absWorkingDir: root, bundle: true, format: "cjs", platform: "neutral", target: "es2020", supported: { "async-await": false }, write: false, charset: "utf8" };
+  const shared = { absWorkingDir: root, bundle: true, format: "cjs", platform: "neutral", target: "es2020", write: false, charset: "utf8" };
   const main = await build({
     ...shared, entryPoints: ["src/main.ts"], external: ["./ui/index.ui.js"],
     plugins: [{
@@ -101,7 +101,7 @@ export async function pack() {
     await mkdir(path.dirname(path.join(root, relative)), { recursive: true });
     await writeFile(path.join(root, relative), content);
   }
-  const archive = zipSync(entries, { level: 9, mtime: new Date("2026-01-01T00:00:00Z") });
+  const archive = zipSync(entries, { level: 9, mtime: new Date(1980, 0, 1) });
   await writeFile(path.join(root, "dist/openui.toolpkg"), archive);
   const asset = path.resolve(root, "../../../../core/crates/runtime/application/assets/plugins/external/openui.toolpkg");
   await mkdir(path.dirname(asset), { recursive: true });

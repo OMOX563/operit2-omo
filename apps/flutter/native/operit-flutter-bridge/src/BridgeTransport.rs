@@ -6,13 +6,13 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use futures_util::{stream::FuturesUnordered, FutureExt, StreamExt};
+use futures_util::{future::BoxFuture, stream::FuturesUnordered, FutureExt, StreamExt};
 use operit_host_api::HostRuntimeTaskSchedulerHost;
 use operit_link::{
     CoreEvent, CoreEventKind, CoreLinkError, CoreLinkSharedClient, CorePushItem, CorePushRequest,
     CoreWatchRequest,
 };
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{mpsc, oneshot, watch, Mutex};
 
 const COMMAND_CAPACITY: usize = 64;
 const PUSH_CAPACITY: usize = 16;
@@ -20,6 +20,7 @@ pub(crate) const WATCH_BATCH_CAPACITY: usize = 64;
 
 type Reply = oneshot::Sender<Result<Option<String>, CoreLinkError>>;
 pub(crate) type StreamReply = oneshot::Receiver<Result<Option<String>, CoreLinkError>>;
+pub(crate) type StreamSubmission = BoxFuture<'static, Result<Option<String>, CoreLinkError>>;
 type Client = Arc<dyn CoreLinkSharedClient + Send + Sync>;
 type StreamTask = Pin<Box<dyn Future<Output = (StreamKey, Arc<()>)>>>;
 
@@ -62,6 +63,7 @@ pub(crate) struct WatchDelivery {
 pub(crate) struct BridgeStreams {
     commands: mpsc::Sender<Command>,
     shutdown: watch::Sender<bool>,
+    admission: Arc<Mutex<()>>,
 }
 
 struct PushRegistration {
@@ -136,10 +138,54 @@ impl BridgeStreams {
             watches: HashMap::new(),
             tasks: FuturesUnordered::new(),
         };
-        (Self { commands, shutdown }, outbox, owner)
+        (
+            Self {
+                commands,
+                shutdown,
+                admission: Arc::new(Mutex::new(())),
+            },
+            outbox,
+            owner,
+        )
     }
 
-    /// Reserves ingress order synchronously for native FFI submissions.
+    /// Orders native ingress before scheduling, waiting for capacity rather than failing a session.
+    pub(crate) fn enqueue(&self, action: StreamAction) -> StreamSubmission {
+        let (reply, response) = oneshot::channel();
+        // Poll the fair lock once at ingress so Host task scheduling cannot reorder waiters.
+        // Disabling cooperative budgeting here ensures even a busy caller registers its place.
+        let mut admission = Box::pin(tokio::task::unconstrained(
+            self.admission.clone().lock_owned(),
+        ));
+        let ready = admission.as_mut().now_or_never();
+        let commands = self.commands.clone();
+        let mut shutdown = self.shutdown.subscribe();
+        async move {
+            if *shutdown.borrow() {
+                return Err(closed());
+            }
+            let admitted = async move {
+                let _guard = match ready {
+                    Some(guard) => guard,
+                    None => admission.await,
+                };
+                commands
+                    .send(Command { action, reply })
+                    .await
+                    .map_err(|_| closed())
+            };
+            tokio::select! {
+                biased;
+                _ = shutdown.changed() => return Err(closed()),
+                sent = admitted => sent?,
+            }
+            // Release admission before awaiting Core: pending opens must remain cancellable.
+            response.await.map_err(|_| closed())?
+        }
+        .boxed()
+    }
+
+    /// Immediately submits browser cancellation where the synchronous API cannot wait.
     pub(crate) fn submit(&self, action: StreamAction) -> Result<StreamReply, CoreLinkError> {
         if *self.shutdown.borrow() {
             return Err(closed());
@@ -341,6 +387,8 @@ async fn forward_watch(
     mut cancelled: oneshot::Receiver<()>,
     events: mpsc::Sender<WatchDelivery>,
 ) {
+    let mut streaming = false;
+    let mut reply = Some(reply);
     let outcome = std::panic::AssertUnwindSafe(async {
         let opened = tokio::select! {
             biased;
@@ -349,9 +397,10 @@ async fn forward_watch(
         };
         let mut source = match opened {
             Ok(source) => source,
-            Err(error) => { let _ = reply.send(Err(error)); return; }
+            Err(error) => { let _ = reply.take().expect("Opening reply").send(Err(error)); return; }
         };
-        if reply.send(Ok(Some(id.clone()))).is_err() { return; }
+        if reply.take().expect("Opening reply").send(Ok(Some(id.clone()))).is_err() { return; }
+        streaming = true;
         loop {
             let event = tokio::select! {
                 biased;
@@ -368,12 +417,18 @@ async fn forward_watch(
             if completed { break; }
         }
     }).catch_unwind().await;
+    // Failed opens are settled by their reply; only opened sources publish completion.
+    if !streaming && outcome.is_ok() { return; }
     let event = outcome.map(|_| None).map_err(|payload| {
         CoreLinkError::new(
             "FATAL_CORE_PANIC",
             crate::BridgeExports::panic_payload_message(payload.as_ref()),
         )
     });
+    if let Some(reply) = reply {
+        let _ = reply.send(event.map(|_| Some(id)));
+        return;
+    }
     let _ = events.send(WatchDelivery { id, tag, event }).await;
 }
 

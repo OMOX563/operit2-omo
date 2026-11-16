@@ -10,6 +10,8 @@ import io.flutter.embedding.engine.FlutterEngine
 import dev.floating_windows.FloatingWindowsPlugin
 
 class MainActivity : FlutterActivity() {
+    /** Selects the runtime fixed by this APK's build configuration. */
+    val isExternalRuntime: Boolean get() = BuildConfig.OPERIT_EXTERNAL_RUNTIME
     companion object {
         private const val TAG = "OperitMainActivity"
         const val NOTIFICATION_ACTIVATION_EXTRA = "app.operit.notificationActivation"
@@ -22,6 +24,7 @@ class MainActivity : FlutterActivity() {
     private lateinit var ownerSystem: OwnerSystemCapabilityChannel
     private lateinit var runtimeRouter: RuntimeMethodChannelRouter
     private lateinit var nativeCrashChannel: NativeCrashChannel
+    private lateinit var incomingFileChannel: IncomingFileChannel
     private var pendingNotificationActivation: Map<String, String>? = null
     private var notificationActivationReceiverReady = false
 
@@ -30,6 +33,7 @@ class MainActivity : FlutterActivity() {
         super.onCreate(savedInstanceState)
         activeActivity = this
         recordNotificationActivation(intent)
+        incomingFileChannel.receive(intent)
         requestHighestRefreshRate()
     }
 
@@ -64,9 +68,11 @@ class MainActivity : FlutterActivity() {
         runtimeRouter.configure(flutterEngine.dartExecutor.binaryMessenger)
         nativeCrashChannel = NativeCrashChannel(this)
         nativeCrashChannel.configure(flutterEngine.dartExecutor.binaryMessenger)
+        incomingFileChannel = IncomingFileChannel(this, flutterEngine.dartExecutor.binaryMessenger)
     }
 
     override fun cleanUpFlutterEngine(flutterEngine: FlutterEngine) {
+        if (::incomingFileChannel.isInitialized) incomingFileChannel.clear()
         try {
             if (::ownerSystem.isInitialized) {
                 ownerSystem.release()
@@ -105,9 +111,14 @@ class MainActivity : FlutterActivity() {
         super.onNewIntent(intent)
         setIntent(intent)
         recordNotificationActivation(intent)
+        incomingFileChannel.receive(intent)
     }
 
-    fun ensureHostEventRuntimeHandle(): Long = ensureRuntimeHost().ensureRuntimeHandle()
+    /** Rejects accidental local runtime creation from a module client process. */
+    fun ensureHostEventRuntimeHandle(): Long {
+        check(!isExternalRuntime) { "The module client does not own a local Core" }
+        return ensureRuntimeHost().ensureRuntimeHandle()
+    }
 
     fun handleRuntimeHostRequest(methodName: String, payloadJson: String): String {
         return ensureOwnerSystem(ensureRuntimeHost()).handleRuntimeHostRequest(methodName, payloadJson)

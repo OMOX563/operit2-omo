@@ -35,7 +35,6 @@ use crate::data::backup::Operit1RoomSchemaMigration::{
 use crate::data::backup::Operit1SnapshotArchive::{
     validateRelativePath, Operit1PreferenceValue, Operit1SnapshotArchive, Operit1SnapshotEntry,
 };
-use crate::data::backup::Operit1ThinkingMigration::convert_thinking_configurations;
 
 use super::CharacterPluginLegacyData::sanitizeMemoryOwnerId;
 use super::CharacterPluginLegacyData::{
@@ -57,8 +56,8 @@ use operit_model::MessagePart::MessagePart;
 use operit_model::MessagePartCodec::MessagePartCodec;
 use operit_model::ModelCatalog::ModelCatalog;
 use operit_model::ModelConfigData::{
-    ApiProviderType, ModelCapabilities, ModelConfigDefaults, ModelContextSpec, ModelProfile,
-    ModelRequestSpec, ModelSummarySettings, ProviderProfile,
+    ApiProviderType, ModelCapabilityOverrides, ModelConfigDefaults, ModelContextSpec, ModelProfile,
+    ModelRequestOverrides, ModelSummarySettings, ProviderProfile,
 };
 use operit_model::ModelParameter::{ModelParameter, ParameterCategory};
 use operit_model::OperitChatArchive::{
@@ -110,10 +109,6 @@ const OPERIT1_INTERNAL_FILES_PREFIXES: [&str; 4] = [
 ];
 const OPERIT1_EXTERNAL_DOWNLOAD_PREFIX: &str = "/storage/emulated/0/Download/Operit/";
 const OPERIT1_DEFAULT_AI_AVATAR_URI: &str = "file:///android_asset/operit.png";
-const OPERIT1_OBJECTBOX_KEY_MEMORY: [u8; 4] = [0x18, 0x00, 0x00, 0x10];
-const OPERIT1_OBJECTBOX_KEY_LINK: [u8; 4] = [0x18, 0x00, 0x00, 0x14];
-const OPERIT1_OBJECTBOX_KEY_TAG: [u8; 4] = [0x18, 0x00, 0x00, 0x1c];
-const OPERIT1_OBJECTBOX_KEY_MEMORY_TAG_RELATION: [u8; 4] = [0x20, 0x00, 0x00, 0x20];
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[allow(non_snake_case)]
@@ -426,16 +421,10 @@ impl Operit1SnapshotImportManager {
         publishOperit1SnapshotImportProgress(Operit1SnapshotImportProgress::stage(
             "model_config",
             "迁移模型配置",
-            "正在写入供应商、密钥和默认聊天模型。",
+            "正在写入全部供应商、密钥和功能模型绑定。",
             0.22,
         ));
-        let selected = parsed.selectedChatConfig()?;
-        let selectedModelId = selected
-            .selectedModelId
-            .clone()
-            .ok_or_else(|| "Operit1 快照里的聊天模型索引没有对应模型".to_string())?;
-        let modelConfig =
-            self.importModelConfigFromParsed(&parsed, selected.configId.clone(), selectedModelId)?;
+        let modelConfig = self.importAllModelConfigsFromParsed(&parsed)?;
         let fileImportPlan = SnapshotFileImportPlan::new();
         publishOperit1SnapshotImportProgress(Operit1SnapshotImportProgress::stage(
             "structured_preferences",
@@ -543,43 +532,21 @@ impl Operit1SnapshotImportManager {
                 config.name, modelId
             ));
         }
-        let providerBinding = config.providerBinding()?;
-        let endpoint = config.apiEndpoint.trim().to_string();
-        if endpoint.is_empty() {
+        if config.apiEndpoint.trim().is_empty() {
             return Err(format!("模型配置「{}」缺少服务地址", config.name));
         }
-
-        let mut provider = ProviderProfile::new(
+        let provider = buildOperit1ProviderProfile(
+            &config,
             ModelConfigDefaults::DEFAULT_PROVIDER_ID.to_string(),
-            providerBinding.displayName,
-            providerBinding.providerType,
-            endpoint,
-        );
-        provider.providerTypeId = providerBinding.providerTypeId;
-        provider.apiKey = config.apiKey.clone();
-        provider.useMultipleApiKeys = config.useMultipleApiKeys;
-        provider.apiKeyPool = config
-            .apiKeyPool
-            .iter()
-            .map(Operit1ApiKeyInfo::toApiKeyInfo)
-            .collect();
-        provider.currentKeyIndex = config.currentKeyIndex;
-        provider.keyRotationMode = config.keyRotationMode.clone();
-        provider.customHeaders = config.customHeaders.clone();
-        provider.requestLimitPerMinute = config.requestLimitPerMinute;
-        provider.maxConcurrentRequests = config.maxConcurrentRequests;
-        provider.models = modelIds
-            .iter()
-            .map(|currentModelId| buildModelProfile(currentModelId, &config))
-            .collect::<Result<Vec<_>, String>>()?;
+        )?;
 
-        let modelConfigManager = ModelConfigManager::new(self.paths.runtime_dir().to_path_buf());
+        let modelConfigManager = ModelConfigManager::default();
         modelConfigManager
             .replaceDefaultProviderProfile(provider.clone())
             .map_err(|error| error.to_string())?;
 
         let functionalConfigManager =
-            FunctionalConfigManager::new(self.paths.runtime_dir().to_path_buf());
+            FunctionalConfigManager::default();
         functionalConfigManager
             .setModelForFunction(
                 FunctionType::CHAT,
@@ -588,19 +555,7 @@ impl Operit1SnapshotImportManager {
             )
             .map_err(|error| error.to_string())?;
 
-        Ok(Operit1ModelConfigImportResult {
-            providerId: provider.id,
-            providerTypeId: provider.providerTypeId,
-            providerName: provider.name,
-            modelId,
-            importedModelCount: provider.models.len() as i32,
-            chatBindingUpdated: true,
-            skippedFields: vec![
-                "contextLength".to_string(),
-                "summaryCustomRules".to_string(),
-                "enableGoogleSearch".to_string(),
-            ],
-        })
+        Ok(operit1ModelImportResult(&provider, modelId, provider.models.len() as i32))
     }
 
     #[allow(non_snake_case)]
@@ -690,6 +645,10 @@ impl Operit1SnapshotImportManager {
                     for (key, value) in adopted.iterEntries() {
                         target.set(&stringPreferencesKey(key), value.clone());
                     }
+                    if entryName == ENTRY_USER_PREFERENCES {
+                        // Imported ordinary appearance does not belong to the target's selected saved theme.
+                        target.set(&stringPreferencesKey("active_theme_config_id"), Value::Null);
+                    }
                 })
                 .map_err(|error| error.to_string())?;
             fileCount += 1;
@@ -757,6 +716,11 @@ impl Operit1SnapshotImportManager {
             )?;
             let (memoryCount, linkCount) = self.importCharactersAndMemory(parsed, fileImportPlan, &archive)?;
             resolveOperit1ArchiveBindings(&mut archive, self.sqliteHost.clone(), self.storageHost.clone())?;
+            let importedChatIds = archive
+                .chats
+                .iter()
+                .map(|chat| chat.id.clone())
+                .collect::<Vec<_>>();
             let chatCount = archive.chats.len() as i32;
             let messageCount = archive
                 .chats
@@ -792,7 +756,11 @@ impl Operit1SnapshotImportManager {
                     }
                 })
                 .map_err(|error| error.to_string())?;
-            crate::data::backup::CharacterPluginMigration::migrateLegacyCharacters(self.paths.clone())?;
+            publishOperit1ArchiveBindings(
+                &importedChatIds,
+                self.sqliteHost.clone(),
+                self.storageHost.clone(),
+            )?;
             if chatCount == 0 {
                 publishOperit1SnapshotCountedProgress(
                     "chats",

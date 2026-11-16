@@ -10,7 +10,7 @@ import path from "node:path";
 import vm from "node:vm";
 import { buildMainScript, buildUiScreenScripts, buildRuntimeToolsScript, createHtmlDocument, createPackageArchive } from "../scripts/build.mjs";
 
-const require = createRequire(new URL("../../workflow/package.json", import.meta.url));
+const require = createRequire(import.meta.url);
 const { unzipSync } = require("fflate");
 const root = fileURLToPath(new URL("../", import.meta.url));
 const repositoryRoot = fileURLToPath(new URL("../../../../../", import.meta.url));
@@ -43,6 +43,20 @@ test("all esbuild outputs are byte-identical from repository and plugin working 
     assert.equal(Buffer.compare(repositoryBytes, pluginBytes), 0, "Working-directory-dependent artifact bytes: " + name);
   }
   assert.equal(process.cwd(), originalDirectory, "Cross-directory builds must not mutate the parent process working directory");
+});
+
+/** Rebuilding on a different day must keep the exact archive identity used by bundled update checks. */
+test("package bytes do not depend on the build clock", async (t) => {
+  const main = await buildMainScript(), tools = await buildRuntimeToolsScript(), html = await createHtmlDocument(), screens = await buildUiScreenScripts();
+  t.mock.timers.enable({ apis: ["Date"], now: new Date(2025, 0, 1).getTime() });
+  const before = await createPackageArchive(main, tools, html, screens);
+  t.mock.timers.setTime(new Date(2026, 10, 5).getTime());
+  const after = await createPackageArchive(main, tools, html, screens);
+  assert.equal(digest(before), digest(after));
+  const changedMain = Buffer.concat([main, Buffer.from("\n// Updated runtime code\n")]);
+  const changed = await createPackageArchive(changedMain, tools, html, screens);
+  assert.notEqual(digest(before), digest(changed));
+  assert.deepEqual(Buffer.from(unzipSync(changed)["dist/main.js"]), changedMain);
 });
 
 /** Computes the exact artifact identity without printing complete generated source on failure. */
@@ -175,22 +189,4 @@ test("all declared resources are packaged and the obsolete sidebar browser chain
   assert.equal(Object.hasOwn(entries, "resources/character-sidebar.html"), false);
   assert.equal(Object.keys(entries).some(path => path === "web/sidebar.ts" || path.startsWith("web/features/sidebar/")), false);
   assert.equal(manifest.resources.some(resource => resource.key === "character_sidebar_html"), false);
-});
-
-/** Main and standalone screens must lower native awaits to retain call-scoped Promise continuations. */
-test("main and Compose screen providers lower every async function for scoped Promise continuations", async () => {
-  const ts = require("typescript");
-  const scripts = { "dist/main.js": await buildMainScript(), ...await buildUiScreenScripts() };
-  for (const [file, bytes] of Object.entries(scripts)) {
-    const text = Buffer.from(bytes).toString("utf8");
-    const tree = ts.createSourceFile(file, text, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
-    let nativeAsyncFunctions = 0;
-    /** Inspects syntax nodes, not comments or strings containing the word async. */
-    function visit(node) {
-      if (ts.isFunctionLike(node) && node.modifiers?.some(modifier => modifier.kind === ts.SyntaxKind.AsyncKeyword)) nativeAsyncFunctions++;
-      ts.forEachChild(node, visit);
-    }
-    visit(tree);
-    assert.equal(nativeAsyncFunctions, 0, "Native await bypasses call-scoped Promise.then: " + file);
-  }
 });

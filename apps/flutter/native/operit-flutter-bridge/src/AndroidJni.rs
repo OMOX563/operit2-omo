@@ -74,6 +74,7 @@ pub unsafe extern "system" fn Java_app_operit_OperitRuntimeNative_create(
     _class: JClass,
     runtime_root: JString,
     workspace_root: JString,
+    archive_runtime_root: JString,
     device_model: JString,
     host: JObject,
 ) -> jlong {
@@ -91,6 +92,17 @@ pub unsafe extern "system" fn Java_app_operit_OperitRuntimeNative_create(
             return 0;
         }
     };
+    let archive_runtime_root = match env.get_string(&archive_runtime_root) {
+        Ok(value) => PathBuf::from(String::from(value)),
+        Err(error) => {
+            set_last_create_error(format!("private archive storage root is invalid: {error}"));
+            return 0;
+        }
+    };
+    if !archive_runtime_root.is_absolute() {
+        set_last_create_error("Private archive storage root must be absolute".to_string());
+        return 0;
+    }
     let device_model: String = match env.get_string(&device_model) {
         Ok(value) => value.into(),
         Err(error) => {
@@ -123,7 +135,7 @@ pub unsafe extern "system" fn Java_app_operit_OperitRuntimeNative_create(
         return 0;
     }
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        OperitFlutterBridge::new_with_storage_roots(runtime_root, workspace_root, device_model)
+        OperitFlutterBridge::new_with_storage_roots(runtime_root, workspace_root, archive_runtime_root, device_model)
     })) {
         Ok(Ok(bridge)) => {
             let installed = env
@@ -261,6 +273,52 @@ pub unsafe extern "system" fn Java_app_operit_OperitRuntimeNative_connectCoreFfi
     let result = new_java_string(env, CStr::from_ptr(descriptor).to_str().expect("FFI JSON"));
     operit_flutter_bridge_free_string(descriptor);
     result
+}
+
+/// Creates an App-local FFI client for the independently running module Core.
+#[no_mangle]
+pub unsafe extern "system" fn Java_app_operit_OperitRuntimeNative_connectModuleCoreFfi(
+    mut env: JNIEnv,
+    _class: JClass,
+    endpoint: JString,
+) -> jstring {
+    let result = env
+        .get_string(&endpoint)
+        .map(String::from)
+        .map_err(|e| e.to_string())
+        .and_then(|endpoint| crate::LocalRuntimeTransport::connect_ffi(&endpoint));
+    match result {
+        Ok(descriptor) => {
+            let text = CStr::from_ptr(descriptor)
+                .to_str()
+                .expect("Module FFI JSON");
+            let result = env.new_string(text).expect("Module FFI string").into_raw();
+            operit_flutter_bridge_free_string(descriptor);
+            result
+        }
+        Err(error) => {
+            let _ = env.throw_new("java/lang/IllegalStateException", error);
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// Writes client bootstrap metadata through the authenticated module connection.
+#[no_mangle]
+pub unsafe extern "system" fn Java_app_operit_OperitRuntimeNative_writeModuleBootstrap(
+    mut env: JNIEnv,
+    _class: JClass,
+    endpoint: JString,
+    content: JString,
+) {
+    let result = (|| -> Result<(), String> {
+        let endpoint: String = env.get_string(&endpoint).map_err(|e| e.to_string())?.into();
+        let content: String = env.get_string(&content).map_err(|e| e.to_string())?.into();
+        crate::LocalRuntimeTransport::write_bootstrap(&endpoint, &content)
+    })();
+    if let Err(error) = result {
+        let _ = env.throw_new("java/lang/IllegalStateException", error);
+    }
 }
 
 #[no_mangle]

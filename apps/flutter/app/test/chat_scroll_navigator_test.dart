@@ -13,6 +13,44 @@ import 'package:operit2/ui/features/chat/viewmodel/ChatViewModel.dart'
 
 /// Exercises the production rail geometry and real pointer gesture boundaries.
 void main() {
+  testWidgets('global index navigates outside the mounted body window', (
+    tester,
+  ) async {
+    final jumps = <int>[];
+    var loads = 0;
+    await _pumpNavigator(
+      tester,
+      jumps: jumps,
+      messages: [_message(199)],
+      loadLocatorEntries: (_, query) async {
+        loads++;
+        expect(query, isEmpty);
+        return [
+          for (var index = 0; index < 200; index++)
+            _preview(index, favorite: index == 0),
+        ];
+      },
+    );
+    expect(loads, 1);
+    final dynamic painter = tester
+        .widget<CustomPaint>(
+          find.byKey(const ValueKey('chat-scroll-rail-paint')),
+        )
+        .painter;
+    expect(painter.ticks.length, 200);
+    expect(painter.ticks.first.isFavorite, isTrue);
+    _railScroll(tester).jumpTo(0);
+    await tester.pumpAndSettle();
+    final target = tester.getRect(
+      find.byKey(const ValueKey('chat-scroll-rail-hit-target')),
+    );
+    await tester.tapAt(Offset(target.center.dx, target.top + 1));
+    await tester.pumpAndSettle();
+    expect(jumps, [0]);
+    expect(loads, 1);
+    expect(tester.takeException(), isNull);
+  });
+
   test('horizontal proximity grows smoothly and saturates beside the rail', () {
     const geometry = ChatScrollRailGeometry(
       entryCount: 20,
@@ -76,7 +114,7 @@ void main() {
   for (final count in <int>[1, 20, 10000]) {
     for (final height in <double>[61, 120, 500, 1200]) {
       test(
-        'all $count messages fit and remain selectable at height $height',
+        '$count message ticks keep their spacing and scroll mapping at height $height',
         () {
           final geometry = ChatScrollRailGeometry(
             entryCount: count,
@@ -84,23 +122,33 @@ void main() {
           );
           expect(geometry.top, greaterThanOrEqualTo(0));
           expect(geometry.top + geometry.height, lessThanOrEqualTo(height));
-          expect(geometry.tickCount, lessThanOrEqualTo(count));
-          expect(geometry.tickCount, lessThanOrEqualTo((height / 3).floor()));
           expect(geometry.entryIndexAt(geometry.hitTop), 0);
           expect(
-            geometry.entryIndexAt(geometry.hitTop + geometry.hitHeight),
+            geometry.entryIndexAt(
+              geometry.hitTop + geometry.hitHeight,
+              scrollOffset: geometry.maxScrollOffset,
+            ),
             count - 1,
           );
           for (var index = 0; index < count; index++) {
-            expect(geometry.entryIndexAt(geometry.entryCenter(index)), index);
+            final offset = (index * ChatScrollRailGeometry.tickSpacing).clamp(
+              0.0,
+              geometry.maxScrollOffset,
+            );
+            expect(
+              geometry.entryIndexAt(
+                geometry.entryCenter(index, scrollOffset: offset),
+                scrollOffset: offset,
+              ),
+              index,
+            );
+            if (index > 0) {
+              expect(
+                geometry.entryCenter(index) - geometry.entryCenter(index - 1),
+                ChatScrollRailGeometry.tickSpacing,
+              );
+            }
           }
-          var end = 0;
-          for (var tick = 0; tick < geometry.tickCount; tick++) {
-            expect(geometry.bucketStart(tick), end);
-            end = geometry.bucketEnd(tick);
-            expect(end, greaterThan(geometry.bucketStart(tick)));
-          }
-          expect(end, count);
         },
       );
     }
@@ -202,71 +250,60 @@ void main() {
     },
   );
 
-  for (final usePersistedEntries in <bool>[true, false]) {
-    testWidgets(
-      'preview uses participant names with sender fallback (persisted: $usePersistedEntries)',
-      (tester) async {
-        const names = <String>['Operit', 'Operit', '', '', '', ''];
-        final messages = List<ChatMessage>.generate(
-          names.length,
-          (index) => _message(
-            index,
-            roleName: index >= 4 ? '废弃角色卡名字' : '',
-            identityTitle: !usePersistedEntries && index < 2
-                ? names[index]
-                : null,
-          ),
-        );
-        await _pumpNavigator(
-          tester,
-          jumps: <int>[],
-          messages: messages,
-          loadLocatorEntries: (_, _) async => usePersistedEntries
-              ? <ChatMessageLocatorPreview>[
-                  for (final message in messages)
-                    ChatMessageLocatorPreview(
-                      messageIndex: message.timestamp,
-                      timestamp: message.timestamp,
-                      sender: message.sender,
-                      displayName: names[message.timestamp],
-                      previewContent: message.displayText,
-                      contentLength: message.displayText.length,
-                      displayMode: 'NORMAL',
-                      isFavorite: false,
-                    ),
-                ]
-              : <ChatMessageLocatorPreview>[],
-        );
-        final geometry = ChatScrollRailGeometry(
-          entryCount: names.length,
-          viewportHeight: 500,
-        );
-        final rect = tester.getRect(
-          find.byKey(const ValueKey<String>('chat-scroll-rail-paint')),
-        );
-        final mouse = await tester.createGesture(kind: PointerDeviceKind.mouse);
-        await mouse.addPointer(location: Offset.zero);
-        const expectedTitles = <String>[
-          '用户 #1',
-          'Operit',
-          '用户 #3',
-          'AI',
-          '用户 #5',
-          'AI',
-        ];
-        for (var index = 0; index < names.length; index++) {
-          await mouse.moveTo(
-            Offset(rect.right - 8, rect.top + geometry.entryCenter(index)),
-          );
-          await tester.pump();
-          expect(find.text(expectedTitles[index]), findsOneWidget);
-          expect(find.textContaining('废弃角色卡名字'), findsNothing);
-          if (index.isEven) expect(find.textContaining('Operit'), findsNothing);
-        }
-        await mouse.removePointer();
-      },
+  testWidgets('preview uses identities returned by the global index', (
+    tester,
+  ) async {
+    const names = <String>['Operit', 'Operit', '', '', '', ''];
+    final messages = List<ChatMessage>.generate(
+      names.length,
+      (index) => _message(index, roleName: index >= 4 ? '废弃角色卡名字' : ''),
     );
-  }
+    await _pumpNavigator(
+      tester,
+      jumps: <int>[],
+      messages: messages,
+      loadLocatorEntries: (_, _) async => <ChatMessageLocatorPreview>[
+        for (final message in messages)
+          ChatMessageLocatorPreview(
+            messageIndex: message.timestamp,
+            timestamp: message.timestamp,
+            sender: message.sender,
+            displayName: names[message.timestamp],
+            previewContent: message.displayText,
+            contentLength: message.displayText.length,
+            displayMode: 'NORMAL',
+            isFavorite: false,
+          ),
+      ],
+    );
+    final geometry = ChatScrollRailGeometry(
+      entryCount: names.length,
+      viewportHeight: 500,
+    );
+    final rect = tester.getRect(
+      find.byKey(const ValueKey<String>('chat-scroll-rail-paint')),
+    );
+    final mouse = await tester.createGesture(kind: PointerDeviceKind.mouse);
+    await mouse.addPointer(location: Offset.zero);
+    const expectedTitles = <String>[
+      '用户 #1',
+      'Operit',
+      '用户 #3',
+      'AI',
+      '用户 #5',
+      'AI',
+    ];
+    for (var index = 0; index < names.length; index++) {
+      await mouse.moveTo(
+        Offset(rect.right - 8, rect.top + geometry.entryCenter(index)),
+      );
+      await tester.pump();
+      expect(find.text(expectedTitles[index]), findsOneWidget);
+      expect(find.textContaining('废弃角色卡名字'), findsNothing);
+      if (index.isEven) expect(find.textContaining('Operit'), findsNothing);
+    }
+    await mouse.removePointer();
+  });
 
   testWidgets('touch down previews and a completed tap jumps exactly once', (
     tester,
@@ -292,7 +329,7 @@ void main() {
     expect(find.text('message 3'), findsNothing);
   });
 
-  testWidgets('touch scrubbing only previews instead of repeatedly jumping', (
+  testWidgets('long press scrubs previews and release confirms one jump', (
     tester,
   ) async {
     final jumps = <int>[];
@@ -308,6 +345,7 @@ void main() {
       Offset(rect.right - 12, rect.top + geometry.entryCenter(2)),
     );
     await tester.pump();
+    await tester.pump(kLongPressTimeout + const Duration(milliseconds: 50));
     await touch.moveTo(
       Offset(rect.right - 12, rect.top + geometry.entryCenter(10)),
     );
@@ -316,7 +354,7 @@ void main() {
     expect(jumps, isEmpty);
     await touch.up();
     await tester.pumpAndSettle();
-    expect(jumps, isEmpty);
+    expect(jumps, <int>[10]);
   });
 
   testWidgets('the approach area does not consume transcript taps', (
@@ -339,7 +377,7 @@ void main() {
   });
 
   testWidgets(
-    'dense history paints one layer and still selects both endpoints',
+    'dense history keeps separate ticks and selects endpoints after scrolling',
     (tester) async {
       final jumps = <int>[];
       await _pumpNavigator(tester, count: 5000, jumps: jumps);
@@ -352,14 +390,207 @@ void main() {
         find.byKey(const ValueKey<String>('chat-scroll-rail-paint')),
         findsOneWidget,
       );
-      await tester.tapAt(Offset(rect.center.dx, rect.top + 1));
-      await tester.pumpAndSettle();
+      final scroll = _railScroll(tester);
+      expect(scroll.position.maxScrollExtent, greaterThan(70000));
       await tester.tapAt(Offset(rect.center.dx, rect.bottom - 1));
       await tester.pumpAndSettle();
-      expect(jumps, <int>[0, 4999]);
+      expect(jumps, <int>[4999]);
+      scroll.jumpTo(0);
+      await tester.pumpAndSettle();
+      await tester.tapAt(Offset(rect.center.dx, rect.top + 1));
+      await tester.pumpAndSettle();
+      expect(jumps, <int>[4999, 0]);
       expect(tester.takeException(), isNull);
     },
   );
+
+  testWidgets(
+    'phone swipes scroll only the rail without jumping the transcript',
+    (tester) async {
+      final jumps = <int>[];
+      final transcript = ScrollController();
+      addTearDown(transcript.dispose);
+      await _pumpNavigator(
+        tester,
+        count: 100,
+        jumps: jumps,
+        scrollController: transcript,
+      );
+      final target = find.byKey(const ValueKey('chat-scroll-rail-hit-target'));
+      final rail = _railScroll(tester);
+      rail.jumpTo(400);
+      await tester.pumpAndSettle();
+      final rect = tester.getRect(target);
+      await tester.dragFrom(rect.center, const Offset(0, -140));
+      await tester.pumpAndSettle();
+      expect(rail.offset, greaterThan(400));
+      expect(transcript.offset, 0);
+      expect(jumps, isEmpty);
+      expect(find.textContaining('message '), findsNothing);
+      final offset = rail.offset;
+      await tester.dragFrom(rect.center, const Offset(0, 140));
+      await tester.pumpAndSettle();
+      expect(rail.offset, lessThan(offset));
+      expect(jumps, isEmpty);
+      expect(tester.takeException(), isNull);
+    },
+  );
+
+  testWidgets('swipes in the approach area still scroll the transcript', (
+    tester,
+  ) async {
+    final transcript = ScrollController();
+    addTearDown(transcript.dispose);
+    final jumps = <int>[];
+    await _pumpNavigator(
+      tester,
+      count: 100,
+      jumps: jumps,
+      scrollController: transcript,
+      contentHeight: 20000,
+      messageAnchors: <int, ChatScrollMessageAnchor>{
+        for (var index = 0; index < 100; index++)
+          index: ChatScrollMessageAnchor(
+            timestamp: index,
+            index: index,
+            key: GlobalKey(),
+            absoluteTopPx: index * 200.0,
+            heightPx: 200,
+          ),
+      },
+    );
+    final rail = _railScroll(tester);
+    final offset = rail.offset;
+    final rect = tester.getRect(
+      find.byKey(const ValueKey('chat-scroll-rail-paint')),
+    );
+    await tester.dragFrom(
+      Offset(rect.left + 12, rect.center.dy),
+      const Offset(0, -140),
+    );
+    await tester.pumpAndSettle();
+    expect(transcript.offset, greaterThan(0));
+    expect(rail.offset, offset);
+    expect(jumps, isEmpty);
+  });
+
+  testWidgets('scrolled ticks preview and tap the same message', (
+    tester,
+  ) async {
+    final jumps = <int>[];
+    await _pumpNavigator(tester, count: 100, jumps: jumps);
+    _railScroll(tester).jumpTo(320);
+    await tester.pumpAndSettle();
+    const geometry = ChatScrollRailGeometry(
+      entryCount: 100,
+      viewportHeight: 500,
+    );
+    final rect = tester.getRect(
+      find.byKey(const ValueKey('chat-scroll-rail-paint')),
+    );
+    final point = Offset(
+      rect.right - 12,
+      rect.top + geometry.entryCenter(25, scrollOffset: 320),
+    );
+    final touch = await tester.startGesture(point);
+    await tester.pump();
+    expect(find.text('message 25'), findsOneWidget);
+    await touch.up();
+    await tester.pumpAndSettle();
+    expect(jumps, <int>[25]);
+    expect(find.text('message 25'), findsNothing);
+  });
+
+  testWidgets('cancelled long press and release outside the rail never jump', (
+    tester,
+  ) async {
+    final jumps = <int>[];
+    await _pumpNavigator(tester, jumps: jumps);
+    final rect = tester.getRect(
+      find.byKey(const ValueKey('chat-scroll-rail-hit-target')),
+    );
+    final touch = await tester.startGesture(rect.center);
+    await tester.pump(kLongPressTimeout + const Duration(milliseconds: 50));
+    await touch.cancel();
+    await tester.pumpAndSettle();
+    expect(jumps, isEmpty);
+    final second = await tester.startGesture(rect.center);
+    await tester.pump(kLongPressTimeout + const Duration(milliseconds: 50));
+    await second.moveBy(const Offset(-100, 0));
+    await second.up();
+    await tester.pumpAndSettle();
+    expect(jumps, isEmpty);
+    expect(find.textContaining('message '), findsNothing);
+  });
+
+  testWidgets('mouse wheel scrolls the rail without navigating', (
+    tester,
+  ) async {
+    final jumps = <int>[];
+    await _pumpNavigator(tester, count: 100, jumps: jumps);
+    final rail = _railScroll(tester);
+    rail.jumpTo(320);
+    await tester.pumpAndSettle();
+    final rect = tester.getRect(
+      find.byKey(const ValueKey('chat-scroll-rail-hit-target')),
+    );
+    await tester.sendEventToBinding(
+      PointerScrollEvent(
+        position: rect.center,
+        scrollDelta: const Offset(0, 160),
+      ),
+    );
+    await tester.pumpAndSettle();
+    expect(rail.offset, 480);
+    expect(jumps, isEmpty);
+  });
+
+  testWidgets('tap padding selects a visible tick after scrolling', (
+    tester,
+  ) async {
+    final jumps = <int>[];
+    await _pumpNavigator(tester, count: 100, jumps: jumps);
+    _railScroll(tester).jumpTo(320);
+    await tester.pumpAndSettle();
+    final rect = tester.getRect(
+      find.byKey(const ValueKey('chat-scroll-rail-hit-target')),
+    );
+    await tester.tapAt(Offset(rect.center.dx, rect.top + 1));
+    await tester.pumpAndSettle();
+    expect(jumps, <int>[20]);
+  });
+
+  testWidgets('rail follows transcript navigation to distant messages', (
+    tester,
+  ) async {
+    final transcript = ScrollController();
+    addTearDown(transcript.dispose);
+    await _pumpNavigator(
+      tester,
+      count: 100,
+      jumps: [],
+      scrollController: transcript,
+    );
+    final rail = _railScroll(tester);
+    expect(rail.offset, 0);
+    transcript.jumpTo(transcript.position.maxScrollExtent);
+    await tester.pumpAndSettle();
+    expect(rail.offset, rail.position.maxScrollExtent);
+    transcript.jumpTo(0);
+    await tester.pumpAndSettle();
+    expect(rail.offset, 0);
+  });
+
+  testWidgets('switching chat resets manual rail scrolling', (tester) async {
+    await _pumpNavigator(tester, count: 100, jumps: []);
+    _railScroll(tester).jumpTo(320);
+    await tester.pumpAndSettle();
+    await _pumpNavigator(tester, jumps: [], chatId: 'short-chat');
+    final rail = _railScroll(tester);
+    expect(rail.offset, 0);
+    expect(rail.position.maxScrollExtent, 0);
+    expect(tester.takeException(), isNull);
+  });
 
   testWidgets('locator searches unloaded messages without changing the rail', (
     tester,
@@ -553,25 +784,42 @@ void main() {
     expect(tester.takeException(), isNull);
   });
 
-  testWidgets(
-    'history failures preserve favorite markers from visible messages',
-    (tester) async {
-      await _pumpNavigator(
-        tester,
-        jumps: [],
-        messages: [_message(0, isFavorite: true)],
-        loadLocatorEntries: (_, _) async => throw StateError('offline'),
-      );
-      final dynamic painter = tester
-          .widget<CustomPaint>(
-            find.byKey(const ValueKey('chat-scroll-rail-paint')),
-          )
-          .painter;
-      expect(painter.ticks.single.isFavorite, isTrue);
-      expect(tester.takeException(), isNull);
-    },
-  );
+  testWidgets('index failures stay explicit and retry the index API', (
+    tester,
+  ) async {
+    var loads = 0;
+    await _pumpNavigator(
+      tester,
+      jumps: [],
+      messages: [_message(0, isFavorite: true)],
+      loadLocatorEntries: (_, _) async {
+        if (++loads == 1) throw StateError('offline');
+        return [_preview(0, favorite: true)];
+      },
+    );
+    expect(find.byKey(const ValueKey('chat-scroll-rail-paint')), findsNothing);
+    await tester.tap(find.byKey(const ValueKey('chat-message-index-retry')));
+    await tester.pumpAndSettle();
+    expect(loads, 2);
+    final dynamic painter = tester
+        .widget<CustomPaint>(
+          find.byKey(const ValueKey('chat-scroll-rail-paint')),
+        )
+        .painter;
+    expect(painter.ticks.single.isFavorite, isTrue);
+    expect(tester.takeException(), isNull);
+  });
 }
+
+/// Finds the rail's independent native scroll controller.
+ScrollController _railScroll(WidgetTester tester) => tester
+    .widget<SingleChildScrollView>(
+      find.descendant(
+        of: find.byKey(const ValueKey('chat-scroll-rail-hit-target')),
+        matching: find.byType(SingleChildScrollView),
+      ),
+    )
+    .controller!;
 
 /// Reads the production painter's active bucket without involving hover state.
 int? _activeRailIndex(WidgetTester tester) {

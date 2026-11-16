@@ -4,10 +4,12 @@ import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
 
+import '../../../../../../core/runtime/RuntimeBootstrapManager.dart';
 import '../../../../../../util/ChatMarkupRegex.dart';
 import '../../../../../theme/OperitTheme.dart';
 import '../../attachments/ChatMessageImageAttachments.dart';
 import '../bubble/BubbleSurface.dart';
+import '../common/HiddenUserMessagePlaceholder.dart';
 import '../../../viewmodel/ChatViewModel.dart';
 import 'CursorMessageLayout.dart';
 
@@ -15,28 +17,56 @@ export '../../attachments/ChatMessageImageAttachments.dart'
     show AttachmentData, ChatMessageAttachments, ChatMessageImageAttachments;
 
 class UserMessageComposable extends StatefulWidget {
+  /// Creates a user row with source inspection disabled during selection.
   const UserMessageComposable({
     super.key,
     required this.message,
+    this.enableDialogs = true,
   });
 
   final ChatUiMessage message;
+  final bool enableDialogs;
 
   @override
   State<UserMessageComposable> createState() => _UserMessageComposableState();
 }
 
 class _UserMessageComposableState extends State<UserMessageComposable> {
-  /// Builds the user message content without a prompt heading.
+  /// Observes profile changes even when the transcript keeps this row cached.
   @override
-  Widget build(BuildContext context) {
+  Widget build(BuildContext context) => ListenableBuilder(
+    listenable: RuntimeBootstrapManager.instance,
+    builder: (context, _) => _buildMessage(context),
+  );
+
+  /// Builds user content with the configured name or explicit proxy author.
+  Widget _buildMessage(BuildContext context) {
     final theme = Theme.of(context);
     final colorScheme = theme.colorScheme;
     final textColor = colorScheme.onPrimaryContainer;
+    if (widget.message.isHiddenUserPlaceholder) {
+      return CursorMessageLayout(
+        verticalPadding: 0,
+        child: HiddenUserMessagePlaceholder(
+          message: widget.message,
+          textColor: textColor,
+          enableDialogs: widget.enableDialogs,
+        ),
+      );
+    }
     final parseResult = parseMessageContent(widget.message.displayText);
     final themePreferenceSnapshot = OperitTheme.of(
       context,
     ).themePreferenceSnapshot;
+    final isProxySender =
+        parseResult.proxySenderName != null &&
+        parseResult.proxySenderName!.isNotEmpty;
+    final displayName = isProxySender
+        ? parseResult.proxySenderName!
+        : RuntimeBootstrapManager.instance.activeIdentity.name.trim();
+    final shouldShowName =
+        (isProxySender || themePreferenceSnapshot.showUserName) &&
+        displayName.isNotEmpty;
     final bubbleColor =
         _optionalColor(themePreferenceSnapshot.cursorUserBubbleColor) ??
         colorScheme.primaryContainer;
@@ -54,6 +84,20 @@ class _UserMessageComposableState extends State<UserMessageComposable> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: <Widget>[
+          if (shouldShowName)
+            Padding(
+              padding: const EdgeInsets.only(bottom: 4),
+              child: Text(
+                displayName,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: theme.textTheme.labelSmall?.copyWith(
+                  color: isProxySender
+                      ? colorScheme.primary
+                      : colorScheme.onSurfaceVariant,
+                ),
+              ),
+            ),
           if (parseResult.replyInfo != null)
             _ReplyInfoView(replyInfo: parseResult.replyInfo!),
           if (parseResult.attachments.any(
@@ -63,7 +107,7 @@ class _UserMessageComposableState extends State<UserMessageComposable> {
               padding: const EdgeInsets.only(bottom: 6),
               child: ChatMessageAttachments(
                 attachments: parseResult.attachments,
-                enableDialogs: true,
+                enableDialogs: widget.enableDialogs,
                 isBubbleMode: false,
               ),
             ),
@@ -93,7 +137,7 @@ class _UserMessageComposableState extends State<UserMessageComposable> {
               padding: const EdgeInsets.only(top: 2),
               child: ChatMessageContextMetadata(
                 attachments: parseResult.attachments,
-                enableDialogs: true,
+                enableDialogs: widget.enableDialogs,
               ),
             ),
         ],
@@ -192,6 +236,8 @@ MessageParseResult _buildMessageParseResult({
           size: raw.size,
           content: raw.content,
           mediaPoolType: 'image',
+          path: raw.path,
+          nodeId: raw.nodeId,
         ),
       );
     } else if (link != null) {
@@ -251,7 +297,8 @@ MessageParseResult parseMessageContent(String content) {
           mediaLink.type == 'file')
         AttachmentData(
           id: mediaLink.id,
-          filename: mediaLink.fileName ??
+          filename:
+              mediaLink.fileName ??
               (mediaLink.type == 'audio' ? 'Audio' : 'Video'),
           type: switch (mediaLink.type) {
             'audio' => 'audio/*',
@@ -346,18 +393,9 @@ MessageParseResult parseMessageContent(String content) {
   for (var index = 0; index < matches.length; index++) {
     final match = matches[index].match;
     final startIndex = match.start;
-    final id = decodeChatXmlText(match.group(1)!);
-    final filename = decodeChatXmlText(match.group(2)!);
-    final type = decodeChatXmlText(match.group(3)!);
-    final size = _parseLong(match.group(4));
-    final attachmentContent = decodeChatXmlText(match.group(5) ?? '');
-    final attachment = AttachmentData(
-      id: id,
-      filename: filename,
-      type: type,
-      size: size,
-      content: attachmentContent,
-    );
+    final attachment = AttachmentData.fromMarkupMatch(match);
+    final filename = attachment.filename;
+    final type = attachment.type;
     final isTrailingAttachment = trailingAttachmentIndices.contains(index);
     final isScreenContent =
         type == 'text/json' && filename == 'screen_content.json';
@@ -395,17 +433,6 @@ MessageParseResult parseMessageContent(String content) {
     replyInfo: replyInfo,
     proxySenderName: proxySenderName,
   );
-}
-
-int _parseLong(String? value) {
-  if (value == null || value.isEmpty) {
-    return 0;
-  }
-  final parsed = int.tryParse(value);
-  if (parsed == null) {
-    return 0;
-  }
-  return parsed;
 }
 
 class _ReplyInfoView extends StatelessWidget {

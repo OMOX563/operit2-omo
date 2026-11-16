@@ -8,6 +8,7 @@ import 'package:operit_ui/operit_ui.dart'
 import 'package:flutter/services.dart';
 
 import '../../../../../l10n/generated/app_localizations.dart';
+import '../../../../common/interactions/ChainedScrollController.dart';
 import '../../../../common/markdown/StreamMarkdownRenderer.dart';
 import 'ChatActivityDisclosure.dart';
 import 'ChatActivityRowStyle.dart';
@@ -196,7 +197,7 @@ class ToolPresentation {
   const ToolPresentation({
     required this.toolName,
     required this.icon,
-    required this.parameterSummary,
+    String? parameterSummary,
     required this.result,
     required this.isSuccess,
     required this.fileDiffs,
@@ -204,7 +205,7 @@ class ToolPresentation {
     this.callId,
     this.display,
     this.resultData,
-  });
+  }) : _parameterSummary = parameterSummary;
 
   factory ToolPresentation.fromCall(
     String toolName,
@@ -221,7 +222,6 @@ class ToolPresentation {
       callId: callId,
       icon: toolDisplayIcon(display?.icon),
       rawParams: call.params,
-      parameterSummary: formatToolParameters(call.params),
       result: result,
       isSuccess: isSuccess,
       display: display,
@@ -249,15 +249,22 @@ class ToolPresentation {
   final String? callId;
   final IconData icon;
   final String rawParams;
-  final String parameterSummary;
+  final String? _parameterSummary;
   final String result;
   final bool? isSuccess;
   final ToolDisplayDeclaration? display;
   final Map<String, dynamic>? resultData;
   final List<FileDiff> fileDiffs;
 
+  /// Formats the full parameter payload only when its details are requested.
+  String get parameterSummary =>
+      _parameterSummary ?? formatToolParameters(rawParams);
+
+  bool get hasParameters =>
+      _parameterSummary?.isNotEmpty ?? rawParams.isNotEmpty;
+
   bool get hasDetails =>
-      parameterSummary.isNotEmpty ||
+      hasParameters ||
       result.isNotEmpty ||
       resultData != null ||
       fileDiffs.isNotEmpty;
@@ -289,6 +296,13 @@ IconData toolDisplayIcon(String? icon) => switch (icon) {
   'notification' => Icons.notifications_outlined,
   'clipboard' => Icons.content_paste,
   'audio' => Icons.volume_up_outlined,
+  'info' => Icons.info_outline,
+  'screen' => Icons.screenshot_outlined,
+  'tap' => Icons.touch_app_outlined,
+  'double_tap' => Icons.ads_click,
+  'long_press' => Icons.pan_tool_outlined,
+  'swipe' => Icons.swipe_outlined,
+  'keyboard' => Icons.keyboard_outlined,
   _ => Icons.build_outlined,
 };
 
@@ -478,10 +492,11 @@ class _ToolCallRowState extends State<ToolCallRow> {
                     mainAxisSize: MainAxisSize.min,
                     crossAxisAlignment: CrossAxisAlignment.stretch,
                     children: [
-                      if (presentation.parameterSummary.isNotEmpty)
+                      if (presentation.hasParameters)
                         ToolInlineDetailSurface(
                           title: l10n.toolParametersLabel,
-                          text: presentation.parameterSummary,
+                          text: '',
+                          textBuilder: () => presentation.parameterSummary,
                           initiallyCollapsed: true,
                         ),
                       for (final diff in presentation.fileDiffs)
@@ -506,7 +521,8 @@ class _ToolCallRowState extends State<ToolCallRow> {
                           presentation.resultData != null)
                         ToolInlineDetailSurface(
                           title: l10n.toolResultLabel,
-                          text: const JsonEncoder.withIndent(
+                          text: '',
+                          textBuilder: () => const JsonEncoder.withIndent(
                             '  ',
                           ).convert(presentation.resultData),
                           initiallyCollapsed:
@@ -554,8 +570,7 @@ class DirectoryListingDisplay extends StatelessWidget {
       padding: const EdgeInsets.symmetric(vertical: 4),
       child: ConstrainedBox(
         constraints: const BoxConstraints(maxHeight: 240),
-        child: SingleChildScrollView(
-          primary: false,
+        child: ChainedSingleChildScrollView(
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
@@ -626,11 +641,15 @@ class ToolInlineDetailSurface extends StatefulWidget {
     super.key,
     required this.title,
     required this.text,
+    this.textBuilder,
     this.isSuccess,
     this.initiallyCollapsed = false,
   });
   final String title;
   final String text;
+
+  /// Resolves formatted payloads only when expanded or explicitly copied.
+  final String Function()? textBuilder;
   final bool? isSuccess;
   final bool initiallyCollapsed;
 
@@ -642,6 +661,19 @@ class ToolInlineDetailSurface extends StatefulWidget {
 
 class _ToolInlineDetailSurfaceState extends State<ToolInlineDetailSurface> {
   late bool _expanded;
+  String? _resolvedText;
+
+  String get _text =>
+      _resolvedText ??= widget.textBuilder?.call() ?? widget.text;
+
+  @override
+  void didUpdateWidget(covariant ToolInlineDetailSurface oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.text != widget.text ||
+        oldWidget.textBuilder != widget.textBuilder) {
+      _resolvedText = null;
+    }
+  }
 
   /// Applies the initial disclosure choice only when this payload first appears.
   @override
@@ -700,8 +732,7 @@ class _ToolInlineDetailSurfaceState extends State<ToolInlineDetailSurface> {
               padding: EdgeInsets.zero,
               visualDensity: VisualDensity.compact,
               icon: Icon(Icons.copy, size: 14, color: color),
-              onPressed: () =>
-                  Clipboard.setData(ClipboardData(text: widget.text)),
+              onPressed: () => Clipboard.setData(ClipboardData(text: _text)),
             ),
           ],
         ),
@@ -725,10 +756,9 @@ class _ToolInlineDetailSurfaceState extends State<ToolInlineDetailSurface> {
                   ),
                   child: ConstrainedBox(
                     constraints: const BoxConstraints(maxHeight: 240),
-                    child: SingleChildScrollView(
-                      primary: false,
+                    child: ChainedSingleChildScrollView(
                       child: SelectableText(
-                        widget.text,
+                        _text,
                         style: ChatActivityRowStyle.textStyle(context).copyWith(
                           color: widget.isSuccess == false
                               ? theme.colorScheme.error

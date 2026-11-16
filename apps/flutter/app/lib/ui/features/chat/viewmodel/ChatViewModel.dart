@@ -113,8 +113,12 @@ class ChatViewModel {
   /// Creates a chat model whose selection and observations use the same runtime.
   ChatViewModel({
     this.bridge = const ProxyCoreRuntimeBridge(),
+    OperitRuntimeBridge? attachmentSourceBridge,
     GeneratedChatRuntimeHolderMainCoreProxy? chat,
-  }) : clients = GeneratedCoreProxyClients(bridge),
+  }) : _attachmentSourceClients = GeneratedCoreProxyClients(
+         attachmentSourceBridge ?? const ProxyCoreRuntimeBridge(),
+       ),
+       clients = GeneratedCoreProxyClients(bridge),
        _chat = chat ?? GeneratedCoreProxyClients(bridge).chatRuntimeHolderMain {
     _observationChat = _chat;
   }
@@ -124,12 +128,17 @@ class ChatViewModel {
     required this.bridge,
     required GeneratedChatRuntimeHolderMainCoreProxy chat,
     required GeneratedChatRuntimeHolderMainCoreProxy observationChat,
-  }) : clients = GeneratedCoreProxyClients(bridge),
+    OperitRuntimeBridge? attachmentSourceBridge,
+  }) : _attachmentSourceClients = GeneratedCoreProxyClients(
+         attachmentSourceBridge ?? const ProxyCoreRuntimeBridge(),
+       ),
+       clients = GeneratedCoreProxyClients(bridge),
        _chat = chat,
        _observationChat = observationChat;
 
   final OperitRuntimeBridge bridge;
   final GeneratedCoreProxyClients clients;
+  final GeneratedCoreProxyClients _attachmentSourceClients;
   final GeneratedChatRuntimeHolderMainCoreProxy _chat;
   late final GeneratedChatRuntimeHolderMainCoreProxy _observationChat;
 
@@ -342,7 +351,8 @@ class ChatViewModel {
     bool Function()? isCancelled,
   }) async {
     final transfer = clients.servicesAttachmentTransferManager;
-    String? uploadId;
+    final sourceTransfer =
+        _attachmentSourceClients.servicesAttachmentTransferManager;
     void checkCancellation() {
       if (isCancelled?.call() ?? false) {
         throw StateError('Attachment upload was cancelled');
@@ -354,54 +364,86 @@ class ChatViewModel {
       if (expectedChatId == null || expectedChatId.trim().isEmpty) {
         throw StateError('File attachments require a selected chat');
       }
-      uploadId = await transfer.beginAttachmentUpload(
-        fileName: file.name,
-        expectedByteLength: file.byteLength,
-      );
-      var uploaded = 0;
-      Stream<Uint8List> checkedChunks() async* {
-        await for (final chunk in file.chunks()) {
-          checkCancellation();
-          uploaded += chunk.length;
-          if (file.byteLength != null && uploaded > file.byteLength!) {
-            throw StateError('Selected file exceeds its declared byte length');
-          }
-          yield chunk;
+      final policy =
+          jsonDecode(
+                await transfer.selectedAttachmentPolicy(chatId: expectedChatId),
+              )
+              as Map<String, dynamic>;
+      final fileLimit = policy['maxFileBytes'] as int;
+      final totalLimit = policy['maxTotalBytes'] as int;
+      final limit = fileLimit < totalLimit ? fileLimit : totalLimit;
+      final large = file.byteLength == null || file.byteLength! > limit;
+      final core_proxy.AttachmentInfo attachment;
+      if (large && file.sourceJson != null && file.byteLength != null) {
+        final reference = await sourceTransfer.registerAttachmentSource(
+          sourceJson: file.sourceJson!,
+          fileName: file.name,
+          expectedByteLength: file.byteLength!,
+        );
+        checkCancellation();
+        attachment = await transfer.createReferenceAttachment(
+          chatId: expectedChatId,
+          referenceJson: reference,
+        );
+      } else {
+        if (large && file.byteLength != null && file.byteLength! > totalLimit) {
+          throw StateError(
+            'This file has no reusable source and exceeds the retention limit in .operit/sync.json.',
+          );
         }
-        if (file.byteLength != null && uploaded != file.byteLength) {
-          throw StateError('Selected file byte length changed during upload');
+        Stream<Uint8List> checkedChunks() async* {
+          await for (final chunk in file.chunks()) {
+            checkCancellation();
+            yield chunk;
+          }
+          checkCancellation();
+          // EOF must be explicit: closing a failed input stream must not commit it.
+          yield Uint8List(0);
+        }
+
+        final uploadId = await transfer.beginAttachmentUpload(
+          fileName: file.name,
+          expectedByteLength: file.byteLength,
+        );
+        if (large) {
+          await sourceTransfer.writeAttachmentSource(
+            uploadId: uploadId,
+            fileName: file.name,
+            expectedByteLength: file.byteLength,
+            maxBytes: totalLimit,
+            bytes: checkedChunks(),
+          );
+          final reference = await sourceTransfer.completeAttachmentSource(
+            uploadId: uploadId,
+            fileName: file.name,
+            expectedByteLength: file.byteLength,
+          );
+          checkCancellation();
+          attachment = await transfer.createReferenceAttachment(
+            chatId: expectedChatId,
+            referenceJson: reference,
+          );
+        } else {
+          await transfer.writeSelectedAttachment(
+            chatId: expectedChatId,
+            uploadId: uploadId,
+            fileName: file.name,
+            expectedByteLength: file.byteLength,
+            bytes: checkedChunks(),
+          );
+          attachment = await transfer.completeSelectedAttachment(
+            chatId: expectedChatId,
+            uploadId: uploadId,
+            fileName: file.name,
+            expectedByteLength: file.byteLength,
+          );
         }
       }
-
-      await transfer.writeAttachmentUpload(
-        uploadId: uploadId,
-        fileName: file.name,
-        expectedByteLength: file.byteLength,
-        bytes: checkedChunks(),
-      );
-      checkCancellation();
-      final attachment = await transfer.completeAttachmentUpload(
-        uploadId: uploadId,
-        fileName: file.name,
-        expectedByteLength: uploaded,
-      );
       checkCancellation();
       await _chat.attachUploadedFile(
         attachment: attachment,
         expectedChatId: expectedChatId,
       );
-    } catch (error, stackTrace) {
-      if (uploadId != null) {
-        try {
-          await transfer.discardAttachmentUpload(
-            uploadId: uploadId,
-            fileName: file.name,
-          );
-        } catch (cleanup) {
-          debugPrint('Failed to discard attachment upload: $cleanup');
-        }
-      }
-      Error.throwWithStackTrace(error, stackTrace);
     } finally {
       try {
         await file.close();
@@ -429,44 +471,6 @@ class ChatViewModel {
     return _chat.clearAttachments();
   }
 
-  String createAttachmentReference(AttachmentInfo attachment) {
-    final buffer = StringBuffer('<attachment ');
-    const escape = HtmlEscape(HtmlEscapeMode.attribute);
-    final normalized = attachment.filePath.replaceAll('\\', '/');
-    const marker = '/data/chat_attachments/';
-    final markerIndex = normalized.lastIndexOf(marker);
-    String? toolPath;
-    if (markerIndex >= 0) {
-      final relative = normalized.substring(markerIndex + marker.length);
-      if (relative.isNotEmpty &&
-          relative
-              .split('/')
-              .every(
-                (part) => part.isNotEmpty && part != '.' && part != '..',
-              )) {
-        toolPath = '/app/data/data/chat_attachments/$relative';
-      }
-    }
-    buffer.write('id="${escape.convert(toolPath ?? attachment.filePath)}" ');
-    buffer.write('filename="${escape.convert(attachment.fileName)}" ');
-    buffer.write('type="${escape.convert(attachment.mimeType)}" ');
-    final nodeId = attachment.nodeId;
-    if (nodeId != null && nodeId.isNotEmpty) {
-      buffer.write('node_id="${escape.convert(nodeId)}" ');
-    }
-    if (toolPath != null) {
-      buffer.write('path="${escape.convert(toolPath)}" ');
-    }
-    if (attachment.fileSize > 0) {
-      buffer.write('size="${attachment.fileSize}" ');
-    }
-    if (attachment.content.isNotEmpty) {
-      buffer.write('content="${escape.convert(attachment.content)}" ');
-    }
-    buffer.write('/>');
-    return buffer.toString();
-  }
-
   /// Splits Markdown with the runtime surface that owns this chat.
   Future<List<ChatResponseStreamEvent>> splitMarkdownContent(String content) {
     return _chat.splitMarkdownContent(content: content);
@@ -480,6 +484,7 @@ class ChatViewModel {
     return _chat.clearToastEvent();
   }
 
+  /// Reads global message positions and bounded previews through the dedicated index API.
   Future<List<ChatMessageLocatorPreview>> loadChatMessageLocatorPreviews(
     String chatId,
     String query,
@@ -636,6 +641,20 @@ class ChatViewModel {
     return entries;
   }
 
+  Future<void> mutateWorkspaceFile(
+    WorkspaceFileOperation operation,
+    String path,
+    String? destinationPath,
+  ) async {
+    final chatId = await _requiredCurrentChatId();
+    await clients.servicesWorkspaceService.mutateWorkspaceFile(
+      chatId: chatId,
+      operation: operation.name,
+      relativePath: path,
+      destinationPath: destinationPath,
+    );
+  }
+
   /// Lists workspace entries ranked for the active @ mention query.
   Future<List<WorkspaceFileEntry>> listMentionWorkspaceSuggestions(
     String searchQuery,
@@ -709,6 +728,11 @@ typedef ChatUiMessage = core_proxy.ChatMessage;
 
 /// Exposes chat presentation helpers directly on the generated Core message state.
 extension ChatMessagePresentation on core_proxy.ChatMessage {
+  /// Identifies automatic user turns whose source is only shown on request.
+  bool get isHiddenUserPlaceholder =>
+      sender == 'user' &&
+      displayMode == core_proxy.ChatMessageDisplayMode.hiddenPlaceholder;
+
   /// Returns the legacy variant-preview flag for a normal Core message.
   bool get isVariantPreview => false;
 
@@ -744,6 +768,10 @@ extension ChatMessagePresentation on core_proxy.ChatMessage {
             ..write(part.content)
             ..write('</think>');
         case core_proxy.MessagePartKind.toolCall:
+          if (part.content.isNotEmpty) {
+            markup.write(part.content);
+            continue;
+          }
           markup
             ..write('<tool name="')
             ..write(_escapeProtocolAttribute(part.toolName!))
@@ -762,10 +790,14 @@ extension ChatMessagePresentation on core_proxy.ChatMessage {
           }
           markup.write('</tool>');
         case core_proxy.MessagePartKind.toolResult:
-          markup
-            ..write('<tool_result name="')
-            ..write(_escapeProtocolAttribute(part.toolName!))
-            ..write('"');
+          markup.write('<tool_result');
+          final toolName = part.toolName;
+          if (toolName != null) {
+            markup
+              ..write(' name="')
+              ..write(_escapeProtocolAttribute(toolName))
+              ..write('"');
+          }
           final toolCallId = part.toolCallId;
           if (toolCallId != null) {
             markup

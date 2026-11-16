@@ -8,20 +8,24 @@ use operit_host_api::{
 use operit_tools::tools::ToolResultDataClasses::{
     HiddenTerminalCommandResultData, JsOptional, StringResultData, TerminalCommandResultData,
     TerminalImplementation, TerminalInfoResultData, TerminalSessionCloseResultData,
-    TerminalSessionCreationResultData, TerminalSessionScreenResultData, TerminalStreamEventData,
+    TerminalSessionCreationResultData, TerminalSessionScreenResultData,
     TerminalType, TerminalTypeInfoData, ToolResultData,
 };
 use operit_tools::ConversationMarkupManager::ToolResult;
 use operit_tools::ToolExecutionManager::{
-    AITool, ToolAccessSpec, ToolBoundary, ToolEffect, ToolExecutor, ToolValidationResult,
+    AITool, ToolExecutionManager, ToolAccessSpec, ToolBoundary, ToolEffect, ToolExecutor, ToolValidationResult,
 };
-const TERMINAL_SESSION_TIMEOUT_MS: u64 = 1800000;
+use operit_vfs::VisualFileSystem::VisualFileSystem;
+use operit_host_api::TerminalWorkingDirectory::{directoryChangeCommand, enterTerminalDirectory};
+
 const HIDDEN_TERMINAL_TIMEOUT_MS: u64 = 120000;
 
 #[derive(Clone)]
 /// Terminal tool facade backed by the host terminal API.
 pub struct StandardTerminalTools {
     pub terminalHost: Option<Arc<dyn TerminalHost>>,
+    filesystem: Option<VisualFileSystem>,
+    storage: Option<Arc<dyn operit_host_api::RuntimeStorageHost>>,
 }
 
 #[derive(Clone, Copy)]
@@ -29,8 +33,6 @@ pub struct StandardTerminalTools {
 pub enum TerminalToolOperation {
     GetTerminalInfo,
     CreateSession,
-    ExecuteInSession,
-    ExecuteInSessionStreaming,
     ExecuteHiddenCommand,
     InputInSession,
     CloseSession,
@@ -45,9 +47,82 @@ pub struct TerminalToolExecutor {
 }
 
 impl StandardTerminalTools {
+    /// Acquires the newest idle generation without submitting directory commands to a busy shell.
+    pub(crate) fn availableSession(&self, name: &str, terminalType: &str, reserved: &std::collections::BTreeSet<String>) -> HostResult<TerminalSessionInfo> {
+        let host = self.host()?;
+        let prefix = format!("{name}_generation_");
+        let sessions = host.listSessions()?;
+        let latest = sessions.iter().filter(|session| session.terminalType == terminalType)
+            .filter_map(|session| {
+                let generation = if session.sessionName == name { 0 }
+                    else { session.sessionName.strip_prefix(&prefix)?.parse::<u64>().ok()? };
+                Some((generation, session.commandRunning || reserved.contains(&session.sessionId)))
+            }).max_by_key(|(generation, _)| *generation);
+        let generation = match latest {
+            Some((generation, true)) => generation.checked_add(1).ok_or_else(|| HostError::new("Terminal session generation exhausted"))?,
+            Some((generation, false)) => generation,
+            None => 0,
+        };
+        let sessionName = if generation == 0 { name.to_string() } else { format!("{prefix}{generation}") };
+        let directory = self.fileDirectory()?.map(|workspace| {
+            operit_host_api::TerminalWorkingDirectory::resolveSessionDirectory(
+                host, Some(terminalType), &workspace, &|path| {
+                    self.filesystem.as_ref()
+                        .ok_or_else(|| HostError::new("Workspace VFS is not configured for terminal tools"))?
+                        .terminalDirectory(host, path).map_err(HostError::new)
+                },
+            )
+        }).transpose()?;
+        let session = host.createOrGetTypedSession(&sessionName, terminalType)?;
+        if let Some(directory) = directory {
+            if let Err(error) = enterTerminalDirectory(host, &session.sessionId, terminalType, &directory) {
+                if session.isNewSession { let _ = host.closeSession(&session.sessionId); }
+                return Err(error);
+            }
+        }
+        Ok(session)
+    }
+
     /// Creates terminal tools from an optional host implementation.
     pub fn new(terminalHost: Option<Arc<dyn TerminalHost>>) -> Self {
-        Self { terminalHost }
+        Self { terminalHost, filesystem: None, storage: None }
+    }
+
+    /// Supplies the runtime VFS for the current chat file directory.
+    pub fn withVfs(mut self, filesystem: VisualFileSystem) -> Self {
+        self.filesystem = Some(filesystem);
+        self
+    }
+
+    pub fn withStorage(mut self, storage: Arc<dyn operit_host_api::RuntimeStorageHost>) -> Self {
+        self.storage = Some(storage);
+        self
+    }
+
+    fn fileDirectory(&self) -> HostResult<Option<String>> {
+        let Some(context) = ToolExecutionManager::currentToolRuntimeContext() else { return Ok(None); };
+        let directory = if let Some(storage) = &self.storage {
+            context.fileDirectory(storage.clone()).map_err(HostError::new)?
+        } else {
+            context.workspacePath.clone().filter(|p| !p.trim().is_empty())
+        };
+        if directory.is_none() && context.callerChatId.is_some() {
+            return Err(HostError::new(
+                "Current chat file directory is unavailable; cannot start a terminal in the home directory",
+            ));
+        }
+        Ok(directory)
+    }
+
+    fn resolveFileDirectory(
+        &self, host: &dyn TerminalHost, terminal: &str, terminalType: &str, path: &str,
+    ) -> HostResult<String> {
+        host.resolveWorkingDirectory(terminal, terminalType, path, &|path| {
+            self.filesystem.as_ref()
+                .ok_or_else(|| HostError::new("Workspace VFS is not configured for terminal tools"))?
+                .terminalDirectory(host, path)
+                .map_err(HostError::new)
+        })
     }
 
     #[allow(non_snake_case)]
@@ -71,13 +146,12 @@ impl StandardTerminalTools {
     pub fn createOrGetSession(&self, tool: &AITool) -> ToolResult {
         let sessionName = parameterValue(tool, "session_name");
         let requestedType = optionalParameterValue(tool, "type");
-        match self
-            .host()
-            .and_then(|host| match requestedType.as_deref() {
-                Some(terminalType) => host.createOrGetTypedSession(&sessionName, terminalType),
-                None => host.createOrGetSession(&sessionName),
-            })
-            .and_then(|data| terminalSessionCreationResultData(&data))
+        let result = self.host().and_then(|host| {
+            let terminalType = match requestedType { Some(value) => value, None => host.terminalInfo()?.terminalType };
+            self.availableSession(&sessionName, &terminalType, &Default::default())
+                .and_then(|session| terminalSessionCreationResultData(&session))
+        });
+        match result
         {
             Ok(data) => toolSuccessData(
                 tool,
@@ -94,65 +168,6 @@ impl StandardTerminalTools {
     }
 
     #[allow(non_snake_case)]
-    /// Executes a command inside an existing interactive terminal session.
-    pub fn executeCommandInSession(&self, tool: &AITool) -> ToolResult {
-        let sessionId = parameterValue(tool, "session_id");
-        let command = parameterValue(tool, "command");
-        let timeoutMs = timeoutParameterValue(tool, "timeout_ms", TERMINAL_SESSION_TIMEOUT_MS);
-        match self
-            .host()
-            .and_then(|host| host.executeInSession(&sessionId, &command, timeoutMs))
-            .and_then(|data| terminalCommandResultData(&data))
-        {
-            Ok(data) => toolSuccessData(tool, ToolResultData::TerminalCommandResultData(data)),
-            Err(error) => toolError(
-                tool,
-                format!("Error executing terminal command: {}", error.message),
-            ),
-        }
-    }
-
-    #[allow(non_snake_case)]
-    /// Executes a command and returns stream-shaped start and completion events.
-    pub fn executeCommandInSessionStream(&self, tool: &AITool) -> Vec<ToolResult> {
-        let sessionId = parameterValue(tool, "session_id");
-        let command = parameterValue(tool, "command");
-        let timeoutMs = timeoutParameterValue(tool, "timeout_ms", TERMINAL_SESSION_TIMEOUT_MS);
-        match self
-            .host()
-            .and_then(|host| host.executeInSession(&sessionId, &command, timeoutMs))
-            .and_then(|data| terminalCommandResultData(&data))
-        {
-            Ok(data) => {
-                let start = ToolResult {
-                    toolName: tool.name.clone(),
-                    success: true,
-                    result: ToolResultData::TerminalStreamEventData(TerminalStreamEventData {
-                        r#type: "start".to_string(),
-                        command: command.clone(),
-                        sessionId: sessionId.clone(),
-                        platform: data.platform.clone(),
-                        terminal: data.terminal.clone(),
-                        terminalType: data.terminalType.clone(),
-                        chunk: JsOptional::Null,
-                        chunkIndex: JsOptional::Value(0),
-                        receivedChars: JsOptional::Value(0),
-                    }),
-                    error: Some(String::new()),
-                };
-                vec![
-                    start,
-                    toolSuccessData(tool, ToolResultData::TerminalCommandResultData(data)),
-                ]
-            }
-            Err(error) => vec![toolError(
-                tool,
-                format!("Error executing terminal command: {}", error.message),
-            )],
-        }
-    }
-
-    #[allow(non_snake_case)]
     /// Executes a hidden host command outside an interactive session.
     pub fn executeHiddenCommand(&self, tool: &AITool) -> ToolResult {
         let command = parameterValue(tool, "command");
@@ -160,7 +175,25 @@ impl StandardTerminalTools {
         let timeoutMs = timeoutParameterValue(tool, "timeout_ms", HIDDEN_TERMINAL_TIMEOUT_MS);
         match self
             .host()
-            .and_then(|host| host.executeHiddenCommand(&command, &executorKey, timeoutMs))
+            .and_then(|host| {
+                let scopedCommand = if let Some(workspace) = self.fileDirectory()? {
+                    let info = host.terminalInfo()?;
+                    let directory = self.resolveFileDirectory(
+                        host, &info.terminal, &info.terminalType, &workspace,
+                    )?;
+                    let cd = directoryChangeCommand(&info.terminalType, &directory)?;
+                    if info.terminalType == "powershell" {
+                        format!("{cd};\n{command}")
+                    } else {
+                        format!("{cd} && {{\n{command}\n}}")
+                    }
+                } else {
+                    command.clone()
+                };
+                let mut result = host.executeHiddenCommand(&scopedCommand, &executorKey, timeoutMs)?;
+                result.command = command.clone();
+                Ok(result)
+            })
         {
             Ok(data) => {
                 if data.exitCode == 0 || data.timedOut {
@@ -273,8 +306,6 @@ impl ToolExecutor for TerminalToolExecutor {
                 ToolEffect::READ
             }
             TerminalToolOperation::CreateSession
-            | TerminalToolOperation::ExecuteInSession
-            | TerminalToolOperation::ExecuteInSessionStreaming
             | TerminalToolOperation::ExecuteHiddenCommand
             | TerminalToolOperation::InputInSession
             | TerminalToolOperation::CloseSession => ToolEffect::WRITE,
@@ -285,16 +316,11 @@ impl ToolExecutor for TerminalToolExecutor {
         })
     }
 
-    fn invokeAndStream(&mut self, tool: &AITool) -> Vec<ToolResult> {
+    /// Executes an independent request through the owning resource services.
+    fn invokeAndStream(&self, tool: &AITool) -> Vec<ToolResult> {
         match self.operation {
             TerminalToolOperation::GetTerminalInfo => vec![self.tools.getTerminalInfo(tool)],
             TerminalToolOperation::CreateSession => vec![self.tools.createOrGetSession(tool)],
-            TerminalToolOperation::ExecuteInSession => {
-                vec![self.tools.executeCommandInSession(tool)]
-            }
-            TerminalToolOperation::ExecuteInSessionStreaming => {
-                self.tools.executeCommandInSessionStream(tool)
-            }
             TerminalToolOperation::ExecuteHiddenCommand => {
                 vec![self.tools.executeHiddenCommand(tool)]
             }
@@ -312,12 +338,6 @@ fn validateTerminalTool(operation: TerminalToolOperation, tool: &AITool) -> Tool
         errorMessage: message.to_string(),
     };
     match operation {
-        TerminalToolOperation::ExecuteInSession
-        | TerminalToolOperation::ExecuteInSessionStreaming => {
-            if parameterValue(tool, "command").is_empty() {
-                return invalid("Command parameter is required");
-            }
-        }
         TerminalToolOperation::ExecuteHiddenCommand => {
             if parameterValue(tool, "command").is_empty() {
                 return invalid("Command parameter is required");
@@ -340,9 +360,7 @@ fn validateTerminalTool(operation: TerminalToolOperation, tool: &AITool) -> Tool
         TerminalToolOperation::GetTerminalInfo => {}
     }
     match operation {
-        TerminalToolOperation::ExecuteInSession
-        | TerminalToolOperation::ExecuteInSessionStreaming
-        | TerminalToolOperation::ExecuteHiddenCommand => {
+        TerminalToolOperation::ExecuteHiddenCommand => {
             if optionalParameterValue(tool, "timeout_ms")
                 .as_deref()
                 .is_some_and(|value| value.parse::<u64>().is_err())
@@ -695,21 +713,9 @@ mod tests {
         let ToolResultData::TerminalSessionCreationResultData(session) = created.result else {
             panic!("expected session creation result");
         };
-        let request = tool(
-            "terminal_exec",
-            &[
-                ("session_id", &session.sessionId),
-                ("command", "printf 'operit-zsh-ok\\n'"),
-                ("timeout_ms", "5000"),
-            ],
-        );
-        let result = tools.executeCommandInSession(&request);
-        let events = tools.executeCommandInSessionStream(&request);
+        let output = host.executeInSession(&session.sessionId, "printf 'operit-zsh-ok\n'", 5000).unwrap();
+        let command = terminalCommandResultData(&output).unwrap();
         host.closeSession(&session.sessionId).unwrap();
-        assert!(result.success, "{:?}", result.error);
-        let ToolResultData::TerminalCommandResultData(command) = result.result else {
-            panic!("expected command result");
-        };
         assert!(matches!(command.terminalType, TerminalType::Zsh));
         assert_eq!(command.exitCode, 0);
         assert!(
@@ -717,8 +723,137 @@ mod tests {
             "output: {:?}",
             command.output
         );
-        assert_eq!(events.len(), 2);
-        assert!(events.iter().all(|event| event.success));
+    }
+
+    /// Real interactive and hidden shells share the file-tool base, and a
+    /// missing directory must fail before a user command can execute.
+    #[cfg(all(not(target_arch = "wasm32"), not(target_os = "windows")))]
+    #[tokio::test(flavor = "current_thread")]
+    async fn shells_enter_workspace_or_persistent_outputs_and_reject_missing_directories() {
+        use operit_host_api::RuntimeStorageHost;
+        use operit_host_native_storage::NativeRuntimeStorageHost;
+        use operit_host_native_terminal::NativePtyTerminalHost;
+        use operit_tools::ToolExecutionManager::{ToolExposureMode, ToolParameter, ToolRuntimeContext};
+        let root = std::env::temp_dir().join(format!(
+            "operit-terminal-directory-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(root.join("workspaces/project")).unwrap();
+        let root = root.canonicalize().unwrap();
+        let storage = Arc::new(NativeRuntimeStorageHost::new(
+            root.join("runtime"),
+            root.join("workspaces"),
+        ));
+        operit_store::CoreNodeIdentityStore::CoreNodeIdentityStore::new(storage.clone())
+            .writeNodeId("shell-test".into())
+            .unwrap();
+        let output = operit_store::ChatOutputStore::ChatOutputStore::new(storage.clone())
+            .bind("chat", 1793740800123, None)
+            .unwrap();
+        let filesystem = VisualFileSystem::fromStorage(
+            Arc::new(operit_host_native_filesystem::PosixFileSystemHost::new()), storage.clone(),
+        ).unwrap();
+        let host = Arc::new(NativePtyTerminalHost::loginShell("/bin/bash", "bash", "/").unwrap());
+        let tools = StandardTerminalTools::new(Some(host.clone()))
+            .withVfs(filesystem.clone())
+            .withStorage(storage.clone());
+        let tool = |name: &str, params: &[(&str, &str)]| AITool {
+            name: name.into(),
+            parameters: params
+                .iter()
+                .map(|(name, value)| ToolParameter {
+                    name: (*name).into(),
+                    value: (*value).into(),
+                })
+                .collect(),
+        };
+        for workspace in [
+            None,
+            Some("/operitapp/workspaces/project"),
+            Some("/operitapp/workspaces/missing"),
+        ] {
+            let context = ToolRuntimeContext {
+                callerChatId: Some("chat".into()),
+                callerParticipantId: None,
+                workspacePath: workspace.map(str::to_string),
+                workspaceFolders: Vec::new(),
+                toolExposureMode: ToolExposureMode::FULL,
+                extensionOwner: "test".into(),
+                executionData: Default::default(),
+            };
+            ToolExecutionManager::scopeToolRuntimeContext(context, async {
+                let created = tools.createOrGetSession(&tool(
+                    "terminal_create",
+                    &[("session_name", "directory-test"), ("type", "bash")],
+                ));
+                if workspace == Some("/operitapp/workspaces/missing") {
+                    assert!(!created.success);
+                    let hidden = tools.executeHiddenCommand(&tool(
+                        "terminal_execute",
+                        &[("command", "printf should-not-run")],
+                    ));
+                    assert!(!hidden.success);
+                    return;
+                }
+                assert!(created.success, "{:?}", created.error);
+                let ToolResultData::TerminalSessionCreationResultData(session) = created.result else {
+                    panic!("Expected session");
+                };
+                let base = workspace.unwrap_or(&output);
+                let pwd_command = "printf '__operit_pwd__%s__operit_pwd_end__\\n' \"$PWD\"";
+                let expected = operit_host_api::FileSource::nativePath(&filesystem.file(base).unwrap()).unwrap();
+                let command = host.executeInSession(&session.sessionId, pwd_command, 5000).unwrap();
+                assert_eq!(command.exitCode, 0);
+                assert!(
+                    command
+                        .output
+                        .contains(&format!("__operit_pwd__{expected}__operit_pwd_end__")),
+                    "{}",
+                    command.output
+                );
+                let hidden =
+                    tools.executeHiddenCommand(&tool("terminal_execute", &[("command", pwd_command)]));
+                assert!(hidden.success, "{:?}", hidden.error);
+                let ToolResultData::HiddenTerminalCommandResultData(command) = hidden.result else {
+                    panic!("Expected hidden command");
+                };
+                assert_eq!(command.exitCode, 0);
+                assert!(
+                    command
+                        .output
+                        .contains(&format!("__operit_pwd__{expected}__operit_pwd_end__")),
+                    "{}",
+                    command.output
+                );
+                // Reuse must cd back after the user changes the live session.
+                host.executeInSession(&session.sessionId, "cd /", 5000)
+                    .unwrap();
+                let reused = tools.createOrGetSession(&tool(
+                    "terminal_create",
+                    &[("session_name", "directory-test")],
+                ));
+                assert!(reused.success, "{:?}", reused.error);
+                let pwd = host
+                    .executeInSession(&session.sessionId, pwd_command, 5000)
+                    .unwrap();
+                assert_eq!(pwd.exitCode, 0);
+                assert!(
+                    pwd.output
+                        .contains(&format!("__operit_pwd__{expected}__operit_pwd_end__")),
+                    "{}",
+                    pwd.output
+                );
+                host.closeSession(&session.sessionId).unwrap();
+            })
+            .await;
+        }
+        assert!(storage
+            .exists(&format!(
+                "{}/.operit/sync.json",
+                operit_store::ChatOutputStore::ChatOutputStore::storagePath(&output).unwrap()
+            ))
+            .unwrap());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(all(not(target_arch = "wasm32"), not(target_os = "windows")))]

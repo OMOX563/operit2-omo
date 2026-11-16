@@ -110,6 +110,17 @@ impl SnapshotFileImportPlan {
         Ok(value.to_string())
     }
 
+    /// Retires source-app document grants whose bytes and permissions are not part of a raw snapshot.
+    fn rewriteMemoryAttachmentPath(&self, value: Option<&str>) -> Result<Option<String>, String> {
+        let Some(path) = value else {
+            return Ok(None);
+        };
+        if path.starts_with("content://") {
+            return Ok(None);
+        }
+        self.rewritePath(path).map(Some)
+    }
+
     #[allow(non_snake_case)]
     fn rewriteWorkspacePath(&self, workspace: &str) -> Result<String, String> {
         let pathText = workspace.trim().replace('\\', "/");
@@ -231,6 +242,9 @@ fn isOperit1UnadoptedPreferenceKey(key: &str) -> bool {
             | "enable_memory_auto_update"
             | "memory_settings"
             | "shared_memory_store_list"
+            // Thinking is set per model now; the global switch and quality level have no target.
+            | "enable_thinking_mode"
+            | "thinking_quality_level"
     ) || ["character_card_", "character_group_", "prompt_tag_", "memory_space_", "shared_memory_store_"]
         .iter()
         .any(|prefix| key.starts_with(prefix))

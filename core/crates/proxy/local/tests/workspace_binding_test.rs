@@ -10,7 +10,7 @@ use operit_link::{toCoreValue, CoreCallRequest, CoreLinkSharedClient};
 use operit_model::ChatMessage::ChatMessage;
 use operit_proxy_local::LocalCoreProxy;
 use operit_runtime::core::application::OperitApplication::OperitApplication;
-use operit_util::RuntimeStoreRoot::{setDefaultRuntimeStoreRootConfig, RuntimeStoreRootConfig};
+
 use serde_json::json;
 
 /// Exercises Flutter's generated proxy route, not just the CLI's direct Core calls.
@@ -30,10 +30,7 @@ async fn flutter_workspace_binding_is_idempotent_and_errors_remain_recoverable()
             let workspace_root = root.join("workspaces");
             std::fs::create_dir_all(&runtime_root).unwrap();
             std::fs::create_dir_all(&workspace_root).unwrap();
-            setDefaultRuntimeStoreRootConfig(RuntimeStoreRootConfig::new(
-                runtime_root.clone(),
-                workspace_root.clone(),
-            ));
+
             let storage = Arc::new(NativeRuntimeStorageHost::new(runtime_root, workspace_root));
             let host_manager = HostManager {
                 fileSystemHost: Some(Arc::new(PosixFileSystemHost::new())),
@@ -64,7 +61,7 @@ async fn flutter_workspace_binding_is_idempotent_and_errors_remain_recoverable()
                     "flutter-bind-first",
                     target,
                     "bindChatToWorkspace",
-                    toCoreValue(json!({"chatId": chat_id, "workspace": "/app/workspaces/project"}))
+                    toCoreValue(json!({"chatId": chat_id, "workspace": "/operitapp/workspaces/project"}))
                         .unwrap(),
                 ),
             )
@@ -121,19 +118,19 @@ async fn flutter_workspace_binding_is_idempotent_and_errors_remain_recoverable()
             assert_ne!(chat_id, inherited_chat_id);
 
             for (request_id, path, succeeds) in [
-                ("flutter-rebind", "/app/workspaces/project", true),
+                ("flutter-rebind", "/operitapp/workspaces/project", true),
                 (
                     "flutter-rebind-normalized",
-                    " /app/workspaces/project/ ",
+                    " /operitapp/workspaces/project/ ",
                     true,
                 ),
                 ("flutter-invalid-path", "relative/project", false),
                 (
                     "flutter-name-conflict",
-                    "/app/workspaces/other/project",
+                    "/operitapp/workspaces/other/project",
                     false,
                 ),
-                ("flutter-retry-after-error", "/app/workspaces/project", true),
+                ("flutter-retry-after-error", "/operitapp/workspaces/project", true),
             ] {
                 let response = CoreLinkSharedClient::call(
                     &proxy,
@@ -182,7 +179,7 @@ async fn flutter_workspace_binding_is_idempotent_and_errors_remain_recoverable()
                     target,
                     "bindChatToWorkspace",
                     toCoreValue(
-                        json!({"chatId": inherited_chat_id, "workspace": "/app/workspaces/extra"}),
+                        json!({"chatId": inherited_chat_id, "workspace": "/operitapp/workspaces/extra"}),
                     )
                     .unwrap(),
                 ),
@@ -203,7 +200,7 @@ async fn flutter_workspace_binding_is_idempotent_and_errors_remain_recoverable()
             assert_eq!(workspace.id, original_workspace.id);
             assert_eq!(workspace.folders.len(), 2);
             assert_eq!(workspace.folders[0], original_workspace.folders[0]);
-            assert_eq!(workspace.folders[1].path, "/app/workspaces/extra");
+            assert_eq!(workspace.folders[1].path, "/operitapp/workspaces/extra");
         })
         .await;
 }

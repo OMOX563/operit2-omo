@@ -50,12 +50,21 @@ impl Node {
     fn deliver(&self, to: &Node, op: &SyncOperation) {
         if let Some(reference) = RuntimeFileSyncStore::requiredBlob(op).unwrap() {
             let source = RuntimeFileSyncStore::new(self.host.clone(), SYNC);
-            let path = source.blobStoragePath(&reference).unwrap();
             RuntimeFileSyncStore::new(to.host.clone(), SYNC)
-                .writeBlob(&reference, &self.host.readBytes(&path).unwrap())
+                .writeBlob(&reference, &source.readBlob(&reference).unwrap())
                 .unwrap();
         }
-        to.workspace().applyOperation(op, false).unwrap();
+        if WorkspaceFileSyncStore::owns(op) {
+            to.workspace().applyOperation(op, false).unwrap();
+        } else {
+            if to.log().shouldApplyOperation(op).unwrap() {
+                RuntimeFileSyncStore::applySyncedOperation(
+                    to.host.clone(), SYNC, &op.entityId, &op.operation, op.payload.clone(),
+                ).unwrap();
+                to.log().recordAppliedOperation(op).unwrap();
+            }
+            to.log().appendOperation(op).unwrap();
+        }
     }
     fn write(&self, path: &str, bytes: &[u8]) {
         self.host.writeBytes(path, bytes).unwrap();
@@ -194,7 +203,7 @@ fn invalid_paths_are_rejected() {
     for path in [
         "workspaces/../outside",
         "workspaces/x/../../secret",
-        "/mnt/macos/file",
+        "/virtual/macos/file",
         "workspaces/x\\outside",
         "workspaces/x//file",
     ] {
@@ -332,6 +341,12 @@ fn file_to_directory_and_back_replicate_in_order() {
 struct CountingHost {
     inner: Arc<NativeRuntimeStorageHost>,
     workspaceReads: AtomicUsize,
+    inventoryWrites: AtomicUsize,
+    failInventoryAt: AtomicUsize,
+    failFlush: std::sync::atomic::AtomicBool,
+    batchFlushes: AtomicUsize,
+    directoryListings: std::sync::Mutex<Vec<String>>,
+    removeBeforeMetadata: std::sync::Mutex<Option<String>>,
 }
 
 impl RuntimeStorageHost for CountingHost {
@@ -352,16 +367,30 @@ impl RuntimeStorageHost for CountingHost {
         self.inner.readBytes(path)
     }
     fn readBytesRange(&self, path: &str, offset: u64, length: usize) -> HostResult<Vec<u8>> {
+        if path.starts_with("workspaces/") && offset == 0 { self.workspaceReads.fetch_add(1, Ordering::SeqCst); }
         self.inner.readBytesRange(path, offset, length)
     }
     fn writeBytes(&self, path: &str, content: &[u8]) -> HostResult<()> {
         self.inner.writeBytes(path, content)
     }
     /// Reads metadata without counting a content read.
-    fn modifiedAt(&self, path: &str) -> HostResult<i64> { self.inner.modifiedAt(path) }
+    fn modifiedAt(&self, path: &str) -> HostResult<i64> {
+        let mut pending = self.removeBeforeMetadata.lock().unwrap();
+        if pending.as_deref() == Some(path) {
+            pending.take();
+            self.inner.delete(path, false)?;
+        }
+        self.inner.modifiedAt(path)
+    }
     /// Preserves source metadata.
     fn setModifiedAt(&self, path: &str, time: i64) -> HostResult<()> { self.inner.setModifiedAt(path, time) }
     fn writeBytesAtomically(&self, path: &str, content: &[u8]) -> HostResult<()> {
+        if path.ends_with("/workspace_inventory.json") {
+            let write = self.inventoryWrites.fetch_add(1, Ordering::SeqCst) + 1;
+            if write == self.failInventoryAt.load(Ordering::SeqCst) {
+                return Err(operit_host_api::HostError::new("injected inventory checkpoint failure"));
+            }
+        }
         self.inner.writeBytesAtomically(path, content)
     }
     fn appendBytes(&self, path: &str, content: &[u8]) -> HostResult<()> {
@@ -370,6 +399,13 @@ impl RuntimeStorageHost for CountingHost {
     fn flushFile(&self, path: &str) -> HostResult<()> {
         self.inner.flushFile(path)
     }
+    fn flushFiles(&self, paths: &[&str]) -> HostResult<()> {
+        self.batchFlushes.fetch_add(1, Ordering::SeqCst);
+        if self.failFlush.load(Ordering::SeqCst) {
+            return Err(operit_host_api::HostError::new("injected file flush failure"));
+        }
+        self.inner.flushFiles(paths)
+    }
     fn delete(&self, path: &str, recursive: bool) -> HostResult<()> {
         self.inner.delete(path, recursive)
     }
@@ -377,6 +413,7 @@ impl RuntimeStorageHost for CountingHost {
         self.inner.exists(path)
     }
     fn list(&self, prefix: &str) -> HostResult<Vec<RuntimeStorageEntry>> {
+        self.directoryListings.lock().unwrap().push(prefix.to_string());
         self.inner.list(prefix)
     }
 }
@@ -390,7 +427,7 @@ impl CountedNode {
     /// Reuses the native node fixture while instrumenting only workspace content reads.
     fn new() -> Self {
         let node = Node::new();
-        let host = Arc::new(CountingHost { inner: node.host.clone(), workspaceReads: AtomicUsize::new(0) });
+        let host = Arc::new(CountingHost { inner: node.host.clone(), workspaceReads: AtomicUsize::new(0), inventoryWrites: AtomicUsize::new(0), failInventoryAt: AtomicUsize::new(0), failFlush: Default::default(), batchFlushes: AtomicUsize::new(0), directoryListings: Default::default(), removeBeforeMetadata: Default::default() });
         Self { host, _node: node }
     }
     fn workspace(&self) -> WorkspaceFileSyncStore {
@@ -476,4 +513,429 @@ fn structured_same_size_writes_publish_immediately() {
         b.host.readBytes("workspaces/project/file.txt").unwrap(),
         b"world"
     );
+}
+
+
+#[test]
+fn editable_policy_gitignore_nested_negation_and_build_pruning() {
+    let a = Node::new();
+    a.write("workspaces/p/.gitignore", b"*.cache\n!keep.cache\n.operit/\n");
+    a.write("workspaces/p/build/generated", b"never upload");
+    a.write("workspaces/p/remove.cache", b"ignore");
+    a.write("workspaces/p/keep.cache", b"keep");
+    a.write("workspaces/p/sub/.gitignore", b"*.txt\n!important.txt\n");
+    a.write("workspaces/p/sub/no.txt", b"ignore");
+    a.write("workspaces/p/sub/important.txt", b"keep");
+    operit_store::FileSyncPolicy::FileSyncPolicy::ensure(a.host.as_ref(), "workspaces/p").unwrap();
+    a.workspace().scan().unwrap();
+    let paths: Vec<_> = a.ops().into_iter().map(|o| o.entityId).collect();
+    assert!(paths.contains(&"workspaces/p/.operit/sync.json".into()));
+    assert!(paths.contains(&"workspaces/p/keep.cache".into()));
+    assert!(paths.contains(&"workspaces/p/sub/important.txt".into()));
+    assert!(!paths.iter().any(|p| p.contains("generated") || p.ends_with("remove.cache") || p.ends_with("no.txt")));
+}
+
+/// Exclusions must prune whole trees before traversal and locator generation, even with a tiny byte limit.
+#[test]
+fn excluded_trees_are_not_traversed_or_replaced_by_many_locators() {
+    let node = CountedNode::new();
+    let mut policy = operit_store::FileSyncPolicy::FileSyncPolicy::default();
+    policy.maxFileBytes = 1;
+    policy.exclude.push("bulk-input/".into());
+    node.host.writeBytes("workspaces/project/.operit/sync.json", &serde_json::to_vec(&policy).unwrap()).unwrap();
+    for directory in ["node_modules", "build", "bulk-input"] {
+        for index in 0..12 {
+            node.host.writeBytes(&format!("workspaces/project/{directory}/nested/{index}.bin"), b"large enough to need a locator if traversed").unwrap();
+        }
+    }
+    node.host.writeBytes("workspaces/project/report.md", b"x").unwrap();
+    node.workspace().scan().unwrap();
+    let listed = node.host.directoryListings.lock().unwrap();
+    let operations = node._node.ops();
+    for directory in ["node_modules", "build", "bulk-input"] {
+        let prefix = format!("workspaces/project/{directory}");
+        assert!(!listed.iter().any(|path| path.starts_with(&prefix)), "excluded tree was traversed: {prefix}");
+        assert!(!operations.iter().any(|operation| operation.entityId.starts_with(&prefix)), "excluded tree created files or locators: {prefix}");
+    }
+    assert!(operations.iter().any(|operation| operation.entityId == "workspaces/project/report.md"));
+}
+
+#[test]
+fn adding_ignore_rules_does_not_delete_peer_files_and_invalid_policy_is_safe() {
+    let a = Node::new(); let b = Node::new();
+    a.write("workspaces/p/a.txt", b"keep both copies");
+    a.workspace().scan().unwrap(); a.send(&b);
+    a.write("workspaces/p/.operit/sync.json", br#"{"exclude":["*.txt"]}"#);
+    a.workspace().scan().unwrap(); a.send(&b);
+    assert_eq!(b.host.readBytes("workspaces/p/a.txt").unwrap(), b"keep both copies");
+    assert!(!a.ops().iter().any(|o| o.operation == "delete"));
+    let count = a.ops().len();
+    a.write("workspaces/p/.operit/sync.json", b"{ invalid");
+    assert!(a.workspace().scan().is_err());
+    assert_eq!(a.ops().len(), count);
+}
+
+#[test]
+fn oversize_file_syncs_locator_without_uploading_original_and_can_shrink() {
+    let a = Node::new(); let b = Node::new();
+    operit_store::CoreNodeIdentityStore::CoreNodeIdentityStore::new(a.host.clone()).initialize().unwrap();
+    a.write("workspaces/p/.operit/sync.json", br#"{"maxFileBytes":4}"#);
+    a.write("workspaces/p/big.bin", b"large source stays here");
+    a.workspace().scan().unwrap(); a.send(&b);
+    assert!(!b.host.exists("workspaces/p/big.bin").unwrap());
+    let pointer = b.host.readBytes("workspaces/p/big.bin.operit-ref.json").unwrap();
+    let reference: operit_store::FileSyncPolicy::FileReference = serde_json::from_slice(&pointer).unwrap();
+    assert_eq!(reference.path, "/operitapp/workspaces/p/big.bin");
+    assert_eq!(reference.fileSize, 23);
+    assert!(!a.ops().iter().any(|o| o.entityId == "workspaces/p/big.bin"));
+    a.write("workspaces/p/big.bin", b"tiny");
+    a.workspace().scan().unwrap(); a.send(&b);
+    assert_eq!(b.host.readBytes("workspaces/p/big.bin").unwrap(), b"tiny");
+    assert!(!b.host.exists("workspaces/p/big.bin.operit-ref.json").unwrap());
+}
+
+#[test]
+fn total_budget_and_output_and_attachment_roots_use_same_policy() {
+    let a = Node::new(); let b = Node::new();
+    operit_store::CoreNodeIdentityStore::CoreNodeIdentityStore::new(a.host.clone()).initialize().unwrap();
+    a.write("runtime/data/chat_outputs/2026-11-04/.operit/sync.json", br#"{"maxTotalBytes":4}"#);
+    a.write("runtime/data/chat_outputs/2026-11-04/a.md", b"one");
+    a.write("runtime/data/chat_outputs/2026-11-04/b.md", b"two");
+    a.write("runtime/data/chat_attachments/chat/file.txt", b"small attachment");
+    a.workspace().scan().unwrap(); a.send(&b);
+    assert_eq!(b.host.readBytes("runtime/data/chat_outputs/2026-11-04/a.md").unwrap(), b"one");
+    assert!(!b.host.exists("runtime/data/chat_outputs/2026-11-04/b.md").unwrap());
+    assert!(b.host.exists("runtime/data/chat_outputs/2026-11-04/b.md.operit-ref.json").unwrap());
+    assert_eq!(b.host.readBytes("runtime/data/chat_attachments/chat/file.txt").unwrap(), b"small attachment");
+    assert_eq!(b.workspace().scan().unwrap(), 0);
+}
+
+#[test]
+fn ignored_incoming_file_is_restored_when_rule_is_removed() {
+    let a = Node::new(); let b = Node::new();
+    b.write("workspaces/p/.operit/sync.json", br#"{"exclude":["*.txt"]}"#);
+    a.write("workspaces/p/a.txt", b"arrived while ignored");
+    a.workspace().scan().unwrap(); a.send(&b);
+    assert!(!b.host.exists("workspaces/p/a.txt").unwrap());
+    b.write("workspaces/p/.operit/sync.json", b"{}");
+    b.workspace().scan().unwrap();
+    assert_eq!(b.host.readBytes("workspaces/p/a.txt").unwrap(), b"arrived while ignored");
+}
+
+/// Bindings and their relative files use the same existing Space file protocol.
+#[test]
+fn output_bindings_and_files_replicate_through_runtime_file_sync() {
+    use operit_store::ChatOutputStore::ChatOutputStore;
+    let a = Node::new();
+    let b = Node::new();
+    let outputs = ChatOutputStore::new(a.host.clone());
+    let base = outputs.bind("parent", 1793740800123, None).unwrap();
+    outputs.bind("child", 1793827200123, Some(&base)).unwrap();
+    outputs.prepare("parent").unwrap();
+    let root = ChatOutputStore::storagePath(&base).unwrap();
+    a.write(&format!("{root}/report.md"), b"![chart](images/chart.png)");
+    a.write(&format!("{root}/images/chart.png"), &[0, 255, 17]);
+    a.write(
+        &format!("{root}/.operit/attachments/input/note.txt"),
+        b"shared input",
+    );
+    a.write(
+        "runtime/data/attachment_sources/local/large.bin",
+        b"local source",
+    );
+    a.workspace().scan().unwrap();
+    a.send(&b);
+
+    let peer_outputs = ChatOutputStore::new(b.host.clone());
+    assert_eq!(
+        peer_outputs.directory("parent").unwrap(),
+        Some(base.clone())
+    );
+    assert_eq!(peer_outputs.directory("child").unwrap(), Some(base.clone()));
+    assert_eq!(
+        peer_outputs.bind("parent", 1794604800123, None).unwrap(),
+        base
+    );
+    assert_eq!(
+        b.host.readBytes(&format!("{root}/report.md")).unwrap(),
+        b"![chart](images/chart.png)"
+    );
+    assert_eq!(
+        b.host
+            .readBytes(&format!("{root}/images/chart.png"))
+            .unwrap(),
+        [0, 255, 17]
+    );
+    assert_eq!(
+        b.host
+            .readBytes(&format!("{root}/.operit/attachments/input/note.txt"))
+            .unwrap(),
+        b"shared input"
+    );
+    assert!(!b
+        .host
+        .exists("runtime/data/attachment_sources/local/large.bin")
+        .unwrap());
+    assert_eq!(peer_outputs.prepare("child").unwrap(), Some(base.clone()));
+    assert_eq!(b.workspace().scan().unwrap(), 0);
+    // Opening a new store after restart retains the received binding.
+    assert_eq!(
+        ChatOutputStore::new(b.host.clone())
+            .directory("child")
+            .unwrap(),
+        Some(base)
+    );
+}
+
+/// A source removed between listing and stat must not block unrelated files or publish a guessed deletion.
+#[test]
+fn disappearing_file_preserves_inventory_until_the_next_scan() {
+    let a = CountedNode::new();
+    let b = Node::new();
+    let path = "workspaces/project/disappearing.txt";
+    a.host.writeBytes(path, b"original").unwrap();
+    assert_eq!(a.workspace().scan().unwrap(), 1);
+    a._node.send(&b);
+    a.host.writeBytes("workspaces/project/healthy.txt", b"still syncing").unwrap();
+    *a.host.removeBeforeMetadata.lock().unwrap() = Some(path.into());
+    assert_eq!(a.workspace().scan().unwrap(), 1);
+    a._node.send(&b);
+    assert_eq!(b.host.readBytes(path).unwrap(), b"original");
+    assert_eq!(b.host.readBytes("workspaces/project/healthy.txt").unwrap(), b"still syncing");
+    assert_eq!(a.workspace().scan().unwrap(), 1);
+    a._node.send(&b);
+    assert!(!b.host.exists(path).unwrap());
+    assert_eq!(a.workspace().scan().unwrap(), 0);
+}
+
+/// systemd ships literal backslashes on POSIX; they must never alias slash-separated storage paths.
+#[cfg(unix)]
+#[test]
+fn systemd_escaped_filenames_do_not_block_workspace_sync_or_alias_directories() {
+    use std::os::unix::fs::symlink;
+    let a = Node::new();
+    let b = Node::new();
+    let directory = a.root.join("workspaces/project/usr/lib/systemd/system");
+    std::fs::create_dir_all(&directory).unwrap();
+    let escaped = directory.join(r"system-systemd\x2dcryptsetup.slice");
+    std::fs::write(&escaped, b"[Slice]").unwrap();
+    symlink("missing.service", directory.join("broken.service")).unwrap();
+    a.write("workspaces/project/notes.txt", b"normal workspace file");
+    assert_eq!(a.workspace().scan().unwrap(), 1);
+    assert_eq!(a.workspace().scan().unwrap(), 0);
+    a.send(&b);
+    assert_eq!(b.host.readBytes("workspaces/project/notes.txt").unwrap(), b"normal workspace file");
+    assert!(!b.host.exists("workspaces/project/usr/lib/systemd/system/system-systemd/x2dcryptsetup.slice").unwrap());
+    assert_eq!(std::fs::read(&escaped).unwrap(), b"[Slice]");
+}
+
+// Models originals written by older peers, including blobs that were never downloaded.
+fn legacy_file_operation(node: &Node, path: &str, kind: &str) -> SyncOperation {
+    use operit_store::SyncOperationStore::{NewSyncOperation, SyncOperationSemantics};
+    node.log().appendLocalOperation("legacy-peer", NewSyncOperation {
+        domain: RUNTIME_FILE_SYNC_DOMAIN.into(), entityType: "file".into(),
+        entityId: path.into(), operation: kind.into(), semantics: SyncOperationSemantics::EntityState,
+        payload: if kind == "upsert" { serde_json::json!({"contentHash": "a".repeat(64), "size": 7}) } else { serde_json::Value::Null },
+    }).unwrap()
+}
+
+/// Scanning retains incompatible source files locally and synchronizes portable names.
+#[cfg(unix)]
+#[test]
+fn incompatible_names_stay_local_while_normal_files_sync() {
+    let a = Node::new();
+    let b = Node::new();
+    let excluded = [
+        "workspaces/p/query??&MsgID=123.jpg", "workspaces/p/CON.txt",
+        "workspaces/p/trailing.", "workspaces/p/trailing ", "workspaces/p/a:b.txt",
+        "workspaces/p/nested?/ok.txt", "workspaces/p/a\\b.txt",
+        "workspaces/CON/.operit/sync.json",
+        "runtime/data/chat_outputs/chat/.operit/attachments/id/image?.jpg",
+        "runtime/data/chat_attachments/chat/id/NUL.jpg",
+        "runtime/data/chat_outputs/chat/...",
+        "workspaces/p/..../nested.txt",
+    ];
+    for path in excluded { a.write(path, b"keep local"); }
+    let allowed = ["workspaces/p/中文 图片.jpg", "runtime/data/chat_outputs/chat/good.txt", "runtime/data/chat_attachments/chat/id/good.jpg"];
+    for path in allowed { a.write(path, b"sync"); }
+    assert_eq!(a.workspace().scan().unwrap(), allowed.len());
+    assert_eq!(a.ops().len(), allowed.len());
+    a.send(&b);
+    for path in excluded {
+        assert_eq!(a.host.readBytes(path).unwrap(), b"keep local");
+        assert!(!b.host.exists(path).unwrap(), "{path}");
+    }
+    for path in allowed { assert_eq!(b.host.readBytes(path).unwrap(), b"sync"); }
+    assert_eq!(a.workspace().scan().unwrap(), 0);
+    assert_eq!(b.workspace().scan().unwrap(), 0);
+}
+
+#[test]
+fn excluded_inventory_and_recovery_state_are_discarded_without_blobs_or_deletions() {
+    let node = Node::new();
+    let path = "runtime/data/chat_outputs/chat/.operit/attachments/id/image?.jpg";
+    let op = legacy_file_operation(&node, path, "upsert");
+    let mut old = serde_json::json!({"files": {}, "references": {}, "deferred": {}, "pending": [path, op.payload]});
+    old["files"][path] = serde_json::json!({"size": 7, "modifiedAt": 1});
+    old["references"][path] = serde_json::json!({"size": 7, "modifiedAt": 1});
+    old["deferred"][path] = op.payload.clone();
+    node.write("runtime/sync/workspace_inventory.json", &serde_json::to_vec(&old).unwrap());
+    node.write("workspaces/p/good.txt", b"normal");
+    assert_eq!(node.workspace().scan().unwrap(), 1);
+    let ops = node.ops();
+    assert_eq!(ops.len(), 1);
+    assert_eq!(ops[0].entityId, "workspaces/p/good.txt");
+    assert_eq!(ops[0].operation, "upsert");
+    let state: serde_json::Value = serde_json::from_slice(&node.host.readBytes("runtime/sync/workspace_inventory.json").unwrap()).unwrap();
+    assert!(state["files"].get(path).is_none());
+    assert!(state["references"].get(path).is_none());
+    assert!(state["deferred"].as_object().unwrap().is_empty());
+    assert!(state["pending"].is_null());
+    assert_eq!(node.workspace().scan().unwrap(), 0);
+}
+
+/// Incoming excluded names never require blobs, materialization, or further replication.
+#[test]
+fn incoming_incompatible_files_skip_transfer_materialization_and_relay() {
+    let old = Node::new();
+    let target = Node::new();
+    let files = RuntimeFileSyncStore::new(target.host.clone(), SYNC);
+    for path in ["workspaces/p/image?.jpg", "workspaces/CON/file.txt", "workspaces/p/nul.jpg", "workspaces/p/trailing.", "workspaces/p/.", "workspaces/p/..", "runtime/data/chat_outputs/chat/...", "workspaces/p/..../nested.txt"] {
+        for kind in ["upsert", "delete"] {
+            let op = legacy_file_operation(&old, path, kind);
+            assert!(RuntimeFileSyncStore::requiredBlob(&op).unwrap().is_none());
+            assert!(!target.workspace().wantsBlob(&op).unwrap());
+            assert!(!target.workspace().applyOperation(&op, false).unwrap());
+            assert!(target.log().applicationOperations().unwrap().is_empty());
+            assert!(target.ops().is_empty());
+            // Large legacy envelopes must also skip before reading their absent blob.
+            let mut envelope = op.clone();
+            envelope.payload = serde_json::json!({"transactionBlob": {"contentHash": "b".repeat(64), "size": 40000}});
+            assert!(RuntimeFileSyncStore::requiredBlob(&envelope).unwrap().is_none());
+            assert_eq!(files.hydrateTransaction(envelope.clone()).unwrap(), envelope);
+        }
+    }
+    old.write("workspaces/p/good.txt", b"normal");
+    old.workspace().scan().unwrap();
+    old.send(&target);
+    assert_eq!(target.host.readBytes("workspaces/p/good.txt").unwrap(), b"normal");
+}
+
+#[cfg(unix)]
+#[test]
+fn excluded_incoming_updates_and_deletes_leave_existing_local_file_untouched() {
+    let source = Node::new();
+    let target = Node::new();
+    let path = "workspaces/p/image?.jpg";
+    target.write(path, b"original");
+    for kind in ["upsert", "delete"] {
+        let op = legacy_file_operation(&source, path, kind);
+        target.workspace().applyOperation(&op, false).unwrap();
+        assert_eq!(target.host.readBytes(path).unwrap(), b"original");
+    }
+    assert!(target.ops().is_empty());
+}
+
+/// Excluded legacy records are retired even when their transport blobs are unavailable.
+#[test]
+fn pending_excluded_originals_are_retired_and_cannot_be_requeued() {
+    for path in ["workspaces/p/old?.jpg", "workspaces/p/.", "workspaces/p/..", "runtime/data/chat_outputs/chat/...", "workspaces/p/..../nested.txt"] {
+        let source = Node::new();
+        let target = Node::new();
+        let excluded = legacy_file_operation(&source, path, "upsert");
+        let normal = legacy_file_operation(&source, "workspaces/p/good.txt", "upsert");
+        let mut envelope = excluded.clone();
+        let reference = RuntimeFileSyncStore::new(source.host.clone(), SYNC).storeJsonBlob(&excluded).unwrap();
+        envelope.payload = serde_json::json!({"transactionBlob": reference});
+        // The receiver intentionally never downloads the envelope blob.
+        target.log().receiveOperations(&[envelope.clone(), normal.clone()]).unwrap();
+        assert_eq!(target.log().pendingOperationCount().unwrap(), 2);
+        target.workspace().scan().unwrap();
+        assert_eq!(target.log().pendingOperationIds().unwrap(), vec![normal.opId.clone()]);
+        assert_eq!(target.log().applicationOperations().unwrap(), vec![normal.clone()]);
+        target.log().receiveOperations(&[excluded.clone(), envelope]).unwrap();
+        assert_eq!(target.log().pendingOperationIds().unwrap(), vec![normal.opId]);
+        assert!(target.ops().iter().all(|op| op.opId != excluded.opId));
+    }
+}
+
+
+#[test]
+fn batch_inventory_uses_two_checkpoints_and_recovers_after_final_publication_failure() {
+    let source = Node::new();
+    for i in 0..8 { source.write(&format!("workspaces/batch/{i}.txt"), format!("data-{i}").as_bytes()); }
+    source.workspace().scan().unwrap();
+    let operations = source.ops();
+    let target = CountedNode::new();
+    let files = RuntimeFileSyncStore::new(target.host.clone(), SYNC);
+    for op in &operations {
+        let reference = RuntimeFileSyncStore::requiredBlob(op).unwrap().unwrap();
+        files.writeBlob(&reference, &RuntimeFileSyncStore::new(source.host.clone(), SYNC).readBlob(&reference).unwrap()).unwrap();
+    }
+    target._node.log().receiveOperations(&operations).unwrap();
+    target.host.failInventoryAt.store(2, Ordering::SeqCst);
+    assert!(target.workspace().materializeOperations(&operations.iter().collect::<Vec<_>>(), false).unwrap_err().contains("injected"));
+    assert_eq!(target.host.inventoryWrites.load(Ordering::SeqCst), 2);
+    let saved: serde_json::Value = serde_json::from_slice(&target.host.readBytes("runtime/sync/workspace_inventory.json").unwrap()).unwrap();
+    assert_eq!(saved["pendingBatch"].as_array().unwrap().len(), 8);
+    // Reopen through a different host and recover before scanning local edits.
+    let reopened = WorkspaceFileSyncStore::new(target._node.host.clone(), SYNC);
+    assert_eq!(reopened.scan().unwrap(), 0);
+    for i in 0..8 {
+        assert_eq!(target.host.readBytes(&format!("workspaces/batch/{i}.txt")).unwrap(), format!("data-{i}").as_bytes());
+    }
+    let saved: serde_json::Value = serde_json::from_slice(&target.host.readBytes("runtime/sync/workspace_inventory.json").unwrap()).unwrap();
+    assert!(saved.get("pendingBatch").is_none());
+    assert_eq!(target._node.log().pendingOperations().unwrap().len(), 8);
+    let expected = operations.iter().map(|op|op.opId.clone()).collect::<std::collections::BTreeSet<_>>();
+    assert!(target._node.ops().iter().all(|op|expected.contains(&op.opId)), "recovery must not publish incoming files as local edits");
+}
+
+#[test]
+fn batch_flush_failure_keeps_recovery_intent_and_does_not_publish_versions() {
+    let source = Node::new();
+    for i in 0..3 { source.write(&format!("workspaces/batch/{i}.txt"), b"durable"); }
+    source.workspace().scan().unwrap();
+    let operations = source.ops();
+    let target = CountedNode::new();
+    let files = RuntimeFileSyncStore::new(target.host.clone(), SYNC);
+    for op in &operations {
+        let reference = RuntimeFileSyncStore::requiredBlob(op).unwrap().unwrap();
+        files.writeBlob(&reference, &RuntimeFileSyncStore::new(source.host.clone(), SYNC).readBlob(&reference).unwrap()).unwrap();
+    }
+    target._node.log().receiveOperations(&operations).unwrap();
+    target.host.failFlush.store(true, Ordering::SeqCst);
+    assert!(target.workspace().materializeOperations(&operations.iter().collect::<Vec<_>>(), false).unwrap_err().contains("flush failure"));
+    assert_eq!(target.host.batchFlushes.load(Ordering::SeqCst), 1);
+    for op in &operations { assert!(target._node.log().shouldApplyOperation(op).unwrap()); }
+    let saved: serde_json::Value = serde_json::from_slice(&target.host.readBytes("runtime/sync/workspace_inventory.json").unwrap()).unwrap();
+    assert_eq!(saved["pendingBatch"].as_array().unwrap().len(), 3);
+    let reopened = WorkspaceFileSyncStore::new(target._node.host.clone(), SYNC);
+    assert_eq!(reopened.scan().unwrap(), 0);
+    for op in &operations {
+        assert_eq!(target.host.readBytes(&op.entityId).unwrap(), b"durable");
+        assert!(!target._node.log().shouldApplyOperation(op).unwrap());
+    }
+    assert_eq!(target._node.ops().len(), operations.len());
+}
+
+#[test]
+fn batch_missing_blob_does_not_block_other_files_or_future_scans() {
+    let source = Node::new();
+    source.write("workspaces/batch/a.txt", b"missing");
+    source.write("workspaces/batch/b.txt", b"valid");
+    source.workspace().scan().unwrap();
+    let operations = source.ops();
+    let target = Node::new();
+    for op in operations.iter().filter(|op|op.entityId.ends_with("b.txt")) {
+        let reference = RuntimeFileSyncStore::requiredBlob(op).unwrap().unwrap();
+        RuntimeFileSyncStore::new(target.host.clone(), SYNC).writeBlob(&reference,
+            &RuntimeFileSyncStore::new(source.host.clone(), SYNC).readBlob(&reference).unwrap()).unwrap();
+    }
+    target.log().receiveOperations(&operations).unwrap();
+    assert!(target.workspace().materializeOperations(&operations.iter().collect::<Vec<_>>(), false).is_err());
+    assert_eq!(target.host.readBytes("workspaces/batch/b.txt").unwrap(), b"valid");
+    assert_eq!(target.workspace().scan().unwrap(), 0);
+    assert!(target.log().shouldApplyOperation(operations.iter().find(|op|op.entityId.ends_with("a.txt")).unwrap()).unwrap());
+    assert!(!target.log().shouldApplyOperation(operations.iter().find(|op|op.entityId.ends_with("b.txt")).unwrap()).unwrap());
 }

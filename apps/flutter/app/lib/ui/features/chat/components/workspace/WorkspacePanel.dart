@@ -35,7 +35,6 @@ import 'WorkspaceTabStrip.dart';
 import 'browser/WorkspaceBrowserViewStore.dart';
 import 'browser/automation/WorkspaceWebVisitSessionRegistry.dart';
 import 'browser/tabs/WorkspaceBrowserTabModels.dart';
-import 'file_preview/WorkspaceTextDocument.dart';
 import 'file_preview/WorkspaceTextCloseDialog.dart';
 import 'terminal/WorkspaceTerminalSessions.dart';
 import 'terminal/WorkspaceTerminalLaunch.dart';
@@ -48,8 +47,10 @@ class WorkspacePanel extends StatefulWidget {
     required this.currentChatId,
     required this.hasBoundWorkspace,
     required this.workspacePath,
+    this.fileDirectory,
     required this.chatCore,
     required this.onListWorkspaceFiles,
+    this.onMutateWorkspaceFile,
     required this.onListWorkspaceBindingDirectories,
     required this.onReadWorkspaceTextFile,
     required this.onReadWorkspaceFileBytes,
@@ -65,9 +66,11 @@ class WorkspacePanel extends StatefulWidget {
   final SidebarDockController? sidebarDockController;
   final bool hasBoundWorkspace;
   final String? workspacePath;
+  final String? fileDirectory;
   final GeneratedChatRuntimeHolderMainCoreProxy chatCore;
   final Future<List<WorkspaceFileEntry>> Function(String path)
   onListWorkspaceFiles;
+  final WorkspaceFileMutation? onMutateWorkspaceFile;
   final Future<List<WorkspaceFileEntry>> Function(String path)
   onListWorkspaceBindingDirectories;
   final Future<String> Function(String path) onReadWorkspaceTextFile;
@@ -105,6 +108,7 @@ class _WorkspacePanelState extends State<WorkspacePanel> {
   int? _dropHoverPaneIndex;
   _WorkspaceDropZone? _dropHoverZone;
   int _filesListingRevision = 0;
+  final _fileClipboard = WorkspaceFileClipboard();
   bool _workspaceUnbindDialogOpen = false;
   List<WorkspaceTerminalSessionInfo> _terminalSessionEntries =
       const <WorkspaceTerminalSessionInfo>[];
@@ -196,6 +200,12 @@ class _WorkspacePanelState extends State<WorkspacePanel> {
   @override
   void didUpdateWidget(covariant WorkspacePanel oldWidget) {
     super.didUpdateWidget(oldWidget);
+    if (oldWidget.currentChatId != widget.currentChatId ||
+        oldWidget.workspacePath != widget.workspacePath ||
+        oldWidget.fileDirectory != widget.fileDirectory) {
+      _fileClipboard.value = null;
+      _filesListingRevision++;
+    }
     if (oldWidget.sidebarDockController != widget.sidebarDockController) {
       oldWidget.sidebarDockController?.removeListener(
         _handleSidebarDockChanged,
@@ -223,6 +233,7 @@ class _WorkspacePanelState extends State<WorkspacePanel> {
   /// Releases subscriptions and invalidates every asynchronous overview request.
   @override
   void dispose() {
+    _fileClipboard.dispose();
     _embeddedContributions.dispose();
     _session.removeListener(_handleSessionChanged);
     widget.sidebarDockController?.removeListener(_handleSidebarDockChanged);
@@ -341,8 +352,9 @@ class _WorkspacePanelState extends State<WorkspacePanel> {
   @override
   Widget build(BuildContext context) {
     return WorkspacePanelSurface(
-      transparentSurface: OperitTheme.of(context)
-          .themePreferenceSnapshot.transparentSurfaceEnabled,
+      transparentSurface: OperitTheme.of(
+        context,
+      ).themePreferenceSnapshot.transparentSurfaceEnabled,
       child: _buildWorkspaceLayout(),
     );
   }
@@ -1134,10 +1146,15 @@ class _WorkspacePanelState extends State<WorkspacePanel> {
     return WorkspaceTabContent(
       tab: tab,
       workspacePath: widget.workspacePath,
+      fileDirectory: widget.fileDirectory,
       workspaceUsage: _workspaceOverviewUsage(),
       terminalSessionCountListenable: _terminalSessionCount,
       browserSessionCountListenable: _browserSessionCount,
       onListWorkspaceFiles: widget.onListWorkspaceFiles,
+      onMutateWorkspaceFile: widget.onMutateWorkspaceFile == null
+          ? null
+          : _mutateWorkspaceFile,
+      fileClipboard: _fileClipboard,
       onListWorkspaceBindingDirectories:
           widget.onListWorkspaceBindingDirectories,
       onReadWorkspaceTextFile: widget.onReadWorkspaceTextFile,
@@ -1169,8 +1186,6 @@ class _WorkspacePanelState extends State<WorkspacePanel> {
       ),
       onFinishWebVisit: (tab, response) =>
           _finishWebVisitTab(tab, response, paneIndex: paneIndex),
-      onActivateCurrentTab: () =>
-          _selectWorkspaceTab(tab, paneIndex: paneIndex),
       onCloseCurrentTab: () => _closeWorkspaceTab(tab, paneIndex: paneIndex),
       onOpenWorkspaceCreator: _showCreateWorkspaceDialog,
       onBindWorkspace: _bindWorkspaceFolder,
@@ -1289,14 +1304,12 @@ class _WorkspacePanelState extends State<WorkspacePanel> {
 
   /// Returns a VFS locator whose filesystem is resolved by the selected terminal host.
   String _manualTerminalWorkingDirectory() {
-    if (!widget.hasBoundWorkspace) {
-      return '/app/data';
+    final directory =
+        widget.fileDirectory?.trim() ?? widget.workspacePath?.trim();
+    if (directory == null || directory.isEmpty) {
+      throw StateError('当前对话的文件目录尚未就绪');
     }
-    final workspaceDirectory = widget.workspacePath?.trim();
-    if (workspaceDirectory == null || workspaceDirectory.isEmpty) {
-      throw StateError('工作区路径为空');
-    }
-    return workspaceDirectory;
+    return directory;
   }
 
   String _nextManualTerminalSessionName() {
@@ -1739,6 +1752,72 @@ class _WorkspacePanelState extends State<WorkspacePanel> {
     }
   }
 
+  /// Keeps open documents on their new path and removes previews of deleted files.
+  Future<void> _mutateWorkspaceFile(
+    WorkspaceFileOperation operation,
+    String path,
+    String? destination,
+  ) async {
+    final chatId = widget.currentChatId;
+    bool affected(WorkspaceTab tab) =>
+        (tab.kind == WorkspaceTabKind.filePreview ||
+            tab.kind == WorkspaceTabKind.files) &&
+        (tab.filePath == path || tab.filePath?.startsWith('$path/') == true);
+    if (operation != WorkspaceFileOperation.copy &&
+        [
+          ..._session.tabs,
+          ..._session.secondaryTabs,
+        ].any((tab) => affected(tab) && tab.textDocument?.isSaving == true)) {
+      throw StateError(AppLocalizations.of(context)!.workspaceFileSaving);
+    }
+    await widget.onMutateWorkspaceFile!(operation, path, destination);
+    if (!mounted ||
+        widget.currentChatId != chatId ||
+        operation == WorkspaceFileOperation.copy) {
+      return;
+    }
+    WorkspaceFileEntry? destinationEntry;
+    if (destination != null) {
+      final slash = destination.lastIndexOf('/');
+      try {
+        final siblings = await widget.onListWorkspaceFiles(
+          slash < 0 ? '' : destination.substring(0, slash),
+        );
+        destinationEntry = siblings
+            .where((entry) => entry.relativePath == destination)
+            .firstOrNull;
+      } catch (_) {
+        // The mutation already succeeded. Relative paths still allow reading and
+        // saving if the destination's listing is temporarily unavailable.
+      }
+    }
+    if (!mounted || widget.currentChatId != chatId) return;
+    setState(() {
+      for (var pane = 0; pane < 2; pane++) {
+        final tabs = _tabsForPane(pane);
+        for (var index = tabs.length - 1; index >= 0; index--) {
+          final tab = tabs[index];
+          if (!affected(tab)) continue;
+          if (operation == WorkspaceFileOperation.delete) {
+            final selected = _selectedIndexForPane(pane);
+            tabs.removeAt(index);
+            if (selected >= index) _setSelectedIndexForPane(pane, selected - 1);
+          } else {
+            final suffix = tab.filePath!.substring(path.length);
+            final newPath = '$destination$suffix';
+            tabs[index] = tab.withFileLocation(
+              newPath,
+              destinationEntry == null
+                  ? null
+                  : '${destinationEntry.path}$suffix',
+            );
+          }
+        }
+      }
+      _collapseEmptyPane();
+    });
+  }
+
   /// Opens the file tree for one mounted workspace folder.
   void _openMountedFolder(WorkspaceMountedFolder folder) {
     final relativePath = folder.relativePath.trim();
@@ -1955,24 +2034,6 @@ class _WorkspacePanelState extends State<WorkspacePanel> {
   }
 
   /// Selects a tab after a content widget requests activation.
-  void _selectWorkspaceTab(WorkspaceTab tab, {int paneIndex = 0}) {
-    final tabs = _tabsForPane(paneIndex);
-    final index = tabs.indexOf(tab);
-    if (index < 0) {
-      return;
-    }
-    setState(() {
-      _setSelectedIndexForPane(paneIndex, index);
-    });
-    if (tab.kind == WorkspaceTabKind.browser &&
-        tab.browserSessionId != null &&
-        tab.browserSessionId!.isNotEmpty) {
-      try {
-        _browserViewStore.selectSession(tab.browserSessionId!);
-      } catch (_) {}
-    }
-  }
-
   /// Closes a tab after its content widget requests closure.
   void _closeWorkspaceTab(WorkspaceTab tab, {int paneIndex = 0}) {
     final tabs = _tabsForPane(paneIndex);
@@ -2023,57 +2084,12 @@ class _WorkspacePanelState extends State<WorkspacePanel> {
     await _terminalSessions.closePtySession(sessionId);
   }
 
-  /// Activates an existing file tab without reloading its editable draft.
-  bool _activateOpenFile(String absolutePath) {
-    for (final paneIndex in <int>[0, 1]) {
-      final tabs = _tabsForPane(paneIndex);
-      final index = tabs.indexWhere(
-        (tab) =>
-            tab.kind == WorkspaceTabKind.filePreview &&
-            tab.absolutePath == absolutePath,
-      );
-      if (index >= 0) {
-        _selectWorkspaceTab(tabs[index], paneIndex: paneIndex);
-        return true;
-      }
-    }
-    return false;
-  }
-
-  /// Opens a file once and gives editable formats a persistent document.
-  Future<void> _openFileTab(WorkspaceFileEntry entry) async {
-    if (_activateOpenFile(entry.path)) return;
-    final previewKind = workspacePreviewKindForPath(entry.path);
-    WorkspaceTextDocument? document;
-    // HTML is loaded by the preview server; pre-reading its text duplicates
-    // the core/VFS round trip and allocates an unused copy of the document.
-    if (previewKind == WorkspaceFilePreviewKind.text ||
-        previewKind == WorkspaceFilePreviewKind.markdown) {
-      document = WorkspaceTextDocument(
-        await widget.onReadWorkspaceTextFile(entry.relativePath),
-      );
-    }
-
-    if (!mounted) {
-      return;
-    }
-
-    // Another open request may complete while this file read is pending.
-    if (_activateOpenFile(entry.path)) return;
-    final tab = WorkspaceTab(
-      kind: WorkspaceTabKind.filePreview,
-      title: entry.name,
-      icon: workspacePreviewIconForKind(previewKind),
-      filePath: entry.relativePath,
-      absolutePath: entry.path,
-      textDocument: document,
-      previewKind: previewKind,
-    );
-    setState(() {
-      _session.tabs.add(tab);
-      _session.selectedIndex = _session.tabs.length - 1;
-    });
-  }
+  /// Shares file preview navigation with Markdown links in the chat pane.
+  Future<void> _openFileTab(WorkspaceFileEntry entry) => _session.openFile(
+    path: entry.path,
+    relativePath: entry.relativePath,
+    readText: widget.onReadWorkspaceTextFile,
+  );
 }
 
 enum _WorkspaceDropZone { center, left, right, top, bottom }

@@ -6,9 +6,6 @@ import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 
 import '../../../../l10n/generated/app_localizations.dart';
-import '../../../../core/proxy/generated/CoreProxyModels.g.dart'
-    show ChatMessageDisplayMode;
-import '../../../common/ChatMessageIdentity.dart';
 import '../viewmodel/ChatViewModel.dart';
 import 'ChatScrollRailGeometry.dart';
 import 'ChatMessageLocatorContent.dart';
@@ -109,16 +106,16 @@ class _ChatScrollNavigatorState extends State<ChatScrollNavigator> {
   List<ChatMessageLocatorPreview> _locatorEntries =
       const <ChatMessageLocatorPreview>[];
 
-  late List<ChatMessageLocatorPreview> _visibleEntries;
+  bool _locatorLoadFailed = false;
   int? _hoveredEntryIndex;
+  double _hoveredEntryCenter = 0;
   int _locatorLoadGeneration = 0;
 
-  /// Loads history previews once instead of generating them on pointer motion.
+  /// Loads global index metadata and bounded previews through the dedicated index API.
   @override
   void initState() {
     super.initState();
     widget.messageNavigation?.addListener(_onMessageNavigation);
-    _visibleEntries = _fallbackEntriesFromMessages();
     _loadLocatorEntries();
   }
 
@@ -136,9 +133,6 @@ class _ChatScrollNavigatorState extends State<ChatScrollNavigator> {
     final favoritesChanged =
         !identical(oldWidget.messages, widget.messages) &&
         _favoritesChanged(oldWidget.messages, widget.messages);
-    if (!identical(oldWidget.messages, widget.messages)) {
-      _visibleEntries = _fallbackEntriesFromMessages();
-    }
     final messagesChanged =
         oldWidget.messages.length != widget.messages.length ||
         oldWidget.messages.firstOrNull?.timestamp !=
@@ -159,18 +153,18 @@ class _ChatScrollNavigatorState extends State<ChatScrollNavigator> {
   /// Builds an isolated paint-driven rail and a preview only for the selected row.
   @override
   Widget build(BuildContext context) {
-    if (widget.messages.isEmpty ||
-        widget.viewportHeight <= 60.0 ||
-        !widget.viewportHeight.isFinite) {
+    if (widget.viewportHeight <= 60.0 || !widget.viewportHeight.isFinite) {
       return const SizedBox.shrink();
     }
 
     final entries = _getEntries();
     final activeTimestamp = _resolveActiveTimestamp();
-    final geometry = ChatScrollRailGeometry(
-      entryCount: entries.length,
-      viewportHeight: widget.viewportHeight,
-    );
+    final geometry = entries.isEmpty
+        ? null
+        : ChatScrollRailGeometry(
+            entryCount: entries.length,
+            viewportHeight: widget.viewportHeight,
+          );
     final hoveredIndex = _hoveredEntryIndex;
 
     return LayoutBuilder(
@@ -184,30 +178,49 @@ class _ChatScrollNavigatorState extends State<ChatScrollNavigator> {
         );
         return Stack(
           children: <Widget>[
-            Positioned(
-              right: 0,
-              top: 0,
-              bottom: 0,
-              width: ChatScrollRailGeometry.interactionWidth,
-              child: _MessageTickRail(
-                entries: entries,
-                activeTimestamp: activeTimestamp,
-                geometry: geometry,
-                onHoverEntry: (index) {
-                  if (_hoveredEntryIndex == index) return;
-                  setState(() {
-                    _hoveredEntryIndex = index;
-                  });
-                },
-                onTapTick: _handleJumpToMessage,
+            if (_locatorLoadFailed)
+              Positioned(
+                right: 0,
+                top: 16,
+                child: IconButton(
+                  key: const ValueKey('chat-message-index-retry'),
+                  tooltip: AppLocalizations.of(
+                    context,
+                  )!.messageLocatorLoadFailed,
+                  onPressed: _loadLocatorEntries,
+                  icon: const Icon(Icons.refresh_rounded),
+                ),
               ),
-            ),
+            if (geometry != null)
+              Positioned(
+                right: 0,
+                top: 0,
+                bottom: 0,
+                width: ChatScrollRailGeometry.interactionWidth,
+                child: _MessageTickRail(
+                  key: ValueKey(widget.currentChatId),
+                  entries: entries,
+                  activeTimestamp: activeTimestamp,
+                  geometry: geometry,
+                  onHoverEntry: (index, center) {
+                    if (_hoveredEntryIndex == index &&
+                        _hoveredEntryCenter == center) {
+                      return;
+                    }
+                    setState(() {
+                      _hoveredEntryIndex = index;
+                      _hoveredEntryCenter = center;
+                    });
+                  },
+                  onTapTick: _handleJumpToMessage,
+                ),
+              ),
             if (hoveredIndex != null &&
                 hoveredIndex < entries.length &&
                 previewWidth > 0)
               Positioned(
                 right: ChatScrollRailGeometry.interactionWidth + 8,
-                top: (geometry.entryCenter(hoveredIndex) - 32).clamp(
+                top: (_hoveredEntryCenter - 32).clamp(
                   8.0,
                   math.max(8.0, widget.viewportHeight - 112),
                 ),
@@ -271,31 +284,7 @@ class _ChatScrollNavigatorState extends State<ChatScrollNavigator> {
 
   /// Returns the current cached history preview collection.
   List<ChatMessageLocatorPreview> _getEntries() {
-    return _locatorEntries.isNotEmpty ? _locatorEntries : _visibleEntries;
-  }
-
-  /// Projects the loaded transcript into locator previews once per message update.
-  List<ChatMessageLocatorPreview> _fallbackEntriesFromMessages() {
-    return widget.messages.indexed
-        .map<ChatMessageLocatorPreview>((item) {
-          final idx = item.$1;
-          final msg = item.$2;
-          final text = msg.displayText;
-          return ChatMessageLocatorPreview(
-            messageIndex: idx,
-            timestamp: msg.timestamp,
-            sender: msg.sender,
-            displayName: readChatMessageIdentity(msg)?.title.trim() ?? '',
-            previewContent: text,
-            contentLength: text.length,
-            displayMode:
-                msg.displayMode == ChatMessageDisplayMode.hiddenPlaceholder
-                ? 'HIDDEN_PLACEHOLDER'
-                : 'NORMAL',
-            isFavorite: msg.isFavorite,
-          );
-        })
-        .toList(growable: false);
+    return _locatorEntries;
   }
 
   /// Routes a confirmed tap to its visible row or its history timestamp.
@@ -337,36 +326,40 @@ class _ChatScrollNavigatorState extends State<ChatScrollNavigator> {
     super.dispose();
   }
 
-  /// Rejects stale preview loads after a chat or history window changes.
+  /// Reads the complete lightweight index and rejects responses from superseded chats.
   Future<void> _loadLocatorEntries() async {
     final generation = ++_locatorLoadGeneration;
     final chatId = widget.currentChatId;
     if (chatId == null || chatId.trim().isEmpty) {
       setState(() {
         _locatorEntries = const <ChatMessageLocatorPreview>[];
+        _locatorLoadFailed = false;
       });
       return;
     }
-    List<ChatMessageLocatorPreview> entries;
+    setState(() => _locatorLoadFailed = false);
     try {
-      entries = await widget.loadLocatorEntries(chatId, '');
+      final entries = await widget.loadLocatorEntries(chatId, '');
+      if (!mounted || generation != _locatorLoadGeneration) return;
+      setState(() {
+        _locatorEntries = entries;
+        _hoveredEntryIndex = null;
+      });
     } catch (_) {
-      // The transcript remains navigable while history is unavailable.
-      return;
+      if (!mounted || generation != _locatorLoadGeneration) return;
+      setState(() {
+        _locatorEntries = const <ChatMessageLocatorPreview>[];
+        _hoveredEntryIndex = null;
+        _locatorLoadFailed = true;
+      });
     }
-    if (!mounted || generation != _locatorLoadGeneration) {
-      return;
-    }
-    setState(() {
-      _locatorEntries = entries;
-      _hoveredEntryIndex = null;
-    });
   }
 }
 
 class _MessageTickRail extends StatefulWidget {
-  /// Creates a paint-only rail with a separate, finger-sized gesture strip.
+  /// Creates a painted rail with a separate, finger-sized scrolling strip.
   const _MessageTickRail({
+    super.key,
     required this.entries,
     required this.activeTimestamp,
     required this.geometry,
@@ -377,7 +370,7 @@ class _MessageTickRail extends StatefulWidget {
   final List<ChatMessageLocatorPreview> entries;
   final int? activeTimestamp;
   final ChatScrollRailGeometry geometry;
-  final ValueChanged<int?> onHoverEntry;
+  final void Function(int? index, double center) onHoverEntry;
   final ValueChanged<int> onTapTick;
 
   /// Keeps pointer motion and animation outside the transcript widget tree.
@@ -388,6 +381,11 @@ class _MessageTickRail extends StatefulWidget {
 class _MessageTickRailState extends State<_MessageTickRail>
     with SingleTickerProviderStateMixin {
   final _pointer = ValueNotifier<Offset>(Offset.zero);
+  final _scroll = ScrollController();
+  bool _scrolling = false;
+  bool _selecting = false;
+
+  double get _scrollOffset => _scroll.hasClients ? _scroll.offset : 0;
   late final AnimationController _proximity;
   late final Listenable _paintSignal;
   late List<_RailTick> _ticks;
@@ -397,16 +395,21 @@ class _MessageTickRailState extends State<_MessageTickRail>
   double _targetProximity = 0;
   bool _disableAnimations = false;
 
-  /// Allocates one animation and caches visual buckets for the whole history.
+  /// Shares repaint signals for pointer movement, animation, and rail scrolling.
   @override
   void initState() {
     super.initState();
     _proximity = AnimationController(vsync: this);
-    _paintSignal = Listenable.merge(<Listenable>[_pointer, _proximity]);
+    _paintSignal = Listenable.merge(<Listenable>[
+      _pointer,
+      _proximity,
+      _scroll,
+    ]);
     _rebuildTicks();
+    _revealActiveAfterLayout();
   }
 
-  /// Re-buckets only when history or viewport geometry actually changes.
+  /// Refreshes metadata and follows the current message when navigation changes.
   @override
   void didUpdateWidget(covariant _MessageTickRail oldWidget) {
     super.didUpdateWidget(oldWidget);
@@ -415,34 +418,56 @@ class _MessageTickRailState extends State<_MessageTickRail>
       _rebuildTicks();
       _previewIndex = null;
     }
+    if (oldWidget.activeTimestamp != widget.activeTimestamp ||
+        oldWidget.entries.length != widget.entries.length ||
+        oldWidget.geometry.viewportHeight != widget.geometry.viewportHeight) {
+      _revealActiveAfterLayout();
+    }
+  }
+
+  /// Follows transcript navigation while preserving manual browsing of the rail.
+  void _revealActiveAfterLayout() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted ||
+          !_scroll.hasClients ||
+          _touchPointer != null ||
+          _scrolling) {
+        return;
+      }
+      final index = _entryIndices[widget.activeTimestamp];
+      if (index == null) return;
+      final geometry = widget.geometry;
+      final center = (index + 0.5) * ChatScrollRailGeometry.tickSpacing;
+      final offset = _scroll.offset;
+      if (center < offset || center > offset + geometry.height) {
+        _scroll.jumpTo(
+          (center - geometry.height / 2).clamp(0.0, geometry.maxScrollOffset),
+        );
+        _clearPointer();
+      }
+    });
   }
 
   /// Releases the single repaint animation and pointer notifier.
   @override
   void dispose() {
+    _scroll.dispose();
     _proximity.dispose();
     _pointer.dispose();
     super.dispose();
   }
 
-  /// Preserves active and favorite markers when many messages share one tick.
+  /// Caches message metadata; painting visits only the visible slice.
   void _rebuildTicks() {
-    final geometry = widget.geometry;
     _entryIndices = <int, int>{
       for (final entry in widget.entries.indexed) entry.$2.timestamp: entry.$1,
     };
-    _ticks = List<_RailTick>.generate(geometry.tickCount, (index) {
-      final start = geometry.bucketStart(index);
-      final end = geometry.bucketEnd(index);
-      var favorite = false;
-      for (var entry = start; entry < end; entry++) {
-        favorite |= widget.entries[entry].isFavorite;
-      }
+    _ticks = List<_RailTick>.generate(widget.entries.length, (index) {
+      final entry = widget.entries[index];
       return _RailTick(
-        start: start,
-        end: end,
-        isUser: widget.entries[(start + end - 1) ~/ 2].sender == 'user',
-        isFavorite: favorite,
+        index: index,
+        isUser: entry.sender == 'user',
+        isFavorite: entry.isFavorite,
       );
     }, growable: false);
   }
@@ -469,6 +494,7 @@ class _MessageTickRailState extends State<_MessageTickRail>
   void _updatePointer(Offset position) {
     final geometry = widget.geometry;
     _pointer.value = position;
+    if (_scrolling && !_selecting) return;
     final insideHeight =
         position.dy >= geometry.hitTop &&
         position.dy <= geometry.hitTop + geometry.hitHeight;
@@ -479,11 +505,16 @@ class _MessageTickRailState extends State<_MessageTickRail>
                 ChatScrollRailGeometry.interactionWidth -
                     ChatScrollRailGeometry.hitWidth &&
             position.dx <= ChatScrollRailGeometry.interactionWidth
-        ? geometry.entryIndexAt(position.dy)
+        ? geometry.entryIndexAt(position.dy, scrollOffset: _scrollOffset)
         : null;
     if (index != _previewIndex) {
       _previewIndex = index;
-      widget.onHoverEntry(index);
+      widget.onHoverEntry(
+        index,
+        index == null
+            ? 0
+            : geometry.entryCenter(index, scrollOffset: _scrollOffset),
+      );
     }
   }
 
@@ -492,7 +523,7 @@ class _MessageTickRailState extends State<_MessageTickRail>
     _animateProximity(0);
     if (_previewIndex != null) {
       _previewIndex = null;
-      widget.onHoverEntry(null);
+      widget.onHoverEntry(null, 0);
     }
   }
 
@@ -519,6 +550,15 @@ class _MessageTickRailState extends State<_MessageTickRail>
     if (event.pointer != _touchPointer) return;
     _touchPointer = null;
     _clearPointer();
+  }
+
+  /// Commits a deliberate tap or long-press selection using the scrolled geometry.
+  void _jumpAt(double localY) {
+    final index = widget.geometry.entryIndexAt(
+      localY + widget.geometry.hitTop,
+      scrollOffset: _scrollOffset,
+    );
+    widget.onTapTick(widget.entries[index].timestamp);
   }
 
   /// Observes proximity without consuming transcript gestures outside the hit strip.
@@ -552,6 +592,7 @@ class _MessageTickRailState extends State<_MessageTickRail>
                       ticks: _ticks,
                       activeIndex: _entryIndices[widget.activeTimestamp],
                       geometry: geometry,
+                      scroll: _scroll,
                       pointer: _pointer,
                       proximity: _proximity,
                       primary: colors.primary,
@@ -573,14 +614,66 @@ class _MessageTickRailState extends State<_MessageTickRail>
                 child: GestureDetector(
                   key: const ValueKey<String>('chat-scroll-rail-hit-target'),
                   behavior: HitTestBehavior.opaque,
-                  onTapUp: (details) {
-                    final index = geometry.entryIndexAt(
-                      details.localPosition.dy + geometry.hitTop,
+                  onTapUp: (details) => _jumpAt(details.localPosition.dy),
+                  onLongPressStart: (details) {
+                    _selecting = true;
+                    _updatePointer(
+                      Offset(
+                        ChatScrollRailGeometry.interactionWidth -
+                            ChatScrollRailGeometry.hitWidth +
+                            details.localPosition.dx,
+                        details.localPosition.dy + geometry.hitTop,
+                      ),
                     );
-                    widget.onTapTick(widget.entries[index].timestamp);
                   },
-                  // This strip owns scrubbing; raw motion only updates the preview.
-                  onVerticalDragStart: (_) {},
+                  onLongPressMoveUpdate: (details) => _updatePointer(
+                    Offset(
+                      ChatScrollRailGeometry.interactionWidth -
+                          ChatScrollRailGeometry.hitWidth +
+                          details.localPosition.dx,
+                      details.localPosition.dy + geometry.hitTop,
+                    ),
+                  ),
+                  onLongPressEnd: (details) {
+                    _selecting = false;
+                    if (details.localPosition.dy >= 0 &&
+                        details.localPosition.dy <= geometry.hitHeight &&
+                        details.localPosition.dx >= 0 &&
+                        details.localPosition.dx <=
+                            ChatScrollRailGeometry.hitWidth) {
+                      _jumpAt(details.localPosition.dy);
+                    }
+                    _clearPointer();
+                  },
+                  onLongPressCancel: () {
+                    _selecting = false;
+                    _clearPointer();
+                  },
+                  child: NotificationListener<ScrollNotification>(
+                    onNotification: (notification) {
+                      if (notification is ScrollStartNotification) {
+                        _scrolling = true;
+                        _clearPointer();
+                      } else if (notification is ScrollEndNotification) {
+                        _scrolling = false;
+                      }
+                      return true;
+                    },
+                    child: ScrollConfiguration(
+                      behavior: ScrollConfiguration.of(
+                        context,
+                      ).copyWith(scrollbars: false, overscroll: false),
+                      child: SingleChildScrollView(
+                        controller: _scroll,
+                        primary: false,
+                        physics: const ClampingScrollPhysics(),
+                        child: SizedBox(
+                          height: geometry.hitHeight + geometry.maxScrollOffset,
+                          width: ChatScrollRailGeometry.hitWidth,
+                        ),
+                      ),
+                    ),
+                  ),
                 ),
               ),
             ),
@@ -591,23 +684,20 @@ class _MessageTickRailState extends State<_MessageTickRail>
   }
 }
 
-/// Describes one visual tick bucket without allocating a widget per message.
+/// Describes a message tick without allocating a widget per message.
 class _RailTick {
-  /// Records the history interval and markers represented by a painted tick.
+  /// Records one message's position and markers.
   const _RailTick({
-    required this.start,
-    required this.end,
+    required this.index,
     required this.isUser,
     required this.isFavorite,
   });
 
-  final int start;
-  final int end;
+  final int index;
   final bool isUser;
   final bool isFavorite;
 
-  /// Tests whether the active or previewed message belongs to this visual bucket.
-  bool contains(int? index) => index != null && index >= start && index < end;
+  bool contains(int? other) => index == other;
 }
 
 /// Draws the entire proximity wave in one bounded, independently repainted layer.
@@ -618,6 +708,7 @@ class _MessageTickPainter extends CustomPainter {
     required this.activeIndex,
     required this.geometry,
     required this.pointer,
+    required this.scroll,
     required this.proximity,
     required this.primary,
     required this.foreground,
@@ -627,6 +718,7 @@ class _MessageTickPainter extends CustomPainter {
   final List<_RailTick> ticks;
   final int? activeIndex;
   final ChatScrollRailGeometry geometry;
+  final ScrollController scroll;
   final ValueNotifier<Offset> pointer;
   final Animation<double> proximity;
   final Color primary;
@@ -636,18 +728,30 @@ class _MessageTickPainter extends CustomPainter {
   @override
   void paint(Canvas canvas, Size size) {
     final position = pointer.value;
+    final scrollOffset = scroll.hasClients ? scroll.offset : 0.0;
     final strength = proximity.value;
     final hoveredIndex = strength > 0.01
-        ? geometry.entryIndexAt(position.dy)
+        ? geometry.entryIndexAt(position.dy, scrollOffset: scrollOffset)
         : null;
     final right = size.width - ChatScrollRailGeometry.rightInset;
     final line = Paint();
     final favorite = Paint()..color = Colors.amber;
-    for (var index = 0; index < ticks.length; index++) {
+    canvas.save();
+    canvas.clipRect(
+      Rect.fromLTWH(0, geometry.top, size.width, geometry.height),
+    );
+    final first = (scrollOffset / ChatScrollRailGeometry.tickSpacing)
+        .floor()
+        .clamp(0, ticks.length);
+    final end =
+        ((scrollOffset + geometry.height) / ChatScrollRailGeometry.tickSpacing)
+            .ceil()
+            .clamp(0, ticks.length);
+    for (var index = first; index < end; index++) {
       final tick = ticks[index];
       final current = tick.contains(activeIndex);
       final hovered = tick.contains(hoveredIndex);
-      final y = geometry.tickCenter(index);
+      final y = geometry.entryCenter(index, scrollOffset: scrollOffset);
       final restingWidth = current ? 15.0 : (tick.isUser ? 10.0 : 6.5);
       final width = geometry.tickWidth(
         restingWidth: restingWidth,
@@ -670,6 +774,7 @@ class _MessageTickPainter extends CustomPainter {
         canvas.drawCircle(Offset(right + 4, y), 1.2, favorite);
       }
     }
+    canvas.restore();
   }
 
   /// Lets the proximity observation area pass gestures through to the transcript.

@@ -1,35 +1,62 @@
-/**
- * Installs the existing v1 dispatch family over the conditional runtime script package.
- * @param {Record<string, any>} runtime
- */
+/** Installs the v1 compatibility surface as an SDK-internal adapter. @param {Record<string, any>} runtime */
 function __operitInstallV1Runtime(runtime) {
     var api = runtime.__operitToolPkgApi;
     var canonical = runtime.__operitCanonicalTools;
     var originalToolCall = runtime.toolCall;
+    var internal = runtime.__operitV1InternalRuntime;
+    if (!internal) throw new Error('Internal V1 runtime implementation is unavailable');
+    runtime.__operitV1CanonicalTools = canonical;
     var routes = Object.freeze({
-        'super_admin:terminal': 'v1_runtime:terminal',
-        'code_runner:run_javascript_node': 'v1_runtime:run_javascript_node',
-        'ffmpeg:ffmpeg_execute': 'v1_runtime:ffmpeg_execute',
-        'ffmpeg:ffmpeg_info': 'v1_runtime:ffmpeg_info',
+        'super_admin:terminal': 'terminal',
+        'code_runner:run_javascript_node': 'run_javascript_node',
+        'ffmpeg:ffmpeg_execute': 'ffmpeg_execute',
+        'ffmpeg:ffmpeg_info': 'ffmpeg_info',
     });
 
-    /** Decodes the script-package executor's JSON text without hiding provider failures.
-     * @param {unknown} value
-     * @returns {any}
-     */
-    function decoded(value) {
-        if (typeof value !== 'string') throw new TypeError('V1 runtime package must return serialized JSON');
-        return JSON.parse(value);
-    }
-
-    /** Calls one exact runtime tool through the original structured host transport.
+    /** Calls the internal implementation without publishing a package tool identity.
      * @param {string} method
      * @param {Record<string, any>} params
-     * @returns {Promise<any>}
      */
     function invoke(method, params) {
-        return originalToolCall('v1_runtime:' + method, params).then(decoded);
+        var implementation = internal[method];
+        if (typeof implementation !== 'function') throw new Error('Unknown internal V1 runtime method: ' + method);
+        return Promise.resolve().then(function() { return implementation(params || {}); });
     }
+
+    /** @type {typeof import('../../../../../../../plugins/types-v1/ffmpeg').FFmpeg} */
+    var ffmpeg = {
+        /** Executes legacy arguments through the VFS-aware runtime bridge. */
+        execute(command) { return invoke('ffmpeg_execute', { command: command }); },
+        /** Returns the selected runtime's installed FFmpeg version. */
+        info() { return invoke('ffmpeg_info', {}); },
+        /** Quotes file operands and translates the documented conversion options. */
+        convert(inputPath, outputPath, options) {
+            /** Quotes one shell argument without interpreting its contents. @param {string} value */
+            function quote(value) { return "'" + String(value).replace(/'/g, "'\\''") + "'"; }
+            var command = '-y -i ' + quote(inputPath);
+            var flags = { video_codec: '-c:v', audio_codec: '-c:a', resolution: '-s', bitrate: '-b:v' };
+            if (options) {
+                for (var key of Object.keys(flags)) {
+                    var value = options[/** @type {keyof typeof options} */ (key)];
+                    if (value !== undefined) command += ' ' + flags[/** @type {keyof typeof flags} */ (key)] + ' ' + quote(value);
+                }
+            }
+            return invoke('ffmpeg_execute', { command: command + ' ' + quote(outputPath) });
+        },
+    };
+    /** @type {Record<string, Function>} */
+    var legacyFfmpeg = {};
+    for (var [ffmpegMethod, implementation] of Object.entries(ffmpeg)) {
+        legacyFfmpeg[ffmpegMethod] = api.method().between('1.0.0', '2.0.0', implementation).build('Tools.FFmpeg.' + ffmpegMethod);
+    }
+    Object.defineProperty(runtime.Tools, 'FFmpeg', {
+        configurable: true,
+        /** Exposes the historical namespace only to admitted v1 calls. */
+        get: function() {
+            var version = api.currentVersion();
+            return version === '1.0.0' || version === '1.0.1' ? legacyFfmpeg : undefined;
+        },
+    });
 
     // Both legacy file calls and shell commands use this existing managed filesystem.
     var cacheImports = new Map();
@@ -48,7 +75,7 @@ function __operitInstallV1Runtime(runtime) {
         var directory = owner + '-' + (hash >>> 0).toString(16);
         var escaped = owner.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
         return {
-            source: '/app/data/cache/toolpkg/' + directory,
+            source: '/operitapp/data/cache/toolpkg/' + directory,
             destination: '/tmp/operit-v1/toolpkg/' + directory,
             pattern: new RegExp('/data/(?:user/0|data)/com\\.ai\\.assistance\\.operit/files/toolpkg_cache/' +
                 escaped + '-(?:\\*|[a-fA-F0-9]+)(?=/|$|[\\s\\x22\\x27;|&<>)])', 'g')
@@ -136,18 +163,15 @@ function __operitInstallV1Runtime(runtime) {
         }
         if (type === 'default' && Object.prototype.hasOwnProperty.call(routes, name)) {
             var target = routes[/** @type {keyof typeof routes} */ (name)];
-            if (args[0] !== null && typeof args[0] === 'object') rewritten[0] = Object.assign({}, args[0], { name: target });
-            else rewritten[index] = target;
+            var objectCall = args[0] !== null && typeof args[0] === 'object';
+            var parameters = objectCall ? (args[0].params || {}) : (args[index + 1] || {});
             if (name === 'super_admin:terminal') {
-                var objectCall = args[0] !== null && typeof args[0] === 'object';
-                var parameters = objectCall ? args[0].params : args[index + 1];
                 if (parameters && typeof parameters.command === 'string') {
                     var mapped = Object.assign({}, parameters, { command: await cachePath(parameters.command) });
-                    if (objectCall) rewritten[0].params = mapped;
-                    else rewritten[index + 1] = mapped;
+                    parameters = mapped;
                 }
             }
-            return originalToolCall.apply(runtime, rewritten).then(decoded);
+            return invoke(target, parameters);
         }
         return originalToolCall.apply(runtime, args);
     }
@@ -158,6 +182,61 @@ function __operitInstallV1Runtime(runtime) {
 
     var terminal = canonical.System.terminal;
     var currentTerminal = runtime.Tools.System.terminal;
+    // One-shot Android commands must bypass the v1 Linux terminal and its path rewrites.
+    var shellSequence = 0;
+    var shellScope = Date.now().toString(36) + '_' + Math.random().toString(36).slice(2);
+    /** Executes with the host's existing Android privilege policy and returns the v1 ADB receipt.
+     * @param {string} command
+     * @returns {Promise<import('../../../../../../../plugins/types-v1/results').ADBResultData>}
+     */
+    async function androidShell(command) {
+        if (typeof command !== 'string' || !command.trim() || command.includes('\0')) {
+            throw new TypeError('Tools.System.shell requires a nonblank command without NUL');
+        }
+        var callState = runtime.__operitGetCallState(runtime.__operitCurrentCallId);
+        if (!callState || !callState.params || callState.params.__operit_package_state !== 'android') {
+            throw new Error('Tools.System.shell requires Android');
+        }
+        // Each invocation owns its session, including concurrent callers and timeout cleanup.
+        var session = await terminal.create('v1_android_shell_' + shellScope + '_' + (++shellSequence), 'shell');
+        var failed = false;
+        try {
+            var result = await terminal.exec(session.sessionId, command, 20000);
+            if (result.timedOut) throw new Error('Android shell timed out: ' + result.output);
+            if (result.exitCode !== 0) {
+                throw new Error('Android shell exited with code ' + result.exitCode + ': ' + result.output);
+            }
+            return {
+                command: result.command,
+                output: result.output,
+                exitCode: result.exitCode,
+                /** Preserves useful string conversion alongside the structured legacy fields.
+                 * @this {import('../../../../../../../plugins/types-v1/results').ADBResultData}
+                 */
+                toString: function() { return this.output; },
+            };
+        } catch (error) {
+            failed = true;
+            throw error;
+        } finally {
+            try {
+                var closed = await terminal.close(session.sessionId);
+                if (!closed.success) throw new Error('Android shell cleanup failed: ' + closed.message);
+            } catch (error) {
+                // Keep the command's failure visible if cleanup fails as well.
+                if (!failed) throw error;
+            }
+        }
+    }
+    var legacyShell = api.method().between('1.0.0', '2.0.0', androidShell).build('Tools.System.shell');
+    Object.defineProperty(runtime.Tools.System, 'shell', {
+        configurable: true,
+        /** Keeps the supplemental legacy entry point out of the v2 API. */
+        get: function() {
+            var version = api.currentVersion();
+            return version === '1.0.0' || version === '1.0.1' ? legacyShell : undefined;
+        },
+    });
     currentTerminal.create = api.method()
         .between('1.0.0', '2.0.0',
             /** Creates a legacy session using the package state selected by Rust.
@@ -198,14 +277,14 @@ function __operitInstallV1Runtime(runtime) {
      * @param {unknown} path
      * @returns {path is string}
      */
-    function isLinux(path) { return typeof path === 'string' && (path === '/mnt/linux' || path.startsWith('/mnt/linux/')); }
+    function isLinux(path) { return typeof path === 'string' && (path === '/virtual/linux' || path.startsWith('/virtual/linux/') || path === '/mnt/linux' || path.startsWith('/mnt/linux/')); }
 
     /** Converts one explicit Linux VFS address into the selected runtime's absolute path.
      * @param {string} path
      */
     function linuxPath(path) {
         if (!isLinux(path)) throw new Error('V1 runtime file operation requires a Linux VFS address');
-        var suffix = path.slice('/mnt/linux'.length);
+        var suffix = path.slice(path.startsWith('/virtual/linux') ? '/virtual/linux'.length : '/mnt/linux'.length);
         return suffix === '' ? '/' : suffix;
     }
 
@@ -216,7 +295,7 @@ function __operitInstallV1Runtime(runtime) {
      */
     async function file(operation, args) {
         var value = await invoke('file', { operation: operation, args: args });
-        value.path = '/mnt/linux' + (value.path === '/' ? '' : value.path);
+        value.path = '/virtual/linux' + (value.path === '/' ? '' : value.path);
         // The managed runtime returns a flat receipt; the canonical text-write contract wraps it.
         if (operation === 'write') return { operation: value, aiDiffInstructions: '' };
         return value;
@@ -235,12 +314,12 @@ function __operitInstallV1Runtime(runtime) {
                 var originalPath = path;
                 var mappedPath = await cachePath(path);
                 if (mappedPath !== path) {
-                    path = '/mnt/linux' + mappedPath;
+                    path = '/virtual/linux' + mappedPath;
                     args[0] = typeof args[0] === 'object' ? Object.assign({}, args[0], { path: path }) : path;
                 }
                 if (['move', 'copy', 'unzip'].includes(name)) {
                     var mappedDestination = await cachePath(args[1]);
-                    if (mappedDestination !== args[1]) args[1] = '/mnt/linux' + mappedDestination;
+                    if (mappedDestination !== args[1]) args[1] = '/virtual/linux' + mappedDestination;
                 }
                 var sourceLinux = isLinux(path);
                 var hasDestination = name === 'move' || name === 'copy' || name === 'unzip';

@@ -12,6 +12,7 @@ use std::sync::Mutex;
 #[path = "space_join_projection.rs"]
 mod projection;
 use projection::{ConsentProjection, JoinReply, MembershipReceipt};
+use super::space_projection::callPeerSpace;
 
 // Group consent uses its own durable schema; single-device approval records are not group approvals.
 pub(crate) const INBOUND: &str = RUNTIME_SPACE_MERGE_INBOUND_PATH;
@@ -93,6 +94,7 @@ fn expire(request: &mut SpaceJoinRequest, targetSpaceId: &str, now: i64, spaceId
     }
 }
 /// Loads one owned application record without carrying its snapshots in caller stack frames.
+#[inline(never)]
 fn load(service: &dyn NodeSpaceContext, path: &str, id: &str) -> Result<Box<Record>, String> {
     let encoded: Box<serde_json::value::RawValue> = store(service).record(path, id)?.ok_or("Join request not found")?;
     let record: Record<Box<serde_json::value::RawValue>> = serde_json::from_str(encoded.get()).map_err(|error| error.to_string())?;
@@ -181,7 +183,8 @@ fn paired(service: &dyn NodeSpaceContext, peer: &str, direction: crate::NodeServ
 /// Applicant-to-gateway adds one identical hop to every candidate. Never use RTT
 /// as an unannounced replacement for hop count; ties use stable device identity.
 fn hopDistances(source: &str, edges: &[CoreSpaceDeviceConnection], transit: &BTreeSet<String>) -> BTreeMap<String, u32> {
-    let mut distances = BTreeMap::from([(source.to_owned(), 0)]);
+    let mut distances = BTreeMap::new();
+    distances.insert(source.to_owned(), 0);
     let mut queue = VecDeque::from([source.to_owned()]);
     while let Some(node) = queue.pop_front() {
         if node != source && !transit.contains(&node) { continue; }
@@ -226,6 +229,7 @@ pub(crate) fn assign(service: &dyn NodeSpaceContext, record: &mut Record, now: i
 }
 
 /// Updates a reviewer lease without materializing applicant profiles or policy evidence.
+#[inline(never)]
 fn assignReviewer(service: &dyn NodeSpaceContext, request: &mut SpaceJoinRequest,
     unavailableSince: &mut Option<i64>, committed: bool, now: i64) -> Result<(), String> {
     if !matches!(request.status, SpaceJoinStatus::Pending | SpaceJoinStatus::Approving) || committed { return Ok(()); }
@@ -279,6 +283,7 @@ fn assignReviewer(service: &dyn NodeSpaceContext, request: &mut SpaceJoinRequest
 /// policy but the reviewer crashed between applying the operation and writing
 /// the result record. Membership already exists in the replayed policy; this
 /// only rebuilds the projection and the applicant-facing receipt.
+#[inline(never)]
 fn recoverCommittedApproval(service: &dyn NodeSpaceContext, record: &mut Record, current: &CoreSpace) -> Result<(), String> {
     if record.request.status != SpaceJoinStatus::Approving || record.approvedDecision != Some(true) { return Ok(()); }
     if !admissionCommitted(service, record)? { return Ok(()); }
@@ -305,6 +310,7 @@ fn recoverCommittedApproval(service: &dyn NodeSpaceContext, record: &mut Record,
     Ok(())
 }
 /// Reconciles expiry, committed admission and reviewer ownership.
+#[inline(never)]
 pub(crate) fn reconcile(service: &dyn NodeSpaceContext, record: &mut Record) -> Result<(), String> {
     let now = currentTimeMillis();
     let current = service.spaceStore().initialize()?;
@@ -563,7 +569,8 @@ async fn prepareRequest(service: &dyn NodeSpaceContext, deviceId: String) -> Res
         let snapshot: PeerSpaceSnapshot = Box::pin(joinSnapshot(service, &deviceId)).await?;
         if !snapshot.space.members.contains(&deviceId) { return Err("Target is not in its advertised Space".into()); }
         space_departure::observe(service, &deviceId, &snapshot.departures, &snapshot.controlOperations)?;
-        let source = peerSpaceSnapshot(service)?;
+        let mut source = peerSpaceSnapshot(service)?;
+        source.departures = space_departure::pending(service, &deviceId)?;
         let local = source.space.clone();
         let localId = service.localNodeId();
         // One shared space identity is never joinable: either both sides already
@@ -606,6 +613,15 @@ async fn prepareRequest(service: &dyn NodeSpaceContext, deviceId: String) -> Res
 
 /// Persists the immutable consent source and releases both snapshots before the network response phase.
 fn prepareSubmission(service: &dyn NodeSpaceContext, deviceId: String, source: PeerSpaceSnapshot, snapshot: PeerSpaceSnapshot) -> Result<String, String> {
+    let _lock = MUTATION.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    paired(service, &deviceId, crate::NodeServices::PairingDirection::Either)?;
+    let current = service.spaceStore().space()?;
+    if current.spaceId != source.space.spaceId || current.spaceRevision != source.space.spaceRevision {
+        return Err("Source Space changed while preparing the join request".into());
+    }
+    if let Some(existing) = outgoing(service)?.into_iter().find(|request| request.targetDeviceId == deviceId && active(&request.status)) {
+        return Ok(existing.requestId);
+    }
     let localId = service.localNodeId();
     let local = &source.space;
     let profile = source.deviceProfiles.iter().find(|p| p.nodeId == localId)
@@ -797,6 +813,8 @@ fn receiveStatus(service: &dyn NodeSpaceContext, peer: &str, current: &CoreSpace
 }
 
 /// Applies a typed command and releases evidence before constructing its reply.
+// Keep validation, policy replay and evidence decoding out of the same device stack frame.
+#[inline(never)]
 fn receiveCommand(service: &dyn NodeSpaceContext, peer: &str, current: &CoreSpace, input: Box<Submission>,
     cancellation: bool) -> Result<ConsentProjection, String> {
     let mut record = receiveSubmission(service, peer, current, input, cancellation)?;
@@ -821,6 +839,7 @@ fn receiveCommand(service: &dyn NodeSpaceContext, peer: &str, current: &CoreSpac
 }
 
 /// Validates immutable applicant evidence while retaining only headers for unrelated requests.
+#[inline(never)]
 fn receiveSubmission(service: &dyn NodeSpaceContext, peer: &str, current: &CoreSpace,
     input: Box<Submission>, cancellation: bool) -> Result<Box<Record>, String> {
     if !cancellation {
@@ -839,7 +858,7 @@ fn receiveSubmission(service: &dyn NodeSpaceContext, peer: &str, current: &CoreS
     if !cancellation && input.sourceSpaceId == current.spaceId {
         return Err("Join request must merge a distinct source Space, not the target itself".into());
     }
-    space_departure::observe(service, peer, &[], &input.source.controlOperations)?;
+    space_departure::observe(service, peer, &input.source.departures, &input.source.controlOperations)?;
     let mut records: Vec<_> = store(service).independentRecords::<ConsentProjection>(INBOUND)?.into_values().collect();
     pruneCompletedRequests(service, &mut records)?;
     if let Some(old) = records.iter().find(|record| record.request.requestId == input.requestId) {
@@ -884,6 +903,7 @@ fn receiveSubmission(service: &dyn NodeSpaceContext, peer: &str, current: &CoreS
 }
 
 /// Projects membership only after matching the decision to the current authoritative admission.
+#[inline(never)]
 fn membershipReply(service: &dyn NodeSpaceContext, summary: ConsentProjection, current: &CoreSpace) -> Result<JoinReply, String> {
     let accepted = if summary.request.status == SpaceJoinStatus::Approved {
         if summary.approvedDecision != Some(true) || summary.decisionRevision.is_none()
@@ -1009,6 +1029,7 @@ pub(crate) async fn incoming(service: &dyn NodeSpaceContext) -> Result<Vec<Space
     Ok(result)
 }
 /// Rejects a stale or unauthorized review claim.
+#[inline(never)]
 fn validateAssignment(service: &dyn NodeSpaceContext, record: &Record, origin: &str, decision: &Decision) -> Result<(), String> {
     if record.request.reviewerDeviceId.as_deref() != Some(origin)
         || record.request.assignmentVersion != decision.assignmentVersion
@@ -1067,7 +1088,7 @@ pub(crate) fn receiveApproval(service: &dyn NodeSpaceContext, origin: &str, requ
             toCoreValue(claimDecision(service, origin, decision, current)?).map_err(|e| e.to_string())
         }
         "complete" => {
-            let outcome: Outcome = fromCoreValue(request.args).map_err(|e| e.to_string())?;
+            let outcome: Box<Outcome> = fromCoreValue(request.args).map_err(|e| e.to_string())?;
             let record = completeDecision(service, origin, outcome, current)?;
             toCoreValue(membershipReply(service, ConsentProjection::from(record.as_ref()), &service.spaceStore().space()?)?).map_err(|e| e.to_string())
         }
@@ -1078,6 +1099,7 @@ pub(crate) fn receiveApproval(service: &dyn NodeSpaceContext, origin: &str, requ
 /// Repair presentation bytes from this durable review only after its matching
 /// admission is authoritative. Missing profiles must not prevent resuming a
 /// membership prefix written before the final approval receipt.
+#[inline(never)]
 fn restoreClaimedMemberProfiles(service: &dyn NodeSpaceContext, record: &Record, current: &CoreSpace) -> Result<(), String> {
     if record.approvedDecision != Some(true)
         || !matches!(record.request.status, SpaceJoinStatus::Approving | SpaceJoinStatus::Approved) {
@@ -1093,7 +1115,8 @@ fn restoreClaimedMemberProfiles(service: &dyn NodeSpaceContext, record: &Record,
 }
 
 /// Applies the same claim transition to local and authenticated remote reviewers.
-fn claimDecision(service: &dyn NodeSpaceContext, origin: &str, decision: Decision, current: CoreSpace) -> Result<Claim, String> {
+#[inline(never)]
+fn claimDecision(service: &dyn NodeSpaceContext, origin: &str, decision: Decision, current: CoreSpace) -> Result<Box<Claim>, String> {
             let mut record = load(service, INBOUND, &decision.requestId)?;
             let before = (record.request.clone(), record.unavailableSince);
             reconcile(service, &mut record)?;
@@ -1117,16 +1140,17 @@ fn claimDecision(service: &dyn NodeSpaceContext, origin: &str, decision: Decisio
         saveRecord(service, INBOUND, &decision.requestId, &record)?;
     }
     restoreClaimedMemberProfiles(service, &record, &current)?;
-    Ok(Claim { record, current: PeerSpaceJoin { space: current,
+    Ok(Box::new(Claim { record, current: PeerSpaceJoin { space: current,
         deviceProfiles: service.spaceStore().deviceProfilesForCurrentSpace()?,
         topology: service.spaceStore().topologyRecords()?.into_values().collect(),
         // A local reviewer already owns this policy and never imports its own
         // claim history. Remote reviewers still need the complete authority.
         controlOperations: if origin == service.localNodeId() { Vec::new() }
-            else { service.networkControlStore().currentSpaceOperations()? }, departures: Vec::new() } })
+            else { service.networkControlStore().currentSpaceOperations()? }, departures: Vec::new() } }))
 }
 /// Completes one claimed decision and returns the owned durable application record.
-fn completeDecision(service: &dyn NodeSpaceContext, origin: &str, outcome: Outcome, current: CoreSpace) -> Result<Box<Record>, String> {
+#[inline(never)]
+fn completeDecision(service: &dyn NodeSpaceContext, origin: &str, outcome: Box<Outcome>, current: CoreSpace) -> Result<Box<Record>, String> {
             let mut record = load(service, INBOUND, &outcome.decision.requestId)?;
             validateAssignment(service, &record, origin, &outcome.decision)?;
             if record.approvedDecision != Some(outcome.decision.approve) { return Err("Decision does not match its claim".into()); }
@@ -1168,6 +1192,7 @@ fn completeDecision(service: &dyn NodeSpaceContext, origin: &str, outcome: Outco
     Ok(record)
 }
 /// Requires current local membership before constructing a decision context.
+#[inline(never)]
 fn localDecisionContext(service: &dyn NodeSpaceContext) -> Result<CoreSpace, String> {
     let current = service.spaceStore().initialize()?;
     let local = service.localNodeId();
@@ -1177,24 +1202,32 @@ fn localDecisionContext(service: &dyn NodeSpaceContext) -> Result<CoreSpace, Str
     Ok(current)
 }
 
-/// Resolves one unambiguous review owner and commits its authorized decision.
-pub(crate) async fn decide(service: &dyn NodeSpaceContext, id: String, version: u64, approve: bool) -> Result<SpaceJoinRequest, String> {
-    let local = service.localNodeId();
-    if !canReview(service, &local)? { return Err("This device cannot approve Space join requests".into()); }
+// Synchronous phases release their record/authority frames before the next
+// await. Only boxed workflow records remain in the approval future's poll frame.
+#[inline(never)]
+fn decisionReview(service: &dyn NodeSpaceContext, id: &str, local: &str) -> Result<Box<ConsentProjection>, String> {
     let records = store(service);
-    let gateway: Option<ConsentProjection> = records.record(INBOUND, &id)?;
-    let assigned: Option<ConsentProjection> = records.record(INBOX, &id)?;
+    let gateway: Option<ConsentProjection> = records.record(INBOUND, id)?;
+    let assigned: Option<ConsentProjection> = records.record(INBOX, id)?;
     let inbox = match (gateway, assigned) {
         (Some(record), None) if record.request.targetDeviceId == local => record,
         (None, Some(record)) if record.request.targetDeviceId != local => record,
         _ => return Err("Join review must have exactly one matching gateway or assignment record".into()),
     };
+    Ok(Box::new(inbox))
+}
+
+/// Resolves one unambiguous review owner and commits its authorized decision.
+pub(crate) async fn decide(service: &dyn NodeSpaceContext, id: String, version: u64, approve: bool) -> Result<SpaceJoinRequest, String> {
+    let local = service.localNodeId();
+    if !canReview(service, &local)? { return Err("This device cannot approve Space join requests".into()); }
+    let inbox = decisionReview(service, &id, &local)?;
     if inbox.request.targetDeviceId == local {
         let _lock = MUTATION.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         return Ok(decideLocally(service, &id, version, approve)?.request);
     }
     let decision = Decision { requestId: id.clone(), assignmentVersion: version, approve };
-    let claim: Claim = approvalCall(service, &inbox.request.targetDeviceId, "claim", toCoreValue(decision).map_err(|e| e.to_string())?).await?;
+    let claim: Box<Claim> = approvalCall(service, &inbox.request.targetDeviceId, "claim", toCoreValue(decision).map_err(|e| e.to_string())?).await?;
     if inbox.identity() != responseIdentity(&claim.record) || inbox.sourceRevision != claim.record.sourceRevision {
         return Err("Join response identity mismatch".into());
     }
@@ -1203,7 +1236,7 @@ pub(crate) async fn decide(service: &dyn NodeSpaceContext, id: String, version: 
     let expectedRevision = inbox.sourceRevision;
     drop(inbox);
     let outcome = prepareOutcome(service, &id, version, approve, false, claim)?;
-    let reply: JoinReply = approvalCall(service, &expected[2], "complete", toCoreValue(outcome).map_err(|e| e.to_string())?).await?;
+    let reply: Box<JoinReply> = approvalCall(service, &expected[2], "complete", toCoreValue(outcome).map_err(|e| e.to_string())?).await?;
     if expected.each_ref().map(String::as_str) != projection::identity(&reply.request, &reply.sourceSpaceId, &reply.targetSpaceId)
         || expectedRevision != reply.sourceRevision {
         return Err("Join response identity mismatch".into());
@@ -1212,6 +1245,7 @@ pub(crate) async fn decide(service: &dyn NodeSpaceContext, id: String, version: 
 }
 
 /// Runs the same durable local decision for explicit review and QR admission under MUTATION.
+#[inline(never)]
 fn decideLocally(service: &dyn NodeSpaceContext, id: &str, version: u64, approve: bool) -> Result<Box<Record>, String> {
     let local = service.localNodeId();
     let claim = claimDecision(service, &local, Decision { requestId: id.into(), assignmentVersion: version, approve }, localDecisionContext(service)?)?;
@@ -1221,9 +1255,10 @@ fn decideLocally(service: &dyn NodeSpaceContext, id: &str, version: u64, approve
 }
 
 /// Consumes command evidence synchronously so completion retains only the decision outcome.
+#[inline(never)]
 fn prepareOutcome(service: &dyn NodeSpaceContext, id: &str, version: u64, approve: bool,
-    onGateway: bool, claim: Claim) -> Result<Outcome, String> {
-    let saved = store(service).record::<Outcome>(RESULTS, id)?;
+    onGateway: bool, claim: Box<Claim>) -> Result<Box<Outcome>, String> {
+    let saved = store(service).record::<Box<Outcome>>(RESULTS, id)?;
     if let Some(saved) = saved {
         if saved.decision.assignmentVersion != version || saved.decision.approve != approve { return Err("Stored decision differs from the claim".into()); }
         Ok(saved)
@@ -1259,7 +1294,7 @@ fn prepareOutcome(service: &dyn NodeSpaceContext, id: &str, version: u64, approv
             if !onGateway { service.spaceStore().adoptAt(joined, claim.record.request.createdAt)?; }
             Some(operation)
         } else { None };
-        let outcome = Outcome { decision: Decision { requestId: id.to_owned(), assignmentVersion: version, approve }, admission, revision };
+        let outcome = Box::new(Outcome { decision: Decision { requestId: id.to_owned(), assignmentVersion: version, approve }, admission, revision });
         // Local retries recover their stable admission from the shared log;
         // only remote reviewers need a durable outbound completion result.
         if !onGateway { store(service).putRecord(RESULTS, id, &outcome)?; }
@@ -1402,42 +1437,14 @@ mod device_space_state_tests {
 
 /// Collects the same versioned authority projection for every applicant and target node.
 async fn joinSnapshot(service: &dyn NodeSpaceContext, node: &str) -> Result<PeerSpaceSnapshot, String> {
-    use super::space_projection::{self, SnapshotHeader, SnapshotCollector};
+    use super::space_projection;
     let response = service.callNode(node.to_owned(), CoreCallRequest::new(
         format!("node-space-projectionProtocol-{}", currentTimeMillis()), NODE_SPACE_TARGET,
         "projectionProtocol", toCoreValue(serde_json::json!({"version": space_projection::VERSION})).map_err(|e| e.to_string())?,
     )).await;
     let protocol = space_projection::decodeProtocolResponse(node, response.result)?;
     if !protocol.snapshotPaging { return Err("SPACE_PROTOCOL_INCOMPATIBLE: Joining requires authority paging".into()); }
-    // A departure/control update may race a paged read. Restart only this
-    // read-only export; never retry admission writes or an uncertain decision.
-    // The negotiated paging protocol stays valid across snapshot revisions.
-    for attempt in 0..3 {
-        let result = async {
-            let header: SnapshotHeader = callPeerSpace(service, node, "snapshotHeader", CoreValue::Null).await?;
-            let mut collector = SnapshotCollector::new(header)?;
-            loop {
-                let page = callPeerSpace(service, node, "snapshotControlPage",
-                    toCoreValue(collector.request()).map_err(|e| e.to_string())?).await?;
-                if collector.push(page)? { break; }
-            }
-            let current = callPeerSpace(service, node, "snapshotHeader", CoreValue::Null).await?;
-            collector.finish(current)
-        }.await;
-        match result {
-            Err(error) if attempt < 2 && error.starts_with("SPACE_EXPORT_CHANGED:") => continue,
-            result => return result,
-        }
-    }
-    unreachable!()
-}
-
-/// Calls one explicit Space method on the directly paired peer.
-async fn callPeerSpace<T: serde::de::DeserializeOwned>(service: &dyn NodeSpaceContext, node: &str, method: &str, args: CoreValue) -> Result<T, String> {
-    let response = service.callNode(node.to_owned(), CoreCallRequest::new(
-        format!("node-space-{method}-{}", currentTimeMillis()), NODE_SPACE_TARGET, method, args,
-    )).await;
-    fromCoreValue(response.result.map_err(|e| e.to_string())?).map_err(|e| e.to_string())
+    space_projection::readSnapshot(service, node).await.map(|(_, snapshot)| snapshot)
 }
 
 #[cfg(test)]
@@ -1471,6 +1478,8 @@ mod snapshot_retry_tests {
         terminal: bool,
         reads: AtomicUsize,
         protocols: AtomicUsize,
+        pageError: Option<&'static str>,
+        pages: AtomicUsize,
     }
     #[async_trait::async_trait(?Send)]
     impl NodeSpaceContext for Export {
@@ -1486,7 +1495,7 @@ mod snapshot_retry_tests {
                     self.protocols.fetch_add(1, Ordering::SeqCst);
                     if self.terminal { return CoreCallResponse::err(request.requestId,
                         operit_link::CoreLinkError::new("PEER_PERMISSION", "denied")); }
-                    serde_json::json!({"version":1,"nodeId":"peer","endpoint":true,
+                    serde_json::json!({"protocol": crate::PeerProtocol::PeerProtocol::current(), "version":1,"nodeId":"peer","endpoint":true,
                         "authorityMode":"localReplay","maxMessageBytes":8192,"snapshotPaging":true})
                 }
                 "snapshotHeader" => {
@@ -1495,6 +1504,13 @@ mod snapshot_retry_tests {
                         "deviceProfiles":[],"topology":[],"departures":[],"controlRevision":format!("{read:064x}"),"controlCount":0})
                 }
                 "snapshotControlPage" => {
+                    let page = self.pages.fetch_add(1, Ordering::SeqCst);
+                    if let Some(code) = self.pageError {
+                        if code != "SPACE_EXPORT_CHANGED" || page < self.changes {
+                            return CoreCallResponse::err(request.requestId,
+                                super::super::spaceCallError(format!("{code}: read failed")));
+                        }
+                    }
                     let args: serde_json::Value = fromCoreValue(request.args).unwrap();
                     serde_json::json!({"revision":args["revision"],"count":0,"operation":null})
                 }
@@ -1504,7 +1520,8 @@ mod snapshot_retry_tests {
         }
     }
     fn export(changes: usize, terminal: bool) -> Export {
-        Export { changes, terminal, reads: AtomicUsize::new(0), protocols: AtomicUsize::new(0) }
+        Export { changes, terminal, reads: AtomicUsize::new(0), protocols: AtomicUsize::new(0),
+            pageError: None, pages: AtomicUsize::new(0) }
     }
     #[tokio::test]
     async fn changed_export_restarts_from_a_fresh_header_without_writing_admission() {
@@ -1514,6 +1531,28 @@ mod snapshot_retry_tests {
         assert_eq!(source.reads.load(Ordering::SeqCst), 4);
         assert_eq!(source.protocols.load(Ordering::SeqCst), 1);
     }
+    #[tokio::test]
+    async fn shared_export_retries_changed_pages_but_not_denied_or_invalid_pages() {
+        let mut source = export(1, false);
+        source.pageError = Some("SPACE_EXPORT_CHANGED");
+        let (revision, snapshot) = super::super::space_projection::readSnapshot(&source, "peer").await.unwrap();
+        assert_eq!(revision, format!("{:064x}", 1));
+        assert_eq!(snapshot.space.spaceId, "space");
+        assert_eq!(source.reads.load(Ordering::SeqCst), 3);
+        assert_eq!(source.pages.load(Ordering::SeqCst), 2);
+        let mut source = export(usize::MAX, false);
+        source.pageError = Some("SPACE_EXPORT_CHANGED");
+        assert!(super::super::space_projection::readSnapshot(&source, "peer").await.is_err());
+        assert_eq!(source.pages.load(Ordering::SeqCst), 3);
+        for code in ["PEER_PERMISSION", "SPACE_EXPORT_INVALID"] {
+            let mut source = export(0, false);
+            source.pageError = Some(code);
+            assert!(super::super::space_projection::readSnapshot(&source, "peer").await.err().unwrap().contains(code));
+            assert_eq!(source.pages.load(Ordering::SeqCst), 1);
+            assert_eq!(source.reads.load(Ordering::SeqCst), 1);
+        }
+    }
+
     #[tokio::test]
     async fn export_retry_is_bounded_and_permission_errors_are_not_retried() {
         let source = export(usize::MAX, false);

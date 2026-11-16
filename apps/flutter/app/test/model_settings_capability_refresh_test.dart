@@ -13,12 +13,252 @@ import 'package:operit2/data/preferences/UserPreferencesManager.dart';
 import 'package:operit2/l10n/generated/app_localizations.dart';
 import 'package:operit2/ui/features/settings/model/ModelSettingsPanel.dart';
 import 'package:operit2/ui/features/chat/components/style/input/agent/AgentChatInputSection.dart';
+import 'package:operit2/ui/features/chat/components/style/input/agent/AgentModelSelectorPopup.dart';
 import 'package:operit2/ui/features/chat/viewmodel/ChatViewModel.dart';
 import 'package:operit2/ui/features/settings/model/ProviderLogo.dart';
 import 'package:operit2/ui/theme/OperitTheme.dart';
 
 void main() {
+  for (final missingProvider in [true, false]) {
+    testWidgets(
+      'model selector repairs a missing ${missingProvider ? 'provider' : 'model'} binding',
+      (tester) async {
+        final bridge = _ModelSettingsBridge()
+          ..chatBinding = core.FunctionModelBinding(
+            providerId: missingProvider ? 'removed-provider' : 'test-provider',
+            modelId: 'removed-model',
+            followsChat: false,
+          );
+        var dismissed = false;
+        String? selectedModel;
+        await tester.pumpWidget(
+          _themed(
+            Center(
+              child: AgentModelSelectorPopup(
+                viewModel: ChatViewModel(bridge: bridge),
+                onDismiss: () => dismissed = true,
+                onModelChanged: (modelId, {providerTypeId, providerName}) =>
+                    selectedModel = modelId,
+              ),
+            ),
+          ),
+        );
+        await tester.pumpAndSettle();
+        expect(bridge.thinkingCalls, 0);
+        expect(find.byType(AgentThinkingLevelRow), findsNothing);
+        expect(tester.takeException(), isNull);
+        await tester.tap(find.text('Test Provider').first);
+        await tester.pumpAndSettle();
+        await tester.tap(find.text('test-model').last);
+        await tester.pumpAndSettle();
+        expect(selectedModel, 'test-model');
+        expect(bridge.chatBinding.providerId, 'test-provider');
+        expect(bridge.chatBinding.modelId, 'test-model');
+        expect(dismissed, isTrue);
+        expect(tester.takeException(), isNull);
+        await tester.pumpWidget(const SizedBox.shrink());
+      },
+    );
+  }
   setUp(ClientLogger.initialize);
+  testWidgets(
+    'provider editor persists the pool and imported identities through Core',
+    (tester) async {
+      final bridge = _ModelSettingsBridge();
+      final panelKey = GlobalKey<ModelSettingsPanelState>();
+      await _pumpModelSettings(tester, bridge, panelKey);
+      final l10n = AppLocalizations.of(panelKey.currentContext!)!;
+      await tester.tap(find.text('Test Provider'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.byTooltip(l10n.settingsModelEditProvider));
+      await tester.pumpAndSettle();
+      final toggle = find.byKey(const ValueKey('api-key-pool-toggle'));
+      await tester.ensureVisible(toggle);
+      await tester.tap(toggle);
+      await tester.pumpAndSettle();
+      await tester.ensureVisible(find.text(l10n.settingsModelAddApiKey));
+      await tester.tap(find.text(l10n.settingsModelAddApiKey));
+      await tester.pumpAndSettle();
+      await tester.enterText(
+        find.byKey(const ValueKey('pool-key-input')),
+        'first-key\nsecond-key',
+      );
+      await tester.tap(find.text(l10n.save).last);
+      await tester.pumpAndSettle();
+      await tester.tap(find.text(l10n.save).last);
+      await tester.pumpAndSettle();
+      final saved = bridge.savedProvider!;
+      expect(saved.id, bridge.provider.id);
+      expect(saved.models.single.id, 'test-model');
+      expect(saved.useMultipleApiKeys, isTrue);
+      expect(saved.apiKeyPool.map((entry) => entry.key), [
+        'first-key',
+        'second-key',
+      ]);
+      expect(saved.apiKeyPool.map((entry) => entry.id).toSet(), hasLength(2));
+      expect(tester.takeException(), isNull);
+    },
+  );
+  for (final downloadedAt in <int?>[null, 1794000000000]) {
+    testWidgets(
+      'catalog update failure keeps model picker usable at $downloadedAt',
+      (tester) async {
+        final bridge = _ModelSettingsBridge()..catalogUpdatedAt = downloadedAt;
+        final panelKey = GlobalKey<ModelSettingsPanelState>();
+        await _pumpModelSettings(tester, bridge, panelKey);
+        final l10n = AppLocalizations.of(panelKey.currentContext!)!;
+        await tester.tap(find.text('Test Provider'));
+        await tester.pumpAndSettle();
+        await tester.tap(find.byTooltip(l10n.settingsModelAddModel));
+        await tester.pumpAndSettle();
+        expect(find.text('new-model'), findsOneWidget);
+        expect(find.textContaining('fixture catalog offline'), findsNothing);
+        if (downloadedAt == null) {
+          expect(find.text(l10n.settingsModelCatalogBundled), findsOneWidget);
+        }
+        await tester.tap(find.text(l10n.settingsModelCatalogRetry));
+        await tester.pumpAndSettle();
+        expect(bridge.catalogRefreshCalls, 1);
+        expect(find.text('new-model'), findsOneWidget);
+        expect(find.textContaining('fixture catalog offline'), findsNothing);
+        expect(tester.takeException(), isNull);
+      },
+    );
+  }
+  for (final success in [true, false]) {
+    testWidgets(
+      'completed ${success ? 'passed' : 'failed'} connection checks restore after reopening settings',
+      (tester) async {
+        final bridge = _ModelSettingsBridge()..connectionTestSucceeds = success;
+        var panelKey = GlobalKey<ModelSettingsPanelState>();
+        await _pumpModelSettings(tester, bridge, panelKey);
+        final l10n = AppLocalizations.of(panelKey.currentContext!)!;
+        final closeTooltip = MaterialLocalizations.of(
+          panelKey.currentContext!,
+        ).closeButtonTooltip;
+        final statusLabel = success
+            ? l10n.settingsModelConnectionTestPassed
+            : l10n.settingsModelConnectionTestFailed;
+        final status = find.byWidgetPredicate(
+          (widget) =>
+              widget is Semantics && widget.properties.label == statusLabel,
+        );
+
+        await tester.tap(find.text('Test Provider'));
+        await tester.pumpAndSettle();
+        expect(status, findsNothing);
+        await tester.tap(find.text(l10n.settingsModelTestAll));
+        await tester.pumpAndSettle();
+        expect(status, findsOneWidget);
+        expect(bridge.connectionTestCalls, 1);
+        await tester.tap(find.byTooltip(closeTooltip).last);
+        await tester.pumpAndSettle();
+
+        panelKey = GlobalKey<ModelSettingsPanelState>();
+        await _pumpModelSettings(tester, bridge, panelKey);
+        await tester.tap(find.text('Test Provider'));
+        await tester.pumpAndSettle();
+        expect(status, findsOneWidget);
+        expect(bridge.connectionTestCalls, 1);
+        if (!success) {
+          await tester.tap(status);
+          await tester.pumpAndSettle();
+          expect(find.text('HTTP 503'), findsOneWidget);
+          // A tooltip inside the result bubble must be able to resolve its
+          // anchor during layout, before the bubble is painted.
+          await tester.longPress(find.byTooltip(l10n.settingsModelCopyError));
+          await tester.pumpAndSettle();
+          expect(find.text(l10n.settingsModelCopyError), findsOneWidget);
+        }
+        expect(tester.takeException(), isNull);
+      },
+    );
+  }
+
+  for (final statusCode in [402, 429]) {
+    testWidgets(
+      'restricted $statusCode results persist without counting as failures',
+      (tester) async {
+        final bridge = _ModelSettingsBridge()
+          ..connectionTestSucceeds = false
+          ..connectionTestError =
+              'request failed: $statusCode: upstream restriction';
+        final panelKey = GlobalKey<ModelSettingsPanelState>();
+        await _pumpModelSettings(tester, bridge, panelKey);
+        final l10n = AppLocalizations.of(panelKey.currentContext!)!;
+        final closeTooltip = MaterialLocalizations.of(
+          panelKey.currentContext!,
+        ).closeButtonTooltip;
+        final restricted = find.byWidgetPredicate(
+          (widget) =>
+              widget is Semantics &&
+              widget.properties.label ==
+                  l10n.settingsModelConnectionTestRestricted,
+        );
+        await tester.tap(find.text('Test Provider'));
+        await tester.pumpAndSettle();
+        await tester.tap(find.text(l10n.settingsModelTestAll));
+        await tester.pumpAndSettle();
+        expect(restricted, findsOneWidget);
+        expect(
+          find.text(l10n.settingsModelTestSummaryWithRestricted(0, 0, 1)),
+          findsOneWidget,
+        );
+        expect(bridge.connectionTestCalls, 1);
+        await tester.tap(find.byTooltip(closeTooltip).last);
+        await tester.pumpAndSettle();
+        await tester.tap(find.text('Test Provider'));
+        await tester.pumpAndSettle();
+        expect(restricted, findsOneWidget);
+        expect(bridge.connectionTestCalls, 1);
+        await tester.tap(restricted);
+        await tester.pumpAndSettle();
+        final reason = statusCode == 402
+            ? l10n.settingsModelTestCreditRestricted
+            : l10n.settingsModelTestRateRestricted;
+        expect(
+          find.text('${l10n.settingsModelTestItemChat} · $reason'),
+          findsOneWidget,
+        );
+        expect(tester.takeException(), isNull);
+      },
+    );
+  }
+
+  testWidgets('checks completed after closing the dialog restore on reopen', (
+    tester,
+  ) async {
+    final gate = Completer<void>();
+    final bridge = _ModelSettingsBridge()..connectionTestGate = gate;
+    final panelKey = GlobalKey<ModelSettingsPanelState>();
+    await _pumpModelSettings(tester, bridge, panelKey);
+    final l10n = AppLocalizations.of(panelKey.currentContext!)!;
+    final closeTooltip = MaterialLocalizations.of(
+      panelKey.currentContext!,
+    ).closeButtonTooltip;
+    await tester.tap(find.text('Test Provider'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text(l10n.settingsModelTestAll));
+    await tester.pump();
+    expect(bridge.connectionTestCalls, 1);
+    await tester.tap(find.byTooltip(closeTooltip).last);
+    await tester.pumpAndSettle();
+    gate.complete();
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Test Provider'));
+    await tester.pumpAndSettle();
+    expect(
+      find.byWidgetPredicate(
+        (widget) =>
+            widget is Semantics &&
+            widget.properties.label == l10n.settingsModelConnectionTestPassed,
+      ),
+      findsOneWidget,
+    );
+    expect(bridge.connectionTestCalls, 1);
+    expect(tester.takeException(), isNull);
+  });
+
   testWidgets(
     'inline capability saves refresh the outer function model snapshot',
     (tester) async {
@@ -58,9 +298,8 @@ void main() {
       await tester.pumpAndSettle();
       await tester.tap(find.text('test-model').last);
       await tester.pumpAndSettle();
-      await tester.tap(find.text(l10n.settingsModelDirectImage).last);
-      await tester.ensureVisible(find.widgetWithText(FilledButton, l10n.save));
-      await tester.tap(find.widgetWithText(FilledButton, l10n.save));
+      // A capability saves as soon as it is switched.
+      await tester.tap(find.text(l10n.settingsModelCapabilityImage).last);
       await tester.pumpAndSettle();
       expect(bridge.capabilities.directImage, isTrue);
       final updatedSnapshot = await panelKey.currentState!.loadFuture;
@@ -235,10 +474,19 @@ Future<void> _pumpModelSettings(
 }
 
 class _ModelSettingsBridge extends OperitRuntimeBridge {
+  core.ProviderProfile? savedProvider;
   core.FunctionModelBinding chatBinding = binding;
   String modelId = binding.modelId;
   String? resolutionError;
   int resolutionCalls = 0;
+  int thinkingCalls = 0;
+  int? catalogUpdatedAt;
+  int catalogRefreshCalls = 0;
+  bool connectionTestSucceeds = true;
+  String connectionTestError = 'HTTP 503';
+  int connectionTestCalls = 0;
+  Completer<void>? connectionTestGate;
+  List<Map<String, Object?>> savedConnectionTests = [];
   core.ModelCapabilities capabilities = const core.ModelCapabilities(
     directImage: false,
     directAudio: false,
@@ -253,8 +501,6 @@ class _ModelSettingsBridge extends OperitRuntimeBridge {
   static const summarySettings = core.ModelSummarySettings(
     enableSummary: true,
     summaryTokenThreshold: 0.7,
-    enableSummaryByMessageCount: false,
-    summaryMessageCountThreshold: 0,
   );
   static const localRuntime = core.LocalModelRuntimeSettings(
     inferenceBindingKey: '',
@@ -276,32 +522,43 @@ class _ModelSettingsBridge extends OperitRuntimeBridge {
     id: modelId,
     pricingOverride: null,
     contextOverride: contextSpec,
-    capabilitiesOverride: capabilities,
+    capabilitiesOverride: core.ModelCapabilityOverrides(
+      directImage: capabilities.directImage,
+      directAudio: capabilities.directAudio,
+      directVideo: capabilities.directVideo,
+      toolCall: capabilities.toolCall,
+    ),
     builtinToolsOverride: const [],
-    requestOverride: null,
+    requestOverride: const core.ModelRequestOverrides(
+      supportsStructuredTools: null,
+      enableClaude1HPromptCache: null,
+    ),
+    listed: null,
+    thinkingOverride: null,
+    thinkingLevel: null,
     parameters: const [],
     summary: summarySettings,
     localRuntime: localRuntime,
   );
 
-  core.ProviderProfile get provider => core.ProviderProfile(
-    id: binding.providerId,
-    name: 'Test Provider',
-    providerTypeId: 'OPENAI',
-    providerType: core.ApiProviderType.openai,
-    endpoint: 'https://example.com/v1',
-    apiKey: '',
-    useMultipleApiKeys: false,
-    apiKeyPool: const [],
-    currentKeyIndex: 0,
-    keyRotationMode: 'ROUND_ROBIN',
-    customHeaders: '{}',
-    requestLimitPerMinute: 0,
-    maxConcurrentRequests: 1,
-    thinkingConfigurations: '[]',
-    thinkingOptionId: '',
-    models: [model],
-  );
+  core.ProviderProfile get provider =>
+      savedProvider ??
+      core.ProviderProfile(
+        id: binding.providerId,
+        name: 'Test Provider',
+        providerTypeId: 'OPENAI',
+        providerType: core.ApiProviderType.openai,
+        endpoint: 'https://example.com/v1',
+        apiKey: '',
+        useMultipleApiKeys: false,
+        apiKeyPool: const [],
+        currentKeyIndex: 0,
+        keyRotationMode: 'ROUND_ROBIN',
+        customHeaders: '{}',
+        requestLimitPerMinute: 0,
+        maxConcurrentRequests: 1,
+        models: [model],
+      );
 
   core.ResolvedModelConfig get config => core.ResolvedModelConfig(
     providerId: binding.providerId,
@@ -326,8 +583,13 @@ class _ModelSettingsBridge extends OperitRuntimeBridge {
       'supportsStructuredTools': true,
     }),
     parameters: const [],
-    thinkingConfigurations: '[]',
-    thinkingOptionId: '',
+    thinking: const core.ModelThinkingSpec(
+      supported: false,
+      toggle: false,
+      efforts: [],
+      budget: null,
+    ),
+    thinkingLevel: null,
     summary: summarySettings,
     localRuntime: localRuntime,
   );
@@ -336,8 +598,39 @@ class _ModelSettingsBridge extends OperitRuntimeBridge {
   Future<Uint8List> callBytes(CoreCallRequest request) async {
     final Object? result;
     switch (request.methodName) {
+      case 'getAvailableProviderModels':
+        result = [
+          core.AvailableProviderModel(
+            modelId: 'new-model',
+            source: core.AvailableProviderModelSource.remote,
+            catalogModelId: 'new-model',
+            pricing: null,
+            context: contextSpec,
+            capabilities: capabilities,
+            builtinTools: const [],
+            request: config.request,
+            listed: null,
+          ).toJson(),
+        ];
+      case 'refreshModelCatalog':
+      case 'getModelCatalogStatus':
+        if (request.methodName == 'refreshModelCatalog') {
+          catalogRefreshCalls++;
+        }
+        result = core.ModelCatalogStatus(
+          updatedAt: catalogUpdatedAt,
+          lastError: 'fixture catalog offline',
+        ).toJson();
       case 'getModelBindingForFunction':
         result = chatBinding.toJson();
+      case 'setModelForFunction':
+        final args = request.args as Map;
+        chatBinding = core.FunctionModelBinding(
+          providerId: args['providerId'] as String,
+          modelId: args['modelId'] as String,
+          followsChat: false,
+        );
+        result = null;
       case 'getProviderProfiles':
         result = [provider.toJson()];
       case 'getAllModelSummaries':
@@ -349,9 +642,42 @@ class _ModelSettingsBridge extends OperitRuntimeBridge {
             endpoint: provider.endpoint,
             modelId: modelId,
             capabilities: capabilities,
+            context: contextSpec,
             pricing: null,
+            thinking: const core.ModelThinkingSpec(
+              supported: false,
+              toggle: false,
+              efforts: [],
+              budget: null,
+            ),
           ).toJson(),
         ];
+      case 'getThinkingSettingsForModel':
+        thinkingCalls++;
+        final args = request.args as Map;
+        if (args['providerId'] != provider.id || args['modelId'] != modelId) {
+          return encodeCoreLink([
+            1,
+            'COMMAND_ERROR',
+            'model not found',
+            null,
+            null,
+            null,
+          ]);
+        }
+        result = const core.ModelThinkingSettings(
+          spec: core.ModelThinkingSpec(
+            supported: false,
+            toggle: false,
+            efforts: [],
+            budget: null,
+          ),
+          source: core.ThinkingSpecSource.unknown,
+          catalog: null,
+          levels: [],
+          current: null,
+          chosen: false,
+        ).toJson();
       case 'getResolvedModelConfig':
         resolutionCalls++;
         if (resolutionError != null) {
@@ -374,14 +700,58 @@ class _ModelSettingsBridge extends OperitRuntimeBridge {
       case 'updateSummaryForModel':
       case 'updateBuiltinToolsForModel':
         result = model.toJson();
+      case 'getModelConnectionTestResults':
+        result = savedConnectionTests;
+      case 'test_model_connection':
+        connectionTestCalls++;
+        await connectionTestGate?.future;
+        final report = <String, Object?>{
+          'providerId': provider.id,
+          'modelId': modelId,
+          'providerName': provider.name,
+          'providerType': provider.providerTypeId,
+          'success': connectionTestSucceeds,
+          'items': [
+            {
+              'type': 'CHAT',
+              'success': connectionTestSucceeds,
+              'error': connectionTestSucceeds ? null : connectionTestError,
+            },
+          ],
+        };
+        savedConnectionTests = [
+          {
+            'providerId': provider.id,
+            'modelId': modelId,
+            'report': report,
+            'error': null,
+          },
+        ];
+        result = report;
       case 'getAllTtsConfigs':
       case 'getAllSttConfigs':
         result = <Object?>[];
       case 'getCurrentTtsConfigId':
       case 'getSelectedSttConfigId':
         result = '';
+      case 'updateProviderProfile':
+        savedProvider = core.ProviderProfile.fromJson(
+          (request.args as Map)['provider'] as Map<String, Object?>,
+        );
+        result = savedProvider!.toJson();
       case 'getProviderCatalogEntries':
-        result = request.target.contains('Stt')
+        result = request.target == 'core/preferences.modelConfigManager'
+            ? [
+                const core.ProviderCatalogEntry(
+                  providerTypeId: 'OPENAI',
+                  displayName: 'OpenAI',
+                  defaultEndpoint: 'https://example.com/v1',
+                  endpointOptions: [],
+                  operations: [],
+                  models: [],
+                ).toJson(),
+              ]
+            : request.target == 'core/preferences.sttConfigManager'
             ? [
                 const core.SttProviderCatalogEntry(
                   providerTypeId: 'OPENAI_STT',

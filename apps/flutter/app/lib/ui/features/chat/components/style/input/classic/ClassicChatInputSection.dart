@@ -3,9 +3,7 @@
 import 'dart:async';
 
 import 'package:desktop_drop/desktop_drop.dart';
-import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
 import 'package:operit_ui/operit_ui.dart';
 
 import '../../../../../../../core/proxy/generated/CoreProxyModels.g.dart'
@@ -22,8 +20,10 @@ import '../common/ChatAttachmentImagePreview.dart';
 import '../common/ChatAttachmentMenuPopup.dart';
 import '../common/ChatComposerSendActionMenu.dart';
 import '../common/ChatComposerSlotHost.dart';
+import '../common/ChatInputEnterShortcuts.dart';
 import '../common/ChatPendingMessageQueuePanel.dart';
 import '../common/ChatPastedImageHandler.dart';
+import '../common/InputProcessingStatusLane.dart';
 import '../common/PendingQueueMessageItem.dart';
 
 class ClassicChatInputSection extends StatefulWidget {
@@ -55,7 +55,7 @@ class ClassicChatInputSection extends StatefulWidget {
     this.onGuidePendingQueueMessage,
     this.attachments = const <AttachmentInfo>[],
     this.onRemoveAttachment,
-    this.onInsertAttachment,
+    this.onPreviewAttachment,
     this.onAttachImage,
     this.onTakePhoto,
     this.onPluginAttachment,
@@ -94,7 +94,7 @@ class ClassicChatInputSection extends StatefulWidget {
   final ValueChanged<int>? onGuidePendingQueueMessage;
   final List<AttachmentInfo> attachments;
   final ValueChanged<String>? onRemoveAttachment;
-  final ValueChanged<AttachmentInfo>? onInsertAttachment;
+  final ValueChanged<AttachmentInfo>? onPreviewAttachment;
   final VoidCallback? onAttachImage;
   final VoidCallback? onTakePhoto;
   final ChatAttachmentCompletion? onPluginAttachment;
@@ -196,6 +196,8 @@ class _ClassicChatInputSectionState extends State<ClassicChatInputSection>
     final overlay = Overlay.of(context);
     _mentionPopupEntry = OverlayEntry(
       builder: (context) {
+        final panel = widget.mentionSuggestionPanel;
+        if (!mounted || panel == null) return const SizedBox.shrink();
         final placement = _popupPlacement(
           context,
           targetKey: _mentionPopupTargetKey,
@@ -208,7 +210,7 @@ class _ClassicChatInputSectionState extends State<ClassicChatInputSection>
           width: placement.width,
           maxHeight: placement.maxHeight,
           onDismiss: _dismissMentionSuggestionPopup,
-          child: widget.mentionSuggestionPanel!,
+          child: panel,
         );
       },
     );
@@ -502,7 +504,7 @@ class _ClassicChatInputSectionState extends State<ClassicChatInputSection>
                           child: _ClassicAttachmentStrip(
                             attachments: widget.attachments,
                             onRemoveAttachment: widget.onRemoveAttachment,
-                            onInsertAttachment: widget.onInsertAttachment,
+                            onPreviewAttachment: widget.onPreviewAttachment,
                           ),
                         ),
                       _ClassicInputBody(
@@ -629,11 +631,11 @@ class _ClassicInputBody extends StatelessWidget {
               onInterruptAndSendMessage != null
           ? 66
           : 36,
-      editor: _ClassicDesktopEnterSendShortcuts(
+      editor: ChatInputEnterShortcuts(
         controller: controller,
+        inputExpanded: inputExpanded,
         canSendMessage: canSendMessage,
         onSendMessage: onSendMessage,
-        enabled: !inputExpanded,
         child: ChatPastedImageHandler(
           focusNode: focusNode,
           enabled: !isSpeechRecording && !isSpeechTranscribing,
@@ -669,9 +671,6 @@ class _ClassicInputBody extends StatelessWidget {
                 chatPastedImageContentInsertionConfiguration(
                   onPasteImages: onPasteImages,
                 ),
-            onSubmitted: (_) {
-              if (!inputExpanded && canSendMessage) onSendMessage();
-            },
             onToggleExpansion: onToggleInputExpansion,
             expandTooltip: l10n.expandInput,
             collapseTooltip: l10n.collapseInput,
@@ -1066,12 +1065,12 @@ class _ClassicAttachmentStrip extends StatelessWidget {
   const _ClassicAttachmentStrip({
     required this.attachments,
     required this.onRemoveAttachment,
-    required this.onInsertAttachment,
+    required this.onPreviewAttachment,
   });
 
   final List<AttachmentInfo> attachments;
   final ValueChanged<String>? onRemoveAttachment;
-  final ValueChanged<AttachmentInfo>? onInsertAttachment;
+  final ValueChanged<AttachmentInfo>? onPreviewAttachment;
 
   /// Builds the horizontal attachment chip strip.
   @override
@@ -1092,7 +1091,7 @@ class _ClassicAttachmentStrip extends StatelessWidget {
             attachment: attachment,
             colorScheme: colorScheme,
             onRemoveAttachment: onRemoveAttachment,
-            onInsertAttachment: onInsertAttachment,
+            onPreviewAttachment: onPreviewAttachment,
           );
         },
       ),
@@ -1105,13 +1104,13 @@ class _ClassicAttachmentChip extends StatelessWidget {
     required this.attachment,
     required this.colorScheme,
     required this.onRemoveAttachment,
-    required this.onInsertAttachment,
+    required this.onPreviewAttachment,
   });
 
   final AttachmentInfo attachment;
   final ColorScheme colorScheme;
   final ValueChanged<String>? onRemoveAttachment;
-  final ValueChanged<AttachmentInfo>? onInsertAttachment;
+  final ValueChanged<AttachmentInfo>? onPreviewAttachment;
 
   /// Builds one attachment chip.
   @override
@@ -1132,9 +1131,9 @@ class _ClassicAttachmentChip extends StatelessWidget {
                   borderRadius: BorderRadius.circular(12),
                   clipBehavior: Clip.antiAlias,
                   child: InkWell(
-                    onTap: onInsertAttachment == null
+                    onTap: onPreviewAttachment == null
                         ? null
-                        : () => onInsertAttachment!(attachment),
+                        : () => onPreviewAttachment!(attachment),
                     child: ChatAttachmentImagePreview(
                       attachmentPath: attachment.filePath,
                       fileName: attachment.fileName,
@@ -1168,9 +1167,9 @@ class _ClassicAttachmentChip extends StatelessWidget {
         ),
         clipBehavior: Clip.antiAlias,
         child: InkWell(
-          onTap: onInsertAttachment == null
+          onTap: onPreviewAttachment == null
               ? null
-              : () => onInsertAttachment!(attachment),
+              : () => onPreviewAttachment!(attachment),
           child: SizedBox(
             height: 26,
             child: Row(
@@ -1355,71 +1354,6 @@ class _ClassicActionButton extends StatelessWidget {
   }
 }
 
-class _ClassicDesktopEnterSendShortcuts extends StatelessWidget {
-  const _ClassicDesktopEnterSendShortcuts({
-    required this.controller,
-    required this.canSendMessage,
-    required this.onSendMessage,
-    required this.enabled,
-    required this.child,
-  });
-
-  final TextEditingController controller;
-  final bool canSendMessage;
-  final VoidCallback onSendMessage;
-  final bool enabled;
-  final Widget child;
-
-  /// Builds desktop enter-to-send shortcuts around the text field.
-  @override
-  Widget build(BuildContext context) {
-    return CallbackShortcuts(
-      bindings: enabled && _usesDesktopEnterSend
-          ? <ShortcutActivator, VoidCallback>{
-              const SingleActivator(LogicalKeyboardKey.enter): _sendIfReady,
-              const SingleActivator(LogicalKeyboardKey.numpadEnter):
-                  _sendIfReady,
-              const SingleActivator(LogicalKeyboardKey.enter, control: true):
-                  _insertNewline,
-              const SingleActivator(
-                LogicalKeyboardKey.numpadEnter,
-                control: true,
-              ): _insertNewline,
-            }
-          : const <ShortcutActivator, VoidCallback>{},
-      child: child,
-    );
-  }
-
-  bool get _usesDesktopEnterSend {
-    return defaultTargetPlatform == TargetPlatform.windows ||
-        defaultTargetPlatform == TargetPlatform.macOS;
-  }
-
-  /// Sends the draft when there is content.
-  void _sendIfReady() {
-    if (canSendMessage) {
-      onSendMessage();
-    }
-  }
-
-  /// Inserts a newline at the current selection.
-  void _insertNewline() {
-    final value = controller.value;
-    final text = value.text;
-    final selection = value.selection;
-    final range = selection.isValid
-        ? selection
-        : TextSelection.collapsed(offset: text.length);
-    final nextText = text.replaceRange(range.start, range.end, '\n');
-    controller.value = TextEditingValue(
-      text: nextText,
-      selection: TextSelection.collapsed(offset: range.start + 1),
-      composing: TextRange.empty,
-    );
-  }
-}
-
 /// Chooses an icon for the attachment MIME type.
 IconData _classicAttachmentIcon(String mimeType) {
   if (_classicIsAttachmentImage(mimeType)) {
@@ -1438,7 +1372,7 @@ double _classicProgressFor(core_proxy.InputProcessingState state) {
   return switch (state.kind) {
     'Processing' => 0.3,
     'Connecting' => 0.6,
-    'Summarizing' => 0.05,
+    'Summarizing' => summaryStageProgress(state.message),
     'ToolProgress' => state.progress.clamp(0, 1),
     _ => 1,
   };

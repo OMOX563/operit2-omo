@@ -28,8 +28,42 @@ include hashes in the existing build manifest.
 - `build_local.py`: existing current-host App/CLI/ESP32 dispatcher.
 - `build_apple_release.py`: Apple release asset dispatcher.
 - `build_esp32.py`: ESP32 firmware builder.
+- `build_android_module.py`: forwards to `apps/android-module/build.py`, whose canonical output is a module folder.
+- `build_android_module_release.py`: builds that folder and stages its installer ZIP as `operit2-module-android-arm64-v8a-<release-version>.zip`.
 - `check_build_environment.py`: shared local/CI environment checker.
 - `common.py`, `cli_common.py`, and `appstore_connect_common.py`: shared helpers.
+
+App/full release runs and Android Flutter Build in GitHub Actions include both
+the ordinary Android APK and the Android module ZIP. They build serially using
+the same platform build name/number and separate `operitRuntime` values. The
+module's `module.prop` uses the shared Cargo release version and the Flutter
+build number as `versionCode`. The folder is retained under
+`tools/release/work/android-module/module-arm64-v8a`; only the installer ZIP is
+staged in `tools/release/dist`. Its root directly contains `module.prop`.
+
+To build only the module release using the current version sources:
+
+```powershell
+.venv/Scripts/python.exe tools/build_scripts/build_android_module_release.py --enforce-lockfile
+```
+
+The same Android signing material and build prerequisites as the ordinary APK
+are required. This command builds packages without installing them on a phone.
+
+## Windows Bash runtime
+
+Windows App ZIP/MSI and CLI ZIP packages include Bash and common Unix commands
+selected from checksum-pinned PortableGit under `bash/`, including their transitive
+DLL dependencies, terminal descriptions, and upstream licenses. Git, Git GUI,
+Perl, Vim aliases, and development files are excluded. The Windows host starts
+`bash/bin/bash.exe` beside the executable and does not require a system Git
+installation or Git on PATH. Both x86_64 and aarch64 CLI packages stage their
+corresponding runtime. Flutter's normal Windows CMake build stages the runtime
+for Debug, Profile and Release, including `fvm flutter run -d windows`. This is
+an independent incremental target; Dart-only builds do not recopy a complete
+runtime or rebuild Rust to prepare Bash. Missing required runtime files trigger
+preparation again. The same preparation script can stage standalone development
+binaries with `.venv/Scripts/python.exe tools/build_scripts/windows_bash.py --destination <binary-directory>`.
 
 ## Generated plugin assets
 
@@ -146,7 +180,7 @@ commands pass through to the selected Xcode toolchain. The SDK itself is unchang
 
 The application reads isolation from the running process signature. The
 unsandbox Host registers native zsh/bash login PTYs with controlling-terminal
-job control and exposes the native `/` filesystem through VFS `/mnt/macos`.
+job control and exposes the native `/` filesystem through VFS `/virtual/macos`.
 The sandbox Host retains its no-controlling-TTY PTY adapter and folder bookmarks.
 AI permission modes and approvals apply to both; unsandbox remains subject to
 the current account and macOS privacy permissions.
@@ -163,10 +197,20 @@ resulting static library and generated Rust bindings together. The embedded
 startup snapshot comes from that same build. This avoids the incompatible
 snapshot in the previously used precompiled iOS archive.
 
-The iOS build uses compile-time jitless mode with Sparkplug, Maglev, TurboFan and
-WebAssembly disabled. It also disables the cppgc caged heap, avoiding its large
-aligned virtual-address reservation during startup without requiring Extended
-Virtual Addressing entitlements. Intl remains enabled. Temporal is disabled
+The iOS build uses compile-time jitless mode with Sparkplug, Maglev and TurboFan
+disabled. WebAssembly runs through V8's DrumBrake interpreter. The reviewed
+`patches/v8-152.2.0-ios-wasm-interpreter.patch` supports full-width references
+without pointer compression, including reference fields, array fills and imported
+multi-value reference returns and correct ARM64/x64 Smi tagging of return counts.
+The helper rejects unreviewed V8 versions or
+unexpected changes to the patched source. The patch digest is part of the cache
+identity.
+
+Explicit DrumBrake memory bounds checks are enabled. This avoids relying on a
+process-wide signal trap handler and 8 GiB Wasm memory guard reservations. Pointer
+compression, the sandbox and the cppgc caged heap remain disabled, avoiding their
+large aligned virtual-address reservations during startup without requiring
+Extended Virtual Addressing entitlements. Intl remains enabled. Temporal is disabled
 because the published source crate omits its Rust vendor dependencies; current
 runtime plugins do not use Temporal. These settings belong to the iOS build
 layer; the common JavaScript scheduler has no Apple-specific runtime branches.
@@ -189,15 +233,25 @@ python3 tools/build_scripts/prepare_ios_v8.py \
 ```
 
 Debug uses a regular executable with dead-code stripping and disables exporting
-all global symbols, so unused WebAssembly wrappers are removed. Swift-referenced
-Rust bridge entry points remain linked. The iSH runtime also namespaces its
+all global symbols. Used WebAssembly entry points and Swift-referenced Rust bridge
+entry points remain linked. The iSH runtime also namespaces its
 kernel printf/scanf functions so host V8 calls keep using Darwin libc. See
 `tools/ios-runtime/ish/README.md` for that native regression. Build/cache checks:
 
 ```bash
 python3 -m unittest discover -s tools/tests -p test_ios_v8_build.py -v
 python3 -m unittest discover -s tools/tests -p test_apple_plugin_build.py -v
+python3 tools/tests/run_ios_wasm_engine_smoke.py --baseline-node
+python3 tools/tests/run_ios_wasm_engine_smoke.py
 ```
+
+The engine smoke check uses the production Host JavaScript runtime, ToolPkg WASM
+API, real USearch module and character-memory adapter. It covers scalar and i64
+calls, JS callbacks, SIMD, memory growth, bounds traps, GC references, package
+export permissions and repeated realm/process creation. A matching simulator
+V8 cache and a booted iOS simulator are required. `--target aarch64-apple-ios`
+checks device cross-compilation and native linking; signed device execution is a
+separate check.
 
 ## Android V8 runtime
 

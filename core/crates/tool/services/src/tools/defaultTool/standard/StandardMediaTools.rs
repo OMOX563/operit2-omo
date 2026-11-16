@@ -4,8 +4,7 @@ use std::path::Path;
 
 use operit_host_api::HostManager::HostManager;
 use operit_plugin_sdk::js_sdk::results::MediaRegistrationResultData;
-use operit_tools::files::PathMapper::PathMapper;
-use operit_tools::files::VisualFileSystem::VisualFileSystem;
+use operit_util::MediaLinkBuilder::MediaLinkBuilder;
 use operit_util::MediaRegistration::{register_media_base64, register_media_bytes, RegisteredMedia};
 use serde::Deserialize;
 
@@ -152,7 +151,7 @@ fn registration_result(
     registered: RegisteredMedia,
 ) -> Result<MediaRegistrationResultData, String> {
     Ok(MediaRegistrationResultData {
-        link: format!("<link type=\"{kind}\" id=\"{}\"></link>", registered.id),
+        link: MediaLinkBuilder::media(kind, &registered.id),
         id: registered.id,
         mimeType: registered.mime_type,
         width: registered.width,
@@ -166,25 +165,7 @@ fn read_vfs_bytes(host: &HostManager, path: &str) -> Result<Vec<u8>, String> {
             "media_register_from_path does not support cross-device paths; copy the file to this device first".to_string(),
         );
     }
-    let file_system = host
-        .fileSystemHost
-        .clone()
-        .ok_or("FileSystemHost is required for media registration")?;
-    let storage = host
-        .runtimeStorageHost
-        .clone()
-        .ok_or("Runtime storage is required for media registration")?;
-    let runtime_root = storage
-        .runtimeRootDir()
-        .ok_or("Runtime root is unavailable")?;
-    let workspace_root = storage
-        .workspaceRootDir()
-        .ok_or("Workspace root is unavailable")?;
-    VisualFileSystem::new(
-        file_system,
-        PathMapper::new(runtime_root, workspace_root, storage),
-    )
-    .readFileBytes(path)
+    host.vfs()?.readFileBytes(path)
 }
 
 #[cfg(test)]
@@ -194,11 +175,15 @@ mod tests {
     use operit_util::MediaPoolManager::MediaPoolManager;
 
     #[test]
-    fn native_base64_request_returns_an_image_link() {
+    /// Verifies the public media tool registers decoded pixels and returns a media link.
+    fn native_base64_request_returns_media_links() {
+        use base64::Engine;
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::RgbaImage::new(2, 3).write_to(&mut png, image::ImageFormat::Png).unwrap();
         let json = serde_json::json!({
             "type": "image",
             "source": "base64",
-            "base64": "iVBORw0KGgoAAAANSUhEUgAAAAIAAAAD",
+            "base64": base64::engine::general_purpose::STANDARD.encode(png.get_ref()),
         })
         .to_string();
         let result: MediaRegistrationResultData = serde_json::from_str(
@@ -210,15 +195,21 @@ mod tests {
         assert_eq!(result.height, Some(3));
         assert_eq!(result.link, format!("<link type=\"image\" id=\"{}\"></link>", result.id));
         ImagePoolManager::remove_image(&result.id);
-        let audio = register_native_media(
-            &HostManager::default(),
-            r#"{"type":"audio","source":"base64","base64":"YQ==","mimeType":"audio/mpeg"}"#,
-        )
-        .expect("audio");
-        let audio: MediaRegistrationResultData = serde_json::from_str(&audio).expect("audio json");
-        assert!(audio.width.is_none());
-        assert!(audio.link.starts_with("<link type=\"audio\" id=\""));
-        MediaPoolManager::remove_media(&audio.id);
+        for (kind, mime) in [("audio", "audio/mpeg"), ("video", "video/mp4")] {
+            let json = serde_json::json!({
+                "type": kind, "source": "base64", "base64": "YQ==", "mimeType": mime,
+            })
+            .to_string();
+            let result: MediaRegistrationResultData = serde_json::from_str(
+                &register_native_media(&HostManager::default(), &json).expect("register"),
+            )
+            .expect("result");
+            assert_eq!(result.mimeType, mime);
+            assert!(result.width.is_none() && result.height.is_none());
+            assert_eq!(result.link, format!("<link type=\"{kind}\" id=\"{}\"></link>", result.id));
+            assert!(MediaPoolManager::get_media(&result.id).is_some());
+            MediaPoolManager::remove_media(&result.id);
+        }
     }
 }
 

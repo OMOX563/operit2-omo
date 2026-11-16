@@ -27,7 +27,7 @@ pub(crate) fn schema() -> PreferenceMergeSchema {
                 let path = operit_util::RuntimeStorageLayout::MODEL_CONFIGS_PREFERENCES_PATH;
                 PreferenceMergeStore {
                     path: path.to_string(),
-                    encrypted: true,
+                    encrypted: false,
                     open: |storage, path| ModelConfigManager::preferenceStore(storage, path),
                     merge: StoragePreferencesMergeDescriptor {
                         version: 1,
@@ -48,7 +48,7 @@ pub(crate) fn schema() -> PreferenceMergeSchema {
                 let path = operit_util::RuntimeStorageLayout::TTS_CONFIGS_PREFERENCES_PATH;
                 PreferenceMergeStore {
                     path: path.to_string(),
-                    encrypted: true,
+                    encrypted: false,
                     open: |storage, path| TtsConfigManager::preferenceStore(storage, path),
                     merge: StoragePreferencesMergeDescriptor {
                         version: 1,
@@ -73,7 +73,7 @@ pub(crate) fn schema() -> PreferenceMergeSchema {
                 let path = operit_util::RuntimeStorageLayout::STT_CONFIGS_PREFERENCES_PATH;
                 PreferenceMergeStore {
                     path: path.to_string(),
-                    encrypted: true,
+                    encrypted: false,
                     open: |storage, path| SttConfigManager::preferenceStore(storage, path),
                     merge: StoragePreferencesMergeDescriptor {
                         version: 1,
@@ -269,6 +269,7 @@ mod tests {
     impl Fixture {
         /// Opens a real storage host in an isolated directory for owner-contract replay checks.
         fn new() -> Self {
+            super::installTestHostSecrets();
             let root = std::env::temp_dir().join(format!(
                 "operit-preference-contract-{}",
                 uuid::Uuid::new_v4()
@@ -389,7 +390,7 @@ mod tests {
             "fileFieldName":"file","modelFieldName":"model","languageFieldName":"language",
             "responseTextJsonPath":"text","headers":[],"createdAt":1,"updatedAt":2});
         let workspace = json!({"id":"remote-workspace","name":"Remote workspace",
-            "folders":[{"name":"Root","path":"/app/workspaces/remote"}],"createdAt":1,"updatedAt":2});
+            "folders":[{"name":"Root","path":"/operitapp/workspaces/remote"}],"createdAt":1,"updatedAt":2});
         for (path, index, key, record) in [
             (
                 RuntimeStorageLayout::TTS_CONFIGS_PREFERENCES_PATH,
@@ -724,11 +725,19 @@ mod tests {
                 .writeBytesAtomically(
                     &path,
                     &serde_json::to_vec(&json!({
-                        "record":record.to_string(),"__operit_preferences_schema_version":2,
+                        "record":record.to_string(),"__operit_preferences_schema_version":0,
                     }))
                     .unwrap(),
                 )
                 .unwrap();
+            // Anchor the archived source before the opaque record codec upgrades it.
+            let source = PreferencesDataStore::newWithStorage(fixture.host.clone(), &path)
+                .withSchema(0, |_, _| Ok(()));
+            let checkpoint = source.syncSnapshot().unwrap();
+            assert!(source.repairSyncedSnapshot(&checkpoint.token().unwrap(), &checkpoint).unwrap());
+            // Released schema-2 files could still hold the archived JSON string.
+            PreferencesDataStore::newWithStorage(fixture.host.clone(), &path)
+                .withSchema(2, |_, _| Ok(())).data().unwrap();
             let mut operation = historical(
                 &path,
                 "record",
@@ -1140,6 +1149,9 @@ mod tests {
         source_store.prepareSync().unwrap();
         applyOperations(source.host.clone(),&schema(),&[],&[],|_,_|true).unwrap();
         let authority = source_store.syncSnapshot().unwrap();
+        // Preserve source context before installing the authority's canonical correction.
+        let target_source = (old_schema.stores[0].open)(target.host.clone(), path);
+        assert!(target_source.repairSyncedSnapshot(&target_source.syncSnapshot().unwrap().token().unwrap(), &checkpoint).unwrap());
         let target_store = UserPreferencesManager::store(target.host.clone());
         target_store.prepareSync().unwrap();
         assert!(target_store.repairSyncedSnapshot(&target_store.syncSnapshot().unwrap().token().unwrap(),&authority).unwrap());
@@ -1158,6 +1170,28 @@ mod tests {
         assert!(Transaction::compare(&source_store.syncSnapshot().unwrap(),&target_store.syncSnapshot().unwrap()).unwrap().is_none());
     }
 
+}
+
+/// Supplies a stable host secret interface for legacy encrypted owner fixtures.
+#[cfg(test)]
+fn installTestHostSecrets() {
+    struct TestSecrets;
+    impl operit_host_api::HostSecretStore for TestSecrets {
+        fn readSecret(&self, key: &str) -> operit_host_api::HostResult<Option<Vec<u8>>> {
+            if key != "operit.preferences.encryption_key.v1" {
+                return Err(operit_host_api::HostError::new("unexpected test secret key"));
+            }
+            Ok(Some(br#"{"format":"operit.preferences.encryption.key","version":1,"algorithm":"XChaCha20Poly1305","keyId":"owner-fixture","key":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}"#.to_vec()))
+        }
+        fn writeSecret(&self, _: &str, _: &[u8]) -> operit_host_api::HostResult<()> {
+            panic!("existing fixture key must not be replaced")
+        }
+        fn deleteSecret(&self, _: &str) -> operit_host_api::HostResult<()> {
+            panic!("existing fixture key must not be deleted")
+        }
+    }
+    static INSTALL: std::sync::Once = std::sync::Once::new();
+    INSTALL.call_once(|| operit_store::setDefaultHostSecretStore(Arc::new(TestSecrets)));
 }
 
 #[cfg(test)]

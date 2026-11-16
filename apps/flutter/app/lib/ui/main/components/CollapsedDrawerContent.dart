@@ -11,7 +11,9 @@ import '../../../core/bridge/ProxyCoreRuntimeBridge.dart';
 import '../../../core/proxy/generated/CoreProxyClients.g.dart';
 import '../../../core/proxy/generated/CoreProxyModels.g.dart' as core_proxy;
 import '../../common/OperitLogoMark.dart';
+import '../../features/update/AppUpdateBadge.dart';
 import '../../features/chat/components/NewChatIntro.dart';
+import '../../theme/OperitTheme.dart';
 import '../navigation/AppNavigationModels.dart';
 import '../layout/SidebarDockController.dart';
 import '../layout/NavigationLayoutMetrics.dart';
@@ -30,6 +32,7 @@ class CollapsedDrawerContent extends StatelessWidget {
     required this.selectedRouteId,
     required this.appearance,
     required this.onNavigationEntrySelected,
+    required this.onConversationNavigationPressed,
     required this.onConversationActivated,
     required this.currentChatId,
     required this.histories,
@@ -41,6 +44,7 @@ class CollapsedDrawerContent extends StatelessWidget {
   final String selectedRouteId;
   final NavigationDrawerAppearance appearance;
   final ValueChanged<NavigationEntrySpec> onNavigationEntrySelected;
+  final VoidCallback onConversationNavigationPressed;
   final VoidCallback onConversationActivated;
   final String? currentChatId;
   final List<core_proxy.ChatHistoryListItem> histories;
@@ -99,6 +103,9 @@ class CollapsedDrawerContent extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final l10n = AppLocalizations.of(context)!;
+    final theme = OperitTheme.of(context);
+    final darkThemeActive = theme.isDark(context);
     final topPadding = MediaQuery.paddingOf(context).top;
     final bottomPadding = MediaQuery.paddingOf(context).bottom;
     return Column(
@@ -112,9 +119,12 @@ class CollapsedDrawerContent extends StatelessWidget {
                 child: Padding(
                   padding: EdgeInsets.only(top: topPadding),
                   child: Center(
-                    child: OperitLogoMark(
-                      size: 34,
-                      color: appearance.statusAvailableColor,
+                    child: AppUpdateBadge(
+                      showIndicator: false,
+                      child: OperitLogoMark(
+                        size: 34,
+                        color: appearance.statusAvailableColor,
+                      ),
                     ),
                   ),
                 ),
@@ -125,10 +135,14 @@ class CollapsedDrawerContent extends StatelessWidget {
                 child: Center(
                   child: _RoundDrawerButton(
                     selected:
-                        selectedRouteId == navigationEntries.first.routeId,
+                        selectedRouteId ==
+                        ScreenRouteRegistry.routeIdOf(
+                          ScreenRouteRegistry.aiChat,
+                        ),
                     appearance: appearance,
                     icon: Icons.chat_bubble_outline,
-                    onClick: onConversationActivated,
+                    tooltip: l10n.aiChat,
+                    onClick: onConversationNavigationPressed,
                   ),
                 ),
               ),
@@ -139,6 +153,7 @@ class CollapsedDrawerContent extends StatelessWidget {
                     selected: false,
                     appearance: appearance,
                     icon: Icons.add_comment_outlined,
+                    tooltip: '新建对话',
                     onClick: () => unawaited(_createConversation(context)),
                   ),
                 ),
@@ -187,7 +202,25 @@ class CollapsedDrawerContent extends StatelessWidget {
                     selected: selectedRouteId == _packageManagerRouteId,
                     appearance: appearance,
                     icon: Icons.inventory_2_outlined,
+                    tooltip: l10n.packageManager,
                     onClick: _openPackageManager,
+                  ),
+                ),
+              ),
+              Padding(
+                padding: _collapsedItemPadding,
+                child: Center(
+                  child: Builder(
+                    key: const ValueKey('desktop-theme-toggle'),
+                    builder: (buttonContext) => _RoundDrawerButton(
+                      selected: false,
+                      appearance: appearance,
+                      icon: darkThemeActive
+                          ? Icons.light_mode_outlined
+                          : Icons.dark_mode_outlined,
+                      tooltip: darkThemeActive ? '切换白天模式' : '切换黑夜模式',
+                      onClick: () => theme.toggle(buttonContext),
+                    ),
                   ),
                 ),
               ),
@@ -198,6 +231,7 @@ class CollapsedDrawerContent extends StatelessWidget {
                     selected: selectedRouteId == _settingsRouteId,
                     appearance: appearance,
                     icon: Icons.settings_outlined,
+                    tooltip: l10n.settings,
                     onClick: _openSettings,
                   ),
                 ),
@@ -237,10 +271,39 @@ class SidebarInfoCard extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return ThemeSidebarInfoCard(
-      brandName: brandName,
-      appearance: appearance,
-      trailing: trailing,
+    return Padding(
+      padding: const EdgeInsetsDirectional.fromSTEB(20, 4, 14, 4),
+      child: LayoutBuilder(
+        builder: (context, constraints) => Row(
+          children: [
+            Expanded(
+              child: Align(
+                alignment: AlignmentDirectional.centerStart,
+                child: AppUpdateBadge(
+                  child: Text(
+                    brandName,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: Theme.of(context).textTheme.titleLarge?.copyWith(
+                      color: appearance.titleColor,
+                      fontWeight: FontWeight.bold,
+                      letterSpacing: 0,
+                    ),
+                  ),
+                ),
+              ),
+            ),
+            if (trailing != null)
+              ConstrainedBox(
+                // Reserve brand space even with several plugin tabs.
+                constraints: BoxConstraints(
+                  maxWidth: constraints.maxWidth * 2 / 3,
+                ),
+                child: trailing!,
+              ),
+          ],
+        ),
+      ),
     );
   }
 }
@@ -250,10 +313,12 @@ class ConversationSearchField extends StatelessWidget {
     super.key,
     required this.controller,
     required this.appearance,
+    this.hintText = '搜索对话',
   });
 
   final TextEditingController controller;
   final NavigationDrawerAppearance appearance;
+  final String hintText;
 
   @override
   Widget build(BuildContext context) {
@@ -267,7 +332,7 @@ class ConversationSearchField extends StatelessWidget {
       ).textTheme.bodyMedium?.copyWith(color: appearance.titleColor),
       decoration: InputDecoration(
         isDense: true,
-        hintText: '搜索对话',
+        hintText: hintText,
         hintStyle: Theme.of(context).textTheme.bodyMedium?.copyWith(
           color: appearance.itemColor.withValues(alpha: 0.62),
         ),
@@ -365,6 +430,7 @@ class ConversationDrawerItem extends StatefulWidget {
     required this.onDetach,
     this.onSearchMessages,
     this.onViewFavorites,
+    this.childToggle,
     this.nested = false,
     this.workspaceStyle = false,
   });
@@ -390,6 +456,7 @@ class ConversationDrawerItem extends StatefulWidget {
   final bool Function(core_proxy.ChatHistoryListItem) canAcceptDrop;
   final bool canDetach;
   final VoidCallback onDetach;
+  final Widget? childToggle;
   final bool nested;
   final bool workspaceStyle;
 
@@ -463,6 +530,7 @@ class _ConversationDrawerItemState extends State<ConversationDrawerItem>
             appearance: appearance,
             workspaceStyle: workspaceStyle,
             nested: widget.nested,
+            metadata: widget.childToggle,
             pinned: history.pinned,
             locked: history.locked,
             dragHovering: candidateData.isNotEmpty,
@@ -1062,12 +1130,14 @@ class _RoundDrawerButton extends StatelessWidget {
     required this.appearance,
     required this.icon,
     required this.onClick,
+    this.tooltip,
   });
 
   final bool selected;
   final NavigationDrawerAppearance appearance;
   final IconData icon;
   final VoidCallback? onClick;
+  final String? tooltip;
 
   /// Builds the compact plugin drag source and reorder drop target.
   @override
@@ -1082,6 +1152,7 @@ class _RoundDrawerButton extends StatelessWidget {
         shape: const CircleBorder(),
         child: IconButton(
           onPressed: onClick,
+          tooltip: tooltip,
           padding: EdgeInsets.zero,
           constraints: const BoxConstraints.tightFor(width: 40, height: 40),
           iconSize: 20,
@@ -1119,6 +1190,7 @@ class _DockedPluginRoundButton extends StatelessWidget {
       selected: selected,
       appearance: appearance,
       icon: entry.icon,
+      tooltip: entry.title,
       onClick: onClick,
     );
     if (controller == null ||

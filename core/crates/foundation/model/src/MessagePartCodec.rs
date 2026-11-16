@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use operit_util::ChatMarkupRegex::{attr_value, tag_body, tag_ranges, ChatMarkupRegex};
+use operit_util::ChatMarkupRegex::{attr_value, tag_ranges, ChatMarkupRegex};
 
 use super::MessagePart::{MessagePart, MessagePartKind};
 
@@ -8,7 +8,7 @@ use super::MessagePart::{MessagePart, MessagePartKind};
 pub struct MessagePartCodec;
 
 impl MessagePartCodec {
-    /// Parses one complete assistant message into ordered semantic parts.
+    /// Parses assistant output, including interrupted semantic parts.
     pub fn parseAssistantMarkup(content: &str) -> Result<Vec<MessagePart>, String> {
         let mut state = AssistantMarkupStreamState::new();
         state.push(content)?;
@@ -112,12 +112,53 @@ impl MessagePartCodec {
         ))
     }
 
+    /// Retains an interrupted tool call with its received parameters and original source.
+    fn parseUnfinishedToolCall(partId: String, sequence: i32, raw: &str) -> MessagePart {
+        let mut part = MessagePart::new(
+            partId.clone(), sequence, MessagePartKind::ToolCall, raw.to_string(),
+        );
+        part.toolCallId = Some(partId);
+        let openingEnd = raw.find('>').map_or(raw.len(), |end| end + 1);
+        part.toolName = attr_value(&raw[..openingEnd], "name");
+        if let Some(openEnd) = raw.find('>') {
+            for (start, end) in tag_ranges(&raw[openEnd + 1..], "param") {
+                let parameter = &raw[openEnd + 1 + start..openEnd + 1 + end];
+                if let (Some(name), Some(body)) = (
+                    attr_value(parameter, "name"), unfinishedTagBody(parameter, "param"),
+                ) {
+                    part.attributes.insert(name, body.to_string());
+                }
+            }
+        }
+        part
+    }
+
+    /// Captures received result metadata and payload without requiring the outer closing tag.
+    fn parseUnfinishedToolResult(
+        partId: String, sequence: i32, raw: &str, opening: &str,
+    ) -> MessagePart {
+        let mut part = MessagePart::new(
+            partId, sequence, MessagePartKind::ToolResult, String::new(),
+        );
+        part.toolName = attr_value(opening, "name");
+        part.toolCallId = attr_value(opening, "call_id");
+        part.attributes = Self::openingAttributes(opening, &["status", "display", "result_data"]);
+        for (start, end) in tag_ranges(&raw[opening.len()..], "content") {
+            let content = &raw[opening.len() + start..opening.len() + end];
+            if let Some(body) = unfinishedTagBody(content, "content") {
+                part.content = body.to_string();
+            }
+        }
+        part
+    }
+
     /// Parses one tool-result tag into a semantic message part.
     fn parseToolResult(partId: String, sequence: i32, raw: &str) -> Result<MessagePart, String> {
         let tagName = ChatMarkupRegex::extract_opening_tag_name(raw)
             .ok_or_else(|| "tool result is missing an opening tag name".to_string())?;
         let body = Self::tagBody(raw, &tagName)?;
-        let payload = tag_body(&body, "content")
+        let payload = tag_ranges(&body, "content").into_iter().next()
+            .and_then(|(start, end)| unfinishedTagBody(&body[start..end], "content"))
             .ok_or_else(|| "tool result is missing its content tag".to_string())?
             .to_string();
         let toolName = attr_value(raw, "name")
@@ -145,11 +186,11 @@ impl MessagePartCodec {
         Ok(part)
     }
 
-    /// Extracts the content body for a complete XML-like tag.
+    /// Extracts the received tag body without requiring a closing delimiter.
     fn tagBody(raw: &str, tagName: &str) -> Result<String, String> {
-        tag_body(raw, tagName)
+        unfinishedTagBody(raw, tagName)
             .map(str::to_string)
-            .ok_or_else(|| format!("message markup tag {tagName} is incomplete"))
+            .ok_or_else(|| format!("message markup tag {tagName} is missing its opening delimiter"))
     }
 
     /// Reads the selected opening-tag attributes into a stable map.
@@ -178,6 +219,10 @@ impl MessagePartCodec {
 
     /// Appends one structured tool call as protocol markup.
     fn appendToolCallMarkup(markup: &mut String, part: &MessagePart) {
+        if !part.content.is_empty() {
+            markup.push_str(&part.content);
+            return;
+        }
         markup.push_str("<tool name=\"");
         markup.push_str(&Self::escapeAttribute(
             part.toolName
@@ -203,13 +248,12 @@ impl MessagePartCodec {
 
     /// Appends one structured tool result as protocol markup.
     fn appendToolResultMarkup(markup: &mut String, part: &MessagePart) {
-        markup.push_str("<tool_result name=\"");
-        markup.push_str(&Self::escapeAttribute(
-            part.toolName
-                .as_deref()
-                .expect("tool-result parts require a tool name"),
-        ));
-        markup.push('\"');
+        markup.push_str("<tool_result");
+        if let Some(toolName) = &part.toolName {
+            markup.push_str(" name=\"");
+            markup.push_str(&Self::escapeAttribute(toolName));
+            markup.push('\"');
+        }
         if let Some(callId) = &part.toolCallId {
             markup.push_str(" call_id=\"");
             markup.push_str(&Self::escapeAttribute(callId));
@@ -245,6 +289,7 @@ impl MessagePartCodec {
 }
 
 /// Incrementally converts an assistant response stream into canonical message parts.
+#[derive(Clone)]
 pub struct AssistantMarkupStreamState {
     source: String,
     pending: String,
@@ -252,6 +297,15 @@ pub struct AssistantMarkupStreamState {
     activeThinkingOpenTag: Option<String>,
     activeThinkingCloseTag: Option<String>,
     preserveUnsupportedTags: bool,
+    segments: Option<Vec<AssistantMarkupSegment>>,
+    activeOpaqueCloseTag: Option<String>,
+}
+
+/// Carries original markup or semantic text without serializing canonical parts.
+#[derive(Clone, Debug)]
+pub struct AssistantMarkupSegment {
+    pub kind: Option<MessagePartKind>,
+    pub content: String,
 }
 
 impl Default for AssistantMarkupStreamState {
@@ -268,6 +322,8 @@ impl Default for AssistantMarkupStreamState {
             activeThinkingOpenTag: None,
             activeThinkingCloseTag: None,
             preserveUnsupportedTags: false,
+            segments: None,
+            activeOpaqueCloseTag: None,
         }
     }
 }
@@ -278,9 +334,28 @@ impl AssistantMarkupStreamState {
         Self::default()
     }
 
+    /// Emits semantic chunks without retaining the full source or building canonical parts.
+    pub fn forSegments() -> Self {
+        Self { segments: Some(Vec::new()), ..Self::default() }
+    }
+
+    /// Drains newly classified source chunks in their original order.
+    pub fn takeSegments(&mut self) -> Vec<AssistantMarkupSegment> {
+        self.segments.as_mut().map(std::mem::take).unwrap_or_default()
+    }
+
+    /// Appends an original semantic delimiter or opaque tool payload to the segment output.
+    fn appendOpaque(&mut self, content: &str) {
+        if let Some(segments) = &mut self.segments {
+            if !content.is_empty() {
+                segments.push(AssistantMarkupSegment { kind: None, content: content.into() });
+            }
+        }
+    }
+
     /// Appends a newly received response chunk and updates only its affected message part.
     pub fn push(&mut self, chunk: &str) -> Result<(), String> {
-        self.source.push_str(chunk);
+        if self.segments.is_none() { self.source.push_str(chunk); }
         self.pending.push_str(chunk);
         self.consumePending(false)
     }
@@ -304,7 +379,7 @@ impl AssistantMarkupStreamState {
         &self.parts
     }
 
-    /// Finalizes semantic parts while retaining unfinished thinking content.
+    /// Finalizes semantic parts without requiring interrupted output to close its tags.
     pub fn complete(&mut self) -> Result<(), String> {
         self.consumePending(true)
     }
@@ -318,10 +393,28 @@ impl AssistantMarkupStreamState {
     /// Consumes source buffered across chunk boundaries into complete semantic parts.
     fn consumePending(&mut self, isFinal: bool) -> Result<(), String> {
         loop {
+            if let Some(closeTag) = self.activeOpaqueCloseTag.clone() {
+                let close = findAsciiCaseInsensitive(&self.pending, &closeTag);
+                let end = match close {
+                    Some(start) => start + closeTag.len(),
+                    None if isFinal => self.pending.len(),
+                    None => self.pending.len() - asciiCaseInsensitiveSuffixPrefixLength(&self.pending, &closeTag),
+                };
+                let content = self.pending[..end].to_string();
+                self.appendOpaque(&content);
+                self.pending.drain(..end);
+                if close.is_some() || isFinal {
+                    self.activeOpaqueCloseTag = None;
+                    continue;
+                }
+                return Ok(());
+            }
             if let Some(closeTag) = self.activeThinkingCloseTag.clone() {
                 if let Some(closeStart) = findAsciiCaseInsensitive(&self.pending, &closeTag) {
                     let content = self.pending[..closeStart].to_string();
                     self.appendThinkingContent(&content);
+                    let delimiter = self.pending[closeStart..closeStart + closeTag.len()].to_string();
+                    self.appendOpaque(&delimiter);
                     self.pending = self.pending[closeStart + closeTag.len()..].to_string();
                     self.activeThinkingOpenTag = None;
                     self.activeThinkingCloseTag = None;
@@ -362,7 +455,19 @@ impl AssistantMarkupStreamState {
             let Some(openEndOffset) = self.pending.find('>') else {
                 if self.isPotentialSemanticOpening() {
                     if isFinal {
-                        return Err("assistant semantic opening tag is incomplete".into());
+                        let content = std::mem::take(&mut self.pending);
+                        let tagName = ChatMarkupRegex::extract_opening_tag_name(&content);
+                        let isTool = tagName.as_deref()
+                            .is_some_and(|name| ChatMarkupRegex::is_tool_tag_name(Some(name)));
+                        if !self.preserveUnsupportedTags && isTool {
+                            self.appendOpaque(&content);
+                            let sequence = self.parts.len() as i32;
+                            self.parts.push(MessagePartCodec::parseUnfinishedToolCall(
+                                MessagePartCodec::partId(sequence), sequence, &content,
+                            ));
+                        } else {
+                            self.appendMarkdownContent(&content);
+                        }
                     }
                     return Ok(());
                 }
@@ -384,6 +489,11 @@ impl AssistantMarkupStreamState {
                 continue;
             }
             if openingTag.trim_end().ends_with("/>") {
+                if self.segments.is_some() {
+                    self.appendOpaque(&openingTag);
+                    self.pending.drain(..openEnd);
+                    continue;
+                }
                 if self.preserveUnsupportedTags {
                     self.appendMarkdownContent(&openingTag);
                     self.pending = self.pending[openEnd..].to_string();
@@ -395,11 +505,12 @@ impl AssistantMarkupStreamState {
             }
             if normalizedTagName == "think" || normalizedTagName == "thinking" {
                 let sequence = self.parts.len() as i32;
-                self.parts.push(MessagePart::thinking(
+                if self.segments.is_none() { self.parts.push(MessagePart::thinking(
                     MessagePartCodec::partId(sequence),
                     sequence,
                     String::new(),
-                ));
+                )); }
+                self.appendOpaque(&openingTag);
                 self.activeThinkingOpenTag = Some(openingTag);
                 self.pending = self.pending[openEnd..].to_string();
                 self.activeThinkingCloseTag = Some(format!("</{tagName}>"));
@@ -407,6 +518,12 @@ impl AssistantMarkupStreamState {
             }
 
             let closeTag = format!("</{tagName}>");
+            if self.segments.is_some() {
+                self.appendOpaque(&openingTag);
+                self.pending.drain(..openEnd);
+                self.activeOpaqueCloseTag = Some(closeTag);
+                continue;
+            }
             let Some(relativeCloseStart) =
                 findAsciiCaseInsensitive(&self.pending[openEnd..], &closeTag)
             else {
@@ -417,7 +534,21 @@ impl AssistantMarkupStreamState {
                         self.appendMarkdownContent(&content);
                         return Ok(());
                     }
-                    return Err(format!("assistant semantic tag is incomplete: {tagName}"));
+                    let raw = std::mem::take(&mut self.pending);
+                    let sequence = self.parts.len() as i32;
+                    let partId = MessagePartCodec::partId(sequence);
+                    let part = match normalizedTagName.as_str() {
+                        "tool" => MessagePartCodec::parseUnfinishedToolCall(partId, sequence, &raw),
+                        "tool_result" => MessagePartCodec::parseUnfinishedToolResult(
+                            partId, sequence, &raw, &openingTag,
+                        ),
+                        "status" => MessagePart::status(
+                            partId, sequence, raw[openEnd..].to_string(),
+                            MessagePartCodec::openingAttributes(&openingTag, &["type"]),
+                        ),
+                        _ => unreachable!("unfinished semantic tags must match their parser"),
+                    };
+                    self.parts.push(part);
                 }
                 return Ok(());
             };
@@ -443,6 +574,10 @@ impl AssistantMarkupStreamState {
         if content.is_empty() {
             return;
         }
+        if let Some(segments) = &mut self.segments {
+            segments.push(AssistantMarkupSegment { kind: Some(MessagePartKind::Markdown), content: content.into() });
+            return;
+        }
         let extendsMarkdownPart = self
             .parts
             .last()
@@ -466,6 +601,10 @@ impl AssistantMarkupStreamState {
     /// Appends source to the currently open thinking part.
     fn appendThinkingContent(&mut self, content: &str) {
         if content.is_empty() {
+            return;
+        }
+        if let Some(segments) = &mut self.segments {
+            segments.push(AssistantMarkupSegment { kind: Some(MessagePartKind::Thinking), content: content.into() });
             return;
         }
         let part = self
@@ -511,6 +650,18 @@ impl AssistantMarkupStreamState {
                 .iter()
                 .any(|name| name.starts_with(&normalized))
     }
+}
+
+/// Reads the received body of a tag whose closing delimiter may not have arrived.
+fn unfinishedTagBody<'a>(raw: &'a str, tagName: &str) -> Option<&'a str> {
+    let start = raw.find('>')? + 1;
+    let body = &raw[start..];
+    let closing = format!("</{tagName}>");
+    let end = match findAsciiCaseInsensitive(body, &closing) {
+        Some(end) => end,
+        None => body.len() - asciiCaseInsensitiveSuffixPrefixLength(body, &closing),
+    };
+    Some(&body[..end])
 }
 
 /// Returns whether a complete tag name denotes a semantic message part.
@@ -844,11 +995,82 @@ mod tests {
         }
     }
 
-    /// Malformed tool markup remains an error instead of becoming visible protocol payloads.
+    /// Interrupted tool calls retain their semantic kind, received arguments, and exact source.
     #[test]
-    fn rejects_incomplete_and_malformed_live_tool_markup() {
+    fn preserves_unfinished_tool_calls_at_every_character_boundary() {
+        let source = "Before<tool_G543 name=\"read_file\"><param name=\"path\">文档/a.txt</param></tool_G543>";
+        let mut live = AssistantMarkupStreamState::new();
+        for end in source.char_indices().map(|(end, _)| end)
+            .chain(std::iter::once(source.len()))
+        {
+            let prefix = &source[..end];
+            live.pushSnapshot(prefix).unwrap();
+            let mut snapshot = AssistantMarkupStreamState::new();
+            snapshot.resetToSnapshot(prefix).unwrap();
+            let parts = snapshot.finish().expect("interrupted tool snapshots must finish");
+            assert_eq!(snapshot.finish().unwrap(), parts);
+            if end >= "Before<tool".len() && end < source.len() {
+                assert_eq!(parts.len(), 2, "{prefix}");
+                assert_eq!(parts[1].kind, MessagePartKind::ToolCall, "{prefix}");
+                assert_eq!(MessagePartCodec::assistantMarkup(&parts), prefix);
+            }
+        }
+        assert_eq!(
+            live.finish().unwrap(), MessagePartCodec::parseAssistantMarkup(source).unwrap(),
+        );
+    }
+
+    /// Cancellation retains incomplete parameter values while later chunks can still complete the live call.
+    #[test]
+    fn unfinished_tool_parameters_remain_structured() {
+        let source = "Before<tool name=\"read_file\"><param name=\"path\">文档/a.txt</pa";
+        let parts = MessagePartCodec::parseAssistantMarkup(source).unwrap();
+        assert_eq!(parts[1].toolName.as_deref(), Some("read_file"));
+        assert_eq!(
+            parts[1].attributes.get("path").map(String::as_str), Some("文档/a.txt"),
+        );
+        assert_eq!(MessagePartCodec::assistantMarkup(&parts), source);
+        let encoded = serde_json::to_string(&parts).unwrap();
+        let restored: Vec<super::MessagePart> = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(parts, restored);
+    }
+
+    /// Inner parameter and content tags do not require closing delimiters either.
+    #[test]
+    fn parses_unclosed_bodies_inside_completed_outer_tags() {
+        let parts = MessagePartCodec::parseAssistantMarkup(
+            "<tool name=\"read_file\"><param name=\"path\">文档/a.txt</tool>",
+        ).unwrap();
+        assert_eq!(
+            parts[1].attributes.get("path").map(String::as_str), Some("文档/a.txt"),
+        );
+        let parts = MessagePartCodec::parseAssistantMarkup(
+            "<tool_result name=\"read_file\" status=\"success\"><content>payload</tool_result>",
+        ).unwrap();
+        assert_eq!(parts[1].content, "payload");
+    }
+
+    /// Result and status snapshots may end before any semantic closing delimiter arrives.
+    #[test]
+    fn finishes_unclosed_results_and_statuses() {
+        for source in [
+            "<tool_result name=\"read_file\" status=\"success\"><content>文档/a.txt",
+            "<tool_result name=\"read_file\" status=\"success\"><content>文档/a.txt</content>",
+        ] {
+            let parts = MessagePartCodec::parseAssistantMarkup(source).unwrap();
+            assert_eq!(parts[1].kind, MessagePartKind::ToolResult);
+            assert_eq!(parts[1].toolName.as_deref(), Some("read_file"));
+            assert_eq!(parts[1].content, "文档/a.txt");
+        }
+        let parts = MessagePartCodec::parseAssistantMarkup("<status type=\"warning\">careful").unwrap();
+        assert_eq!(parts[1].kind, MessagePartKind::Status);
+        assert_eq!(parts[1].content, "careful");
+    }
+
+    /// Completed malformed tool markup still reports invalid fields.
+    #[test]
+    fn rejects_malformed_completed_tool_markup() {
         for content in [
-            "Before<tool_G543 name=\"read_file\"><param name=\"path\">a.txt</param>",
             "Before<tool name=\"search\"><param name=\"various_search</param></tool>After",
             "Before<tool_result name=\"search\" status=\"success\">PRIVATE-RESULT</tool_result>",
         ] { assert!(MessagePartCodec::parseAssistantMarkup(content).is_err(), "{content}"); }

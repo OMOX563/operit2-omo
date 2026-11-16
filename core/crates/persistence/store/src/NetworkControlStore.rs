@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::CoreNodeIdentityStore::CoreNodeIdentityStore;
-use crate::CoreSpaceStore::{CoreSpaceDeviceProfile, CoreSpaceStore};
+use crate::CoreSpaceStore::{CoreSpace, CoreSpaceDeviceProfile, CoreSpaceStore};
 use crate::RuntimeStorageHost::defaultRuntimeStorageHost;
 use crate::PreferencesDataStore::{stringPreferencesKey, CoreNodeStateStore};
 use crate::NetworkControlReadModel::{lockControlReadModel};
@@ -177,7 +177,13 @@ fn deserializeControlCommand<'de, D: serde::Deserializer<'de>>(deserializer: D) 
         WireCommand::AdmitSpace { sourceSpaceId, identities, nodeIds } => {
             let identities = match (identities, nodeIds) {
                 (Some(identities), None) => identities,
-                (None, Some(nodes)) => nodes.into_iter().map(|node| (node, "user".into())).collect(),
+                (None, Some(nodes)) => {
+                    // Insert directly: bulk collection adds a temporary sorting
+                    // buffer and a separate sort implementation on small devices.
+                    let mut identities = BTreeMap::new();
+                    for node in nodes { identities.insert(node, "user".into()); }
+                    identities
+                },
                 (Some(_), Some(_)) => return Err(serde::de::Error::custom("Space admission cannot contain both nodeIds and identities")),
                 (None, None) => return Err(serde::de::Error::custom("Space admission requires identities")),
             };
@@ -219,6 +225,16 @@ pub struct NetworkControlState {
     pub deviceIdentityIds: BTreeMap<String, String>,
     pub disconnectedNodeIds: BTreeSet<String>,
     pub policies: BTreeMap<String, String>,
+}
+
+impl NetworkControlState {
+    /// Applies the same capability rule to callers sharing one policy snapshot.
+    pub fn nodeHasCapability(&self, nodeId: &str, capability: &str, targetNodeId: Option<&str>) -> Result<bool, String> {
+        validateNodeId(nodeId)?;
+        validateCapability(capability)?;
+        if let Some(target) = targetNodeId { validateNodeId(target)?; }
+        Ok(hasCapability(self, nodeId, capability, targetNodeId))
+    }
 }
 
 /// Owns the compact, auditable authorization policy for one synchronized Space.
@@ -346,9 +362,16 @@ impl NetworkControlStore {
 
     /// Reads the accepted projection without copying its collections or loading command history.
     pub fn withCurrentState<R>(&self, read: impl FnOnce(&NetworkControlState) -> R) -> Result<R, String> {
+        self.withCurrentSpaceState(|_, state| read(state))
+    }
+
+    /// Uses one Space read and a shared immutable policy snapshot. Release the
+    /// model lock before invoking callers, which may access storage or mutate policy.
+    pub fn withCurrentSpaceState<R>(&self, read: impl FnOnce(&CoreSpace, &NetworkControlState) -> R) -> Result<R, String> {
         let space = self.spaceStore.initialize()?;
-        let state = self.stateForSpace(&space.spaceId)?;
-        Ok(read(&state))
+        let model = self.syncOperationStore.networkControlReadModel(self.nodeLocalOnly).map_err(|error| error.to_string())?;
+        let state = lockControlReadModel(&model).map_err(|error| error.to_string())?.state(&space.spaceId)?;
+        Ok(read(&space, &state))
     }
 
     /// Returns the complete accepted and rejected command audit for the current Space.
@@ -365,12 +388,7 @@ impl NetworkControlStore {
         capability: &str,
         targetNodeId: Option<&str>,
     ) -> Result<bool, String> {
-        validateNodeId(nodeId)?;
-        validateCapability(capability)?;
-        if let Some(targetNodeId) = targetNodeId {
-            validateNodeId(targetNodeId)?;
-        }
-        self.withCurrentState(|state| hasCapability(state, nodeId, capability, targetNodeId))
+        self.withCurrentState(|state| state.nodeHasCapability(nodeId, capability, targetNodeId))?
     }
 
     /// Returns whether a node is prohibited from being used as a direct connection or route hop.
@@ -549,6 +567,7 @@ impl NetworkControlStore {
     /// The key is bound to the claimed request/version, not just the member:
     /// removing and later readmitting a member must still create a new command.
     #[allow(non_snake_case)]
+    #[inline(never)]
     pub fn admitSpaceForReview(&self, sourceSpaceId: String, identities: BTreeMap<String, String>, reviewKey: &str) -> Result<SyncOperation, String> {
         let _lock = networkControlMutationLock()
             .lock()
@@ -583,6 +602,7 @@ impl NetworkControlStore {
     /// Looks up one review receipt without retaining the complete decoded log.
     /// Every immutable envelope and duplicate is still validated before returning.
     #[allow(non_snake_case)]
+    #[inline(never)]
     pub fn spaceControlOperation(&self, spaceId: &str, commandId: &str, issuer: &str) -> Result<Option<SyncOperation>, String> {
         if !self.boundedStorage {
             return Ok(self.orderedCommands(spaceId)?.into_iter()
@@ -618,6 +638,7 @@ impl NetworkControlStore {
 
     /// Canonicalizes immutable identities once and derives the manifest from every original byte.
     #[allow(non_snake_case)]
+    #[inline(never)]
     fn readSpaceControlProjection(&self, spaceId: &str, query: ControlExportQuery<'_>)
         -> Result<(SpaceControlManifest, Option<Box<serde_json::value::RawValue>>), String> {
         use sha2::{Digest, Sha256};
@@ -712,19 +733,22 @@ impl NetworkControlStore {
     /// Applies one received control command without emitting a second local command.
     #[allow(non_snake_case)]
     pub fn applySyncedOperation(&self, operation: &SyncOperation) -> Result<(), String> {
+        self.applySyncedOperations(std::slice::from_ref(operation))
+    }
+
+    /// Applies one Space's received commands with one durable control-clock publication.
+    pub fn applySyncedOperations(&self, operations: &[SyncOperation]) -> Result<(), String> {
         let _lock = networkControlMutationLock()
             .lock()
             .map_err(|error| format!("Network control mutation lock poisoned: {error}"))?;
-        validateControlOperation(operation)?;
-        if self.nodeLocalOnly { return self.projectControlOperationsUnlocked(std::slice::from_ref(operation)); }
+        for operation in operations { validateControlOperation(operation)?; }
+        if self.nodeLocalOnly { return self.projectControlOperationsUnlocked(operations); }
         self.syncOperationStore
-            .appendUnobservedOperation(operation)
+            .appendUnobservedOperations(operations)
             .map_err(|error| error.to_string())?;
-        // Acknowledge the control sequence on its own clock so the same page is
-        // not exported on every synchronization pass. Business sequences stay
-        // behind this command so earlier chat or file operations are not lost.
+        // Control acknowledgements cannot hide earlier business operations from the same origin.
         self.syncOperationStore
-            .observeNetworkControlOperation(operation)
+            .observeNetworkControlOperations(operations)
             .map_err(|error| error.to_string())
     }
 
@@ -762,7 +786,7 @@ impl NetworkControlStore {
         let mut known = if compact {
             // Normally empty after endpoint migration. Preserve compatibility
             // with an endpoint that still has journal authority to reconcile.
-            let mut journal = self.syncOperationStore.archivedControlOperations().map_err(|error| error.to_string())?;
+            let mut journal = self.syncOperationStore.archivedControlOperations(self.nodeLocalOnly).map_err(|error| error.to_string())?;
             journal.reverse();
             journal.sort_by(|left, right| left.opId.cmp(&right.opId));
             journal.dedup_by(|left, right| left.opId == right.opId);
@@ -921,6 +945,7 @@ impl NetworkControlStore {
         self.projectControlOperationsForSpaceUnlocked(operations, &spaceId)
     }
 
+    #[inline(never)]
     fn projectControlOperationsForSpaceUnlocked(&self, operations: &[SyncOperation], spaceId: &str) -> Result<(), String> {
         // Validate the full batch before one atomic merge. Encoded history is
         // borrowed, and existing commands are decoded one at a time for equality.
@@ -996,6 +1021,7 @@ impl NetworkControlStore {
     }
 
     #[allow(non_snake_case)]
+    #[inline(never)]
     fn appendLocalCommandWithId(&self, spaceId: &str, command: NetworkControlCommand, commandId: String) -> Result<SyncOperation, String> {
         let record = NetworkControlCommandRecord {
             commandId,
@@ -1044,10 +1070,11 @@ impl NetworkControlStore {
     /// Reads the state maintained by committed control mutations.
     #[allow(non_snake_case)]
     fn stateForSpace(&self, spaceId: &str) -> Result<NetworkControlState, String> {
-        lockControlReadModel(&self.syncOperationStore.networkControlReadModel().map_err(|error| error.to_string())?).map_err(|error| error.to_string())?.state(spaceId)
+        lockControlReadModel(&self.syncOperationStore.networkControlReadModel(self.nodeLocalOnly).map_err(|error| error.to_string())?).map_err(|error| error.to_string())?.state(spaceId).map(|state| state.as_ref().clone())
     }
 
     /// Order borrowed encoded records once, decoding at most one payload at a time.
+    #[inline(never)]
     fn visitEncodedCommands(&self, spaceId: &str,
         mut visit: impl FnMut(&serde_json::value::RawValue) -> Result<(), String>) -> Result<(), String> {
         validateSpaceId(spaceId)?;
@@ -1063,7 +1090,7 @@ impl NetworkControlStore {
                 createdAt: operation.createdAt, originDeviceId: operation.originDeviceId.into_owned(), sequence: operation.sequence,
             }, space: record.spaceId, json })
         }
-        let mut journal = self.syncOperationStore.archivedControlOperations().map_err(|error| error.to_string())?;
+        let mut journal = self.syncOperationStore.archivedControlOperations(self.nodeLocalOnly).map_err(|error| error.to_string())?;
         journal.reverse();
         journal.sort_by(|left, right| left.opId.cmp(&right.opId));
         journal.dedup_by(|left, right| left.opId == right.opId);
@@ -1102,7 +1129,7 @@ impl NetworkControlStore {
     /// Reads the exact policy revision in deterministic authorization order.
     fn orderedCommands(&self, spaceId: &str) -> Result<Vec<SyncOperation>, String> {
         validateSpaceId(spaceId)?;
-        lockControlReadModel(&self.syncOperationStore.networkControlReadModel().map_err(|error| error.to_string())?).map_err(|error| error.to_string())?.commands(spaceId)
+        lockControlReadModel(&self.syncOperationStore.networkControlReadModel(self.nodeLocalOnly).map_err(|error| error.to_string())?).map_err(|error| error.to_string())?.commands(spaceId)
     }
 
     /// Replays authorization commands and reads display profiles only for explicit audits.
@@ -1179,7 +1206,9 @@ fn networkControlMutationLock() -> &'static Mutex<()> {
 /// Returns the immutable built-in roles exposed alongside user-defined roles.
 #[allow(non_snake_case)]
 fn builtinRoles() -> BTreeMap<String, NetworkControlRole> {
-    [
+    let mut roles = BTreeMap::new();
+    // Four fixed entries do not need the bulk collector's temporary sort.
+    for role in [
         builtinRole("admin", "Administrator", ["*"]),
         builtinRole(
             "user",
@@ -1193,10 +1222,10 @@ fn builtinRoles() -> BTreeMap<String, NetworkControlRole> {
         ),
         builtinRole("relay", "Relay", [NETWORK_DEVICES_VIEW_CAPABILITY, "network.relay", "storage.provide"]),
         builtinRole("edge", "Edge", [NETWORK_DEVICES_VIEW_CAPABILITY, "runtime.execute"]),
-    ]
-    .into_iter()
-    .map(|role| (role.roleId.clone(), role))
-    .collect()
+    ] {
+        roles.insert(role.roleId.clone(), role);
+    }
+    roles
 }
 
 /// Creates one fixed built-in role definition.

@@ -1,7 +1,8 @@
+import { createTerminal9p } from "./terminal_9p.js";
 import { createBrowserJavaScriptHost } from "./operit_javascript_runtime.js";
 import { createBrowserHttpStreamHost } from "./browser_http_stream.js";
 import { openBrowserFile } from "./browser_file_open.js";
-import { captureBrowserScreen, readBrowserLocation, recognizeBrowserText,
+import { captureBrowserScreen, readBrowserLocation, recognizeBrowserText, requireBrowserSharedMemory,
   type BrowserOcrEngine } from "./browser_system_capabilities.js";
 
 type JsonValue =
@@ -421,6 +422,7 @@ interface DownloadRequest {
 }
 
 interface V86StarterConfiguration {
+  filesystem?: { handle9p: (request: Uint8Array, reply: (packet: Uint8Array) => void) => void };
   wasm_path: string;
   memory_size: number;
   vga_memory_size: number;
@@ -462,6 +464,9 @@ interface LinuxVmSession {
   progressVisible: boolean;
   activeCommand: LinuxVmCommand | null;
   pendingCommands: LinuxVmCommand[];
+  managedExecution: { output: number[]; result: LinuxVmCommandResult | null; error: string | null } | null;
+  screen: number[];
+  workingDir: string;
 }
 
 interface LinuxVmCommandResult {
@@ -594,6 +599,7 @@ interface RuntimeWorkerHostCall {
   method: string;
   args: unknown[];
   control: SharedArrayBuffer;
+  filesystem?: SharedArrayBuffer;
 }
 
 interface RuntimeWorkerHostPayload {
@@ -752,6 +758,41 @@ interface ModelInstallWorkerError {
   function registerMainHostModule<T extends object>(module: T): T {
     mainHostModules.add(module);
     return module;
+  }
+
+  let terminalFilesystemBuffer: SharedArrayBuffer | null = null;
+  let terminalFilesystemControl: Int32Array | null = null;
+  let notifyTerminalFilesystemWorker: (() => void) | null = null;
+
+  /** Calls the OPFS owner directly, including while it waits for a guest command. */
+  async function callTerminalFilesystem(method: string, args: unknown[]): Promise<unknown> {
+    const buffer = terminalFilesystemBuffer;
+    if (buffer === null) throw new Error("Terminal filesystem owner is unavailable");
+    const header = new Int32Array(buffer, 0, 2), payload = new Uint8Array(buffer, 8);
+    while (Atomics.compareExchange(header, 0, 0, 4) !== 0) {
+      await new Promise(resolve => setTimeout(resolve, 1));
+    }
+    try {
+      const request = MessagePack.encode([method, args]);
+      if (request.length > payload.length) throw new Error("Terminal filesystem request exceeds channel capacity");
+      payload.set(request);
+      Atomics.store(header, 1, request.length);
+      Atomics.store(header, 0, 1);
+      const control = terminalFilesystemControl;
+      if (control !== null) {
+        Atomics.compareExchange(control, 0, 0, 3);
+        Atomics.notify(control, 0);
+      }
+      notifyTerminalFilesystemWorker?.();
+      while (Atomics.load(header, 0) !== 2) {
+        await new Promise(resolve => setTimeout(resolve, 1));
+      }
+      const response = MessagePack.decode(payload.slice(0, Atomics.load(header, 1)));
+      if (!Array.isArray(response) || response[0] !== 0) throw new Error(String(response[1]));
+      return response[1];
+    } finally {
+      Atomics.store(header, 0, 0);
+    }
   }
 
   const textEncoder = new TextEncoder();
@@ -2605,7 +2646,7 @@ interface ModelInstallWorkerError {
     paths: AsrBundlePaths,
     state: WebLocalInferenceState,
   ): Promise<WebAsrBundle> {
-    requireCrossOriginIsolation("ASR");
+    requireBrowserSharedMemory();
     const urls = {
       recognizerScript: runtimeJavaScriptUrl(
         paths.recognizerScript,
@@ -2658,7 +2699,7 @@ interface ModelInstallWorkerError {
     paths: TtsBundlePaths,
     state: WebLocalInferenceState,
   ): Promise<WebTtsBundle> {
-    requireCrossOriginIsolation("TTS");
+    requireBrowserSharedMemory();
     const urls = {
       ttsScript: runtimeBlobUrl(paths.ttsScript, "text/javascript", state),
       runtimeScript: runtimeBlobUrl(paths.runtimeScript, "text/javascript", state),
@@ -2889,16 +2930,6 @@ self.onmessage = (event) => {
       if (performance.now() >= deadline) {
         throw new Error("Web TTS worker command timed out");
       }
-    }
-  }
-
-  // Requires the response isolation headers needed by threaded Sherpa WASM.
-  function requireCrossOriginIsolation(capability: string): void {
-    if (globalThis.crossOriginIsolated !== true) {
-      throw new Error(
-        `Web local ${capability} requires Cross-Origin-Opener-Policy: same-origin and ` +
-          "Cross-Origin-Embedder-Policy: require-corp",
-      );
     }
   }
 
@@ -3165,7 +3196,7 @@ self.onmessage = (event) => {
 
   /** Creates one worker-backed guest process and schedules its serial deployment frames. */
   function startManagedRuntimeProcess(request: ManagedRuntimeRequest): string {
-    requireCrossOriginIsolation("managed Node/Python runtime");
+    requireBrowserSharedMemory();
     validateManagedRuntimeRequest(request);
     const runtime = guestRuntimeExecutable(request.program);
     const executablePath = request.executablePath?.trim();
@@ -3418,13 +3449,16 @@ self.onmessage = (event) => {
     return session;
   }
 
-  /** Adds bytes to one session's terminal output buffer without dropping data. */
+  /** Retains bounded output tails independently for the renderer and screen snapshots. */
   function appendLinuxVmOutput(session: LinuxVmSession, bytes: Uint8Array): void {
-    const requiredLength = session.outputLength + bytes.length;
-    if (requiredLength > linuxVmOutputLimit) {
-      failLinuxVmSession(session, new Error("Linux VM terminal output exceeded 4 MiB"));
-      return;
+    for (const byte of bytes) session.screen.push(byte);
+    if (session.screen.length > 65536) session.screen.splice(0, 32768);
+    if (session.outputLength + bytes.length > linuxVmOutputLimit) {
+      const drop = Math.max(linuxVmOutputLimit / 2, session.outputLength + bytes.length - linuxVmOutputLimit);
+      session.output.copyWithin(0, drop, session.outputLength);
+      session.outputLength -= drop;
     }
+    const requiredLength = session.outputLength + bytes.length;
     if (requiredLength > session.output.length) {
       const nextLength = Math.min(
         linuxVmOutputLimit,
@@ -3440,10 +3474,11 @@ self.onmessage = (event) => {
 
   /** Appends one command-output byte while enforcing the terminal output limit. */
   function appendLinuxVmCommandOutput(command: LinuxVmCommand, byte: number): void {
-    const requiredLength = command.outputLength + 1;
-    if (requiredLength > linuxVmOutputLimit) {
-      throw new Error("Linux VM command output exceeded 4 MiB");
+    if (command.outputLength === linuxVmOutputLimit) {
+      command.output.copyWithin(0, linuxVmOutputLimit / 2);
+      command.outputLength = linuxVmOutputLimit / 2;
     }
+    const requiredLength = command.outputLength + 1;
     if (requiredLength > command.output.length) {
       const expanded = new Uint8Array(Math.min(
         linuxVmOutputLimit,
@@ -3465,6 +3500,11 @@ self.onmessage = (event) => {
     appendLinuxVmOutput(session, Uint8Array.of(byte));
     if (command.collectingOutput) {
       appendLinuxVmCommandOutput(command, byte);
+      const execution = session.managedExecution;
+      if (execution !== null) {
+        execution.output.push(byte);
+        if (execution.output.length >= 1048576) execution.output.splice(0, 524288);
+      }
     }
   }
 
@@ -3508,6 +3548,7 @@ self.onmessage = (event) => {
     }
     clearTimeout(command.timeoutHandle);
     session.activeCommand = null;
+    session.workingDir = result.workingDir;
     command.resolve(result);
     startNextLinuxVmCommand(session);
   }
@@ -3623,8 +3664,8 @@ self.onmessage = (event) => {
     if (typeof command !== "string" || command.trim().length === 0) {
       throw new Error("Linux VM terminal command must not be blank");
     }
-    if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1) {
-      throw new Error("Linux VM terminal timeout must be a positive integer");
+    if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 0) {
+      throw new Error("Linux VM terminal timeout must be a nonnegative integer");
     }
     if (session.state === "failed" || session.state === "closed") {
       throw new Error(`Linux VM terminal is not running: ${sessionId}`);
@@ -3634,7 +3675,7 @@ self.onmessage = (event) => {
       const commandState: LinuxVmCommand = {
         token,
         command,
-        timeoutHandle: globalThis.setTimeout(() => {
+        timeoutHandle: timeoutMs === 0 ? 0 : globalThis.setTimeout(() => {
           if (session.activeCommand !== commandState) {
             return;
           }
@@ -3766,6 +3807,7 @@ self.onmessage = (event) => {
       }
       renderLinuxVmProgress(session, "Downloading runtime");
       const emulator = new module.V86({
+        filesystem: { handle9p: createTerminal9p({ call: callTerminalFilesystem }) },
         wasm_path: v86AssetUrl("v86.wasm"),
         memory_size: 512 * 1024 * 1024,
         vga_memory_size: 2 * 1024 * 1024,
@@ -3848,6 +3890,9 @@ self.onmessage = (event) => {
       progressVisible: false,
       activeCommand: null,
       pendingCommands: [],
+      managedExecution: null,
+      screen: [],
+      workingDir: "/",
     };
     linuxVmSessions.set(sessionId, session);
     void startLinuxVm(session);
@@ -3948,8 +3993,18 @@ self.onmessage = (event) => {
     javaScriptRuntime: registerMainHostModule(createBrowserJavaScriptHost()),
     terminal: registerMainHostModule({
       /** Starts one browser-local Linux VM terminal session. */
-      startPty(sessionId: string, rows: number, cols: number): void {
+      async startPty(sessionId: string, rows: number, cols: number): Promise<void> {
         startLinuxVmSession(sessionId, rows, cols);
+        try {
+          const result = await executeLinuxVmCommand(sessionId,
+            "mkdir -p /mnt/operit-host && mount -t 9p -o trans=virtio,version=9p2000,cache=none,msize=65536 host9p /mnt/operit-host", 120000);
+          if (result.timedOut || result.exitCode !== 0) {
+            throw new Error(`Cannot mount browser workspace: ${result.output}`);
+          }
+        } catch (error) {
+          closeLinuxVmPty(sessionId);
+          throw error;
+        }
       },
       /** Drains raw virtual serial bytes from one browser-local Linux VM terminal. */
       readPty(sessionId: string): Uint8Array {
@@ -3966,6 +4021,31 @@ self.onmessage = (event) => {
         timeoutMs: number,
       ): Promise<LinuxVmCommandResult> {
         return executeLinuxVmCommand(sessionId, command, timeoutMs);
+      },
+      /** Starts a command without holding the synchronous Rust bridge until completion. */
+      startPtyCommand(sessionId: string, command: string): void {
+        const session = linuxVmSession(sessionId);
+        if (session.activeCommand !== null || session.pendingCommands.length > 0) throw new Error("Terminal session is busy");
+        const execution = { output: [] as number[], result: null as LinuxVmCommandResult | null, error: null as string | null };
+        session.managedExecution = execution;
+        void executeLinuxVmCommand(sessionId, command, 0).then(
+          result => { execution.result = result; },
+          error => { execution.error = String(error); },
+        );
+      },
+      /** Drains command output and reads its original receipt without sending terminal input. */
+      pollPtyCommand(sessionId: string) {
+        const session = linuxVmSession(sessionId);
+        const execution = session.managedExecution;
+        if (execution === null) throw new Error("Terminal has no managed command");
+        const output = Uint8Array.from(execution.output.splice(0, 65536));
+        return { output, result: execution.output.length === 0 ? execution.result : null, error: execution.error };
+      },
+      /** Exposes current session activity and retained visible output independently of PTY drains. */
+      sessionState(sessionId: string) {
+        const session = linuxVmSession(sessionId);
+        return { commandRunning: session.activeCommand !== null || session.pendingCommands.length > 0,
+          workingDir: session.workingDir, content: textDecoder.decode(Uint8Array.from(session.screen)) };
       },
       /** Records terminal dimensions requested for one browser-local Linux VM terminal. */
       resizePty(sessionId: string, rows: number, cols: number): void {
@@ -4278,6 +4358,46 @@ self.onmessage = (event) => {
         sqliteTransactions.delete(id);
       },
     }),
+    terminalFilesystem: registerWorkerHostModule({
+      stat(path: string) {
+        const isFile = storageHasFile(filePrefix, path);
+        if (!isFile && path !== "" && !fileDirectoryExists(path)) throw new Error("No such file or directory");
+        return { isDirectory: !isFile, size: isFile ? storageRead(filePrefix, path).length : 0 };
+      },
+      list(path: string) {
+        return listFileDirectory(path).map(entry => ({
+          name: entry.path.split("/").pop() || entry.path, isDirectory: entry.isDirectory, size: entry.size,
+        }));
+      },
+      read(path: string, offset: number, count: number) {
+        return storageReadRange(filePrefix, path, offset, count);
+      },
+      write(path: string, offset: number, content: Uint8Array) {
+        const previous = storageRead(filePrefix, path);
+        const bytes = new Uint8Array(Math.max(previous.length, offset + content.length));
+        bytes.set(previous); bytes.set(content, offset); storageWrite(filePrefix, path, bytes);
+      },
+      truncate(path: string, size: number) {
+        const previous = storageRead(filePrefix, path), bytes = new Uint8Array(size);
+        bytes.set(previous.subarray(0, size)); storageWrite(filePrefix, path, bytes);
+      },
+      create(path: string) {
+        if (storageExists(filePrefix, path) || fileDirectoryExists(path)) throw new Error("File exists");
+        storageWrite(filePrefix, path, new Uint8Array());
+      },
+      mkdir(path: string) {
+        if (storageExists(filePrefix, path) || fileDirectoryExists(path)) throw new Error("File exists");
+        makeFileDirectory(path, false);
+      },
+      remove(path: string) {
+        if (fileDirectoryExists(path) && listFileDirectory(path).length) throw new Error("Directory not empty");
+        storageDelete(filePrefix, path, false); deleteFileDirectory(path, false);
+      },
+      rename(source: string, target: string) {
+        copyFileSystemEntry(source, target, true);
+        storageDelete(filePrefix, source, true); deleteFileDirectory(source, true);
+      },
+    }),
     fileSystem: registerWorkerHostModule({
       validatePath() {},
       listFiles(path: string) {
@@ -4537,40 +4657,26 @@ self.onmessage = (event) => {
       getSystemSetting(namespace: string, setting: string) {
         return { namespace, setting, value: "" };
       },
-      installApp(path: string) {
-        return { operationType: "install", packageName: path, success: false, details: "" };
+      installApp(_path: string) {
+        throw new Error("Browser security does not allow installing native application packages. Download the package and use your system installer.");
       },
-      uninstallApp(packageName: string) {
-        return { operationType: "uninstall", packageName, success: false, details: "" };
+      uninstallApp(_packageName: string) {
+        throw new Error("Browser security does not allow uninstalling native applications. Use your system application settings.");
       },
-      listInstalledApps(includeSystemApps: boolean) {
-        return { includesSystemApps: includeSystemApps, packages: [] as string[] };
+      listInstalledApps(_includeSystemApps: boolean) {
+        throw new Error("Browsers cannot enumerate installed native applications.");
       },
-      startApp(packageName: string) {
-        return { operationType: "start", packageName, success: false, details: "" };
+      startApp(_packageName: string) {
+        throw new Error("Browsers cannot launch arbitrary native application identifiers.");
       },
-      stopApp(packageName: string) {
-        return { operationType: "stop", packageName, success: false, details: "" };
+      stopApp(_packageName: string) {
+        throw new Error("Browsers cannot stop native application processes.");
       },
-      /** Rejects notification history that browsers do not expose to applications. */
       getNotifications() {
         throw new Error("Browsers do not expose other applications' system notifications");
       },
-      getAppUsageTime(
-        packageName: string,
-        sinceHours: number,
-        limit: number,
-        includeSystemApps: boolean,
-      ) {
-        return {
-          startTime: Date.now(),
-          endTime: Date.now(),
-          sinceHours,
-          requestedPackageName: packageName,
-          includesSystemApps: includeSystemApps,
-          totalEntries: 0,
-          entries: [] as string[],
-        };
+      getAppUsageTime(_packageName: string, _sinceHours: number, _limit: number, _includeSystemApps: boolean) {
+        throw new Error("Browsers do not expose native application foreground usage history.");
       },
       /** Acquires a current user-authorized position from the browser. */
       getDeviceLocation(timeout: number, highAccuracy: boolean, includeAddress: boolean) {
@@ -4600,7 +4706,7 @@ self.onmessage = (event) => {
           availableMemory: "",
           totalStorage: "",
           availableStorage: "",
-          batteryLevel: 0,
+          batteryLevel: -1,
           batteryCharging: false,
           cpuInfo: "",
           networkType: navigator.onLine ? "online" : "offline",
@@ -5107,6 +5213,10 @@ self.onmessage = (event) => {
     const leaderHostCalls = new Map<number, RuntimeWorkerLeaderHostCallRoute>();
     const disconnectedHostPayloads = new Map<number, Uint8Array>();
 
+    notifyTerminalFilesystemWorker = () => {
+      if (runtimeWorker !== null) runtimeWorker.postMessage({ type: "terminalFilesystemWake" });
+      else coordinator.postMessage({ type: "terminalFilesystemWake" });
+    };
     coordinator.addEventListener("message", event => handleCoordinatorMessage(event.data));
     runtimeGlobal.addEventListener("pagehide", disconnectRuntimeWorker);
     void locks.request(runtimeOwnerLockName, { mode: "exclusive" }, runRuntimeLeadership).catch(rejectRuntimeRequests);
@@ -5152,6 +5262,10 @@ self.onmessage = (event) => {
     /** Routes one cross-page coordination message received from a different browser page. */
     function handleCoordinatorMessage(value: unknown): void {
       if (typeof value !== "object" || value === null) {
+        return;
+      }
+      if (Reflect.get(value, "type") === "terminalFilesystemWake") {
+        runtimeWorker?.postMessage({ type: "terminalFilesystemWake" });
         return;
       }
       if (isLeaderCoreRequest(value)) {
@@ -5630,6 +5744,10 @@ self.onmessage = (event) => {
     message: RuntimeWorkerHostCall,
     hostPayloads: Map<number, Uint8Array>,
   ): Promise<void> {
+    if (message.filesystem instanceof SharedArrayBuffer) {
+      terminalFilesystemBuffer = message.filesystem;
+      terminalFilesystemControl = new Int32Array(message.control);
+    }
     let encoded: Uint8Array;
     try {
       const host = runtimeGlobal.__operitHost as Record<string, Record<string, unknown>> | undefined;

@@ -401,30 +401,6 @@ impl ChatHistoryManager {
         self.hydrateMessages(snapshot.messages, snapshot.variants, snapshot.parts)
     }
 
-    /// Loads a chat history row with display-ready messages.
-    fn loadDisplayHistory(
-        &self,
-        chatHistory: ChatHistory,
-    ) -> ChatHistoryManagerResult<ChatHistory> {
-        let messages = self.loadChatMessages(&chatHistory.id)?;
-        Ok(ChatHistory {
-            messages,
-            ..chatHistory
-        })
-    }
-
-    /// Loads display-ready histories for a list of chat entities.
-    fn loadDisplayHistories(
-        &self,
-        chatHistories: Vec<ChatHistory>,
-    ) -> ChatHistoryManagerResult<Vec<ChatHistory>> {
-        let mut completeHistories = Vec::new();
-        for chatHistory in chatHistories {
-            completeHistories.push(self.loadDisplayHistory(chatHistory)?);
-        }
-        Ok(completeHistories)
-    }
-
     /// Converts one chat and its messages into an archive entry.
     fn buildOperitArchivedChat(
         &self,
@@ -513,10 +489,48 @@ impl ChatHistoryManager {
     /// Loads one persisted chat history metadata row.
     #[allow(non_snake_case)]
     pub fn loadChatHistory(&self, chatId: String) -> ChatHistoryManagerResult<Option<ChatHistory>> {
-        Ok(self
-            .chatDao
-            .getChatById(&chatId)?
-            .map(|chatEntity| chatEntity.toChatHistory(Vec::new())))
+        let chat = self.chatDao.getChatById(&chatId)?;
+        if chat.is_some() { self.ensureOutputDirectory(&chatId)?; self.fileDirectoryForChat(&chatId)?; }
+        Ok(chat.map(|chatEntity| chatEntity.toChatHistory(Vec::new())))
+    }
+
+    /// Persists inherited output bindings independently of mutable parent links.
+    pub fn ensureOutputDirectory(&self, chatId: &str) -> ChatHistoryManagerResult<String> {
+        let outputs = crate::ChatOutputStore::ChatOutputStore::new(crate::RuntimeStorageHost::defaultRuntimeStorageHost());
+        let mut chain = Vec::new();
+        let mut visited = HashSet::new();
+        let mut current = chatId.to_string();
+        let mut directory = loop {
+            if !visited.insert(current.clone()) { return Err(ChatHistoryManagerError::IllegalState("Cyclic parent conversations".into())); }
+            if let Some(directory) = outputs.directory(&current).map_err(ChatHistoryManagerError::IllegalState)? { break Some(directory); }
+            let chat = self.chatDao.getChatById(&current)?.ok_or_else(|| ChatHistoryManagerError::IllegalArgument(format!("Chat not found: {current}")))?;
+            let parent = chat.parentChatId.clone();
+            chain.push(chat);
+            match parent { Some(parent) if self.chatDao.getChatById(&parent)?.is_some() => current = parent, _ => break None }
+        };
+        for chat in chain.iter().rev() {
+            directory = Some(outputs.bind(&chat.id, chat.createdAt, directory.as_deref()).map_err(ChatHistoryManagerError::IllegalState)?);
+        }
+        directory.ok_or_else(|| ChatHistoryManagerError::IllegalState("Missing output directory".into()))
+    }
+
+    /// Returns the actual relative-path base without treating outputs as a workspace.
+    pub fn fileDirectoryForChat(&self, chatId: &str) -> ChatHistoryManagerResult<String> {
+        let chat = self.chatDao.getChatById(chatId)?.ok_or_else(|| ChatHistoryManagerError::IllegalArgument("Chat does not exist".into()))?;
+        if let Some(id) = chat.workspaceId.as_deref() {
+            if let Some(workspace) = self.getWorkspace(id)? {
+                let path = workspace.primaryFolder().path.clone();
+                if let Some(relative) = path.strip_prefix("/operitapp/workspaces/").or_else(|| path.strip_prefix("/app/workspaces/")) {
+                    crate::FileSyncPolicy::FileSyncPolicy::ensure(crate::RuntimeStorageHost::defaultRuntimeStorageHost().as_ref(), &format!("workspaces/{relative}"))
+                        .map_err(ChatHistoryManagerError::IllegalState)?;
+                }
+                return Ok(path);
+            }
+        }
+        let directory = self.ensureOutputDirectory(chatId)?;
+        crate::ChatOutputStore::ChatOutputStore::new(crate::RuntimeStorageHost::defaultRuntimeStorageHost()).prepare(chatId)
+            .map_err(ChatHistoryManagerError::IllegalState)?;
+        Ok(directory)
     }
 
     /// Counts all stored chats.
@@ -774,8 +788,28 @@ impl ChatHistoryManager {
                 "Chat does not exist: {chatId}"
             )));
         }
+        self.ensureOutputDirectory(&chatId)?;
         self.chatDao.promoteChatToRoot(&chatId, currentTimeMillis())?;
         self.recordChatMetadata(&chatId)?;
+        Ok(())
+    }
+
+    /// Keeps relative references bound to their saved message revision in every write path.
+    fn bindMessageFileContext(&self, chatId: &str, messageToPersist: &mut ChatMessage) -> ChatHistoryManagerResult<()> {
+        let timestamp = messageToPersist.timestamp;
+        let variantIndex = messageToPersist.selectedVariantIndex;
+        let oldParts = self.database.messagePartDao().getPartsForMessage(chatId, timestamp, variantIndex)?;
+        let oldContext = oldParts.iter().find(|part| part.attributes.contains_key("file_base_path"));
+        let base = oldContext.and_then(|p| p.attributes.get("file_base_path")).cloned()
+            .map(Ok).unwrap_or_else(|| self.fileDirectoryForChat(chatId))?;
+        let node = oldContext.and_then(|p| p.attributes.get("file_node_id")).cloned()
+            .or_else(|| crate::CoreNodeIdentityStore::CoreNodeIdentityStore::localNodeId());
+        for part in &mut messageToPersist.parts {
+            if matches!(part.kind, operit_model::MessagePart::MessagePartKind::Markdown | operit_model::MessagePart::MessagePartKind::Thinking) {
+                part.attributes.entry("file_base_path".into()).or_insert_with(|| base.clone());
+                if let Some(node) = &node { part.attributes.entry("file_node_id".into()).or_insert_with(|| node.clone()); }
+            }
+        }
         Ok(())
     }
 
@@ -783,7 +817,7 @@ impl ChatHistoryManager {
     fn persistMessageLocked(
         &self,
         chatId: &str,
-        messageToPersist: ChatMessage,
+        mut messageToPersist: ChatMessage,
     ) -> ChatHistoryManagerResult<ChatMessage> {
         if messageToPersist.selectedVariantIndex < 0 {
             return Err(ChatHistoryManagerError::IllegalArgument(
@@ -792,6 +826,7 @@ impl ChatHistoryManager {
         }
         let timestamp = messageToPersist.timestamp;
         let variantIndex = messageToPersist.selectedVariantIndex;
+        self.bindMessageFileContext(chatId, &mut messageToPersist)?;
         let updatedAt = currentTimeMillis();
         self.syncStore.mutateMessage(chatId, timestamp, |transaction| {
             let existing = transaction.queryOne(
@@ -1068,12 +1103,12 @@ impl ChatHistoryManager {
         Ok(())
     }
 
-    /// Atomically commits one assistant segment, chat metrics, and its sync operation.
+    /// Atomically commits an assistant segment, its usage delta, optional context window, and sync state.
     pub fn commitAssistantMessageSegment(
         &self,
         chatId: String,
-        message: ChatMessage,
-        chatMetrics: Option<(i64, i64, i64)>,
+        mut message: ChatMessage,
+        currentWindowSize: Option<i64>,
     ) -> ChatHistoryManagerResult<crate::SyncOperationStore::SyncClock> {
         if message.sender != "ai" {
             return Err(ChatHistoryManagerError::IllegalArgument(format!(
@@ -1098,11 +1133,7 @@ impl ChatHistoryManager {
             ChatHistoryManagerError::IllegalArgument(format!("Chat does not exist: {chatId}"))
         })?;
         chat.updatedAt = currentTimeMillis();
-        if let Some((inputTokens, outputTokens, currentWindowSize)) = chatMetrics {
-            chat.inputTokens = inputTokens;
-            chat.outputTokens = outputTokens;
-            chat.currentWindowSize = currentWindowSize;
-        }
+        self.bindMessageFileContext(&chatId, &mut message)?;
         let timestamp = message.timestamp;
         let parts = message.parts.clone();
         let messageEntity = MessageEntity::fromChatMessage(
@@ -1114,7 +1145,7 @@ impl ChatHistoryManager {
         let partEntities = messagePartEntities(&chatId, timestamp, 0, &parts);
         Ok(self
             .syncStore
-            .commitAssistantMessageSegment(chat, messageEntity, partEntities)?)
+            .commitAssistantMessageSegment(chat, messageEntity, partEntities, currentWindowSize)?)
     }
 
     /// Updates favorite state for a message and its selected variant.
@@ -1295,6 +1326,10 @@ impl ChatHistoryManager {
 
     /// Deletes a chat when deletion policy allows it.
     pub fn deleteChatHistory(&self, chatId: String) -> ChatHistoryManagerResult<bool> {
+        // Freeze child bindings before removing the row from which they inherit.
+        for child in self.chatDao.getAllChatsDirectly()?.iter().filter(|chat| chat.parentChatId.as_deref() == Some(&chatId)) {
+            self.ensureOutputDirectory(&child.id)?;
+        }
         if !self.syncStore.deleteChat(&chatId)? {
             return Ok(false);
         }
@@ -1335,6 +1370,11 @@ impl ChatHistoryManager {
         source: Option<(&str, Option<i64>)>,
     ) -> ChatHistoryManagerResult<ChatHistory> {
         self.syncStore.commitChatDraft(&draft, source)?;
+        let inherited = draft.parentChatId.as_deref().or_else(|| source.map(|(id, _)| id));
+        let directory = inherited.map(|id| self.ensureOutputDirectory(id)).transpose()?;
+        crate::ChatOutputStore::ChatOutputStore::new(crate::RuntimeStorageHost::defaultRuntimeStorageHost())
+            .bind(&draft.id, draft.createdAt.parse().map_err(|_| ChatHistoryManagerError::IllegalArgument("Invalid creation time".into()))?, directory.as_deref())
+            .map_err(ChatHistoryManagerError::IllegalState)?;
         self.createBinding(&draft.id)?;
         self.loadChatHistory(draft.id.clone())?.ok_or_else(|| {
             ChatHistoryManagerError::IllegalState("Committed draft chat was not found".to_string())
@@ -1529,34 +1569,6 @@ impl ChatHistoryManager {
         Ok(self.chatDao.getChatById(&chatId)?.map(|chat| chat.title))
     }
 
-    /// Loads all hydrated messages for one chat.
-    pub fn loadChatMessages(&self, chatId: &str) -> ChatHistoryManagerResult<Vec<ChatMessage>> {
-        self.loadMessagesSnapshot(
-            chatId,
-            "SELECT * FROM messages WHERE chatId = ?1 ORDER BY timestamp ASC",
-            sqliteParams![chatId],
-        )
-    }
-
-    /// Loads hydrated messages with optional summary-message filtering.
-    pub fn loadChatMessagesWithOptions(
-        &self,
-        chatId: String,
-        order: Option<String>,
-        limit: Option<i32>,
-    ) -> ChatHistoryManagerResult<Vec<ChatMessage>> {
-        let normalizedOrder = order.map(|order| order.trim().to_lowercase());
-        let direction = match normalizedOrder.as_deref() {
-            Some("desc") => "DESC",
-            _ => "ASC",
-        };
-        let (sql, params) = match limit {
-            Some(limit) => (format!("SELECT * FROM messages WHERE chatId = ?1 ORDER BY timestamp {direction} LIMIT ?2"), sqliteParams![chatId, limit.max(1)]),
-            None => (format!("SELECT * FROM messages WHERE chatId = ?1 ORDER BY timestamp {direction}"), sqliteParams![chatId]),
-        };
-        self.loadMessagesSnapshot(&chatId, &sql, params)
-    }
-
     /// Loads hydrated messages inside an inclusive zero-based index range.
     pub fn loadChatMessagesRange(
         &self,
@@ -1669,6 +1681,11 @@ impl ChatHistoryManager {
         Ok(self.messageDao.existsUserMessage(&chatId)?)
     }
 
+    /// Checks for a newer committed user turn without loading conversation messages.
+    pub fn hasUserMessageAfter(&self, chatId: &str, timestamp: i64) -> ChatHistoryManagerResult<bool> {
+        Ok(self.messageDao.existsUserMessageAfterTimestamp(chatId, timestamp)?)
+    }
+
     /// Loads runtime-visible messages for model context.
     pub fn loadRuntimeChatMessages(
         &self,
@@ -1686,48 +1703,48 @@ impl ChatHistoryManager {
             sqliteParams![chatId])
     }
 
-    /// Loads lightweight message previews for locator search UI.
+    /// Loads model context through a historical message, including the summary at that point.
+    pub fn loadRuntimeChatMessagesUpTo(
+        &self,
+        chatId: String,
+        upToTimestampInclusive: i64,
+    ) -> ChatHistoryManagerResult<Vec<ChatMessage>> {
+        self.loadMessagesSnapshot(&chatId,
+            r#"
+            WITH latest AS (
+                SELECT MAX(timestamp) AS timestamp FROM messages
+                WHERE chatId = ?1 AND sender = 'summary' AND timestamp <= ?2
+            )
+            SELECT messages.* FROM messages, latest
+            WHERE chatId = ?1
+                AND (latest.timestamp IS NULL OR messages.timestamp >= latest.timestamp)
+                AND messages.timestamp <= ?2
+            ORDER BY messages.timestamp ASC
+            "#,
+            sqliteParams![chatId, upToTimestampInclusive])
+    }
+
+    /// Counts later persisted messages without hydrating previews, parts or variants.
+    pub fn loadChatMessageDepths(&self, chatId: &str, timestamps: &[i64]) -> ChatHistoryManagerResult<Vec<i32>> {
+        timestamps.iter().map(|timestamp| {
+            Ok(self.messageDao.countMessagesAfterTimestamp(chatId, *timestamp)?)
+        }).collect()
+    }
+
+    /// Reads the global message index with bounded previews and no hydrated message bodies.
     pub fn loadChatMessageLocatorPreviews(
         &self,
         chatId: String,
         query: String,
     ) -> ChatHistoryManagerResult<Vec<ChatMessageLocatorPreview>> {
-        if !query.trim().is_empty() {
-            return Ok(self.messageDao.searchLocatorPreviewsForChat(
-                &chatId,
-                query.trim(),
-                LOCATOR_PREVIEW_CHAR_COUNT,
-            )?);
-        }
-
-        Ok(self
-            .messageDao
-            .getLocatorPreviewsForChat(&chatId, LOCATOR_PREVIEW_CHAR_COUNT)?)
+        Ok(self.messageDao.getMessageLocatorIndex(
+            &chatId, query.trim(), LOCATOR_PREVIEW_CHAR_COUNT,
+        )?)
     }
 
-    /// Loads hydrated messages starting at a timestamp.
-    pub fn loadChatMessagesFromTimestamp(
-        &self,
-        chatId: String,
-        startTimestampInclusive: i64,
-    ) -> ChatHistoryManagerResult<Vec<ChatMessage>> {
-        self.loadMessagesSnapshot(
-            &chatId,
-            "SELECT * FROM messages WHERE chatId = ?1 AND timestamp >= ?2 ORDER BY timestamp ASC",
-            sqliteParams![chatId, startTimestampInclusive],
-        )
-    }
-
-    /// Loads hydrated messages inside an inclusive timestamp window.
-    pub fn loadChatMessagesWindow(
-        &self,
-        chatId: String,
-        startTimestampInclusive: i64,
-        endTimestampInclusive: i64,
-    ) -> ChatHistoryManagerResult<Vec<ChatMessage>> {
-        self.loadMessagesSnapshot(&chatId,
-            "SELECT * FROM messages WHERE chatId = ?1 AND timestamp >= ?2 AND timestamp <= ?3 ORDER BY timestamp ASC",
-            sqliteParams![chatId, startTimestampInclusive, endTimestampInclusive])
+    /// Resolves one exact persisted message position without reading its body.
+    pub fn loadChatMessageIndexPosition(&self, chatId: &str, timestamp: i64) -> ChatHistoryManagerResult<Option<i32>> {
+        Ok(self.messageDao.getMessageIndexPosition(chatId, timestamp)?)
     }
 
     /// Loads hydrated messages after a timestamp in ascending order.

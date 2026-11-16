@@ -20,7 +20,7 @@ export interface JsonResultData {
 /**
  * Contains every concrete payload returned by the built-in tool runtime.
  */
-export type ToolResultData = JsonResultData | EdgePortResultData | BooleanResultData | StringResultData | SleepResultData | EnvironmentVariableReadResultData | EnvironmentVariableWriteResultData | ModelsListSummariesResultData | TtsSynthesizeResultData | TtsSpeakResultData | SttTranscribeResultData | TtsListConfigsResultData | TtsGetCurrentConfigIdResultData | TtsSetCurrentConfigIdResultData | ThemeListConfigsResultData | ThemeApplyConfigResultData | IntResultData | BinaryResultData | FilePartContentData | DirectoryListingData | FileContentData | BinaryFileContentData | FileExistsData | FileInfoData | FileOperationData | FileApplyResultData | StorageRequestResultData | WebSocketResultData | HttpResponseData | HttpStreamEventData | SystemSettingData | AppOperationData | AppListData | AppUsageTimeResultData | NotificationData | LocationData | DeviceInfoResultData | ChatServiceStartResultData | ChatCreationResultData | ChatListResultData | ChatFindResultData | AgentStatusResultData | ChatSwitchResultData | ChatTitleUpdateResultData | ChatDeleteResultData | MessageSendResultData | ChatSendMessageResultData | ChatObservationResultData | ChatCancelResultData | ChatReadExtensionResultData | ChatWriteExtensionResultData | ChatDeleteExtensionResultData | ChatCallResultData | ChatMessagesResultData | VisitWebResultData | TerminalInfoResultData | TerminalCommandResultData | TerminalStreamEventData | TerminalObservationResultData | HiddenTerminalCommandResultData | TerminalSessionCreationResultData | TerminalSessionCloseResultData | TerminalSessionScreenResultData | MusicPlaybackResultData | BluetoothStateData | BluetoothBondedDevicesData | BluetoothScanResultData | BluetoothSessionData | BluetoothTransferData | BluetoothReadData | BluetoothBleServicesData | BluetoothBleNotificationData | CatalogReadToolSourcesResultData | MediaRegistrationResultData | FindFilesResultData | GrepResultData;
+export type ToolResultData = UIPageResultData | UIActionResultData | JsonResultData | EdgePortResultData | BooleanResultData | StringResultData | SleepResultData | EnvironmentVariableReadResultData | EnvironmentVariableWriteResultData | ModelsListSummariesResultData | TtsSynthesizeResultData | TtsSpeakResultData | SttTranscribeResultData | TtsListConfigsResultData | TtsGetCurrentConfigIdResultData | TtsSetCurrentConfigIdResultData | ThemeListConfigsResultData | ThemeApplyConfigResultData | IntResultData | BinaryResultData | FilePartContentData | DirectoryListingData | FileContentData | BinaryFileContentData | FileExistsData | FileInfoData | FileOperationData | FileApplyResultData | StorageRequestResultData | WebSocketResultData | HttpResponseData | HttpStreamEventData | SystemSettingData | AppOperationData | AppListData | AppUsageTimeResultData | NotificationData | LocationData | DeviceInfoResultData | ChatServiceStartResultData | ChatCreationResultData | ChatListResultData | ChatFindResultData | AgentStatusResultData | ChatSwitchResultData | ChatTitleUpdateResultData | ChatDeleteResultData | MessageSendResultData | ChatSendMessageResultData | ChatObservationResultData | ChatCancelResultData | ChatReadExtensionResultData | ChatWriteExtensionResultData | ChatDeleteExtensionResultData | ChatCallResultData | ChatMessagesResultData | VisitWebResultData | TerminalInfoResultData | TerminalCommandResultData | TerminalStreamEventData | TerminalObservationResultData | HiddenTerminalCommandResultData | TerminalSessionCreationResultData | TerminalSessionCloseResultData | TerminalSessionScreenResultData | MusicPlaybackResultData | BluetoothStateData | BluetoothBondedDevicesData | BluetoothScanResultData | BluetoothSessionData | BluetoothTransferData | BluetoothReadData | BluetoothBleServicesData | BluetoothBleNotificationData | CatalogReadToolSourcesResultData | MediaRegistrationResultData | FindFilesResultData | GrepResultData;
 
 /**
  * Captures the UI node and Android surface reached when an automation run finishes.
@@ -96,6 +96,10 @@ export interface SimplifiedUINode {
   resourceId?: string;
   bounds?: string;
   isClickable: boolean;
+  /**
+   * Preserves platform accessibility roles, states and supported actions.
+   */
+  properties: Record<string, unknown>;
   children: SimplifiedUINode[];
   /**
    * Formats the node as a compact JSON value.
@@ -112,9 +116,25 @@ export interface SimplifiedUINode {
 }
 
 /**
- * Captures the active Android package, activity, and simplified UI hierarchy.
+ * Captures the active surface and its platform-neutral accessibility hierarchy.
  */
 export interface UIPageResultData {
+  /**
+   * Identifies the native window that owns this snapshot.
+   */
+  windowId: string;
+  /**
+   * Contains a bounded, compact text view for model context; uiElements retains the full tree.
+   */
+  summary: string;
+  /**
+   * Reports the visibility granted by the owning platform.
+   */
+  scope: string;
+  /**
+   * Reports whether the provider reached its traversal budget.
+   */
+  truncated: boolean;
   packageName: string;
   activityName: string;
   uiElements: SimplifiedUINode;
@@ -146,7 +166,7 @@ export type TerminalType = "powershell" | "bash" | "zsh" | "shell";
 /**
  * Identifies the concrete terminal implementation selected by a host.
  */
-export type TerminalImplementation = "native" | "proot" | "android-system" | "adb" | "shell" | "ish" | "qemu-vroot" | "v86";
+export type TerminalImplementation = "native" | "proot" | "android-system" | "adb" | "shell" | "arm64" | "qemu-vroot" | "v86";
 
 /**
  * Reports the start or an incremental chunk of a streamed chat-message response.
@@ -567,6 +587,10 @@ export interface SystemSettingData {
  * Reports the outcome of installing, uninstalling, starting, or stopping an application package.
  */
 export interface AppOperationData {
+  /**
+   * permission_required, installer_opened, restart_required, or completed.
+   */
+  installState?: string;
   operationType: string;
   packageName: string;
   success: boolean;
@@ -1222,7 +1246,7 @@ export interface TerminalCommandResultData {
    */
   terminalType: TerminalType;
   /**
-   * Whether this execution ended due to timeout. On timeout, the current command is cancelled and the terminal session is kept.
+   * Whether foreground waiting expired while the original command continues in its session.
    */
   timedOut: boolean;
   /**
@@ -1720,7 +1744,7 @@ export interface EdgePortResultData {
 /**
  * Exchanges one scoped terminal execution observation through the common tool transport.
  */
-export type TerminalObservationResultData = { handle: string; } | { event: TerminalExecEvent | null; } | { };
+export type TerminalObservationResultData = { result: TerminalCommandResultData; } | { handle: string; } | { event: TerminalExecEvent | null; } | { };
 
 /**
  * Reports exactly the requested WebSocket operation.

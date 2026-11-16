@@ -3,8 +3,8 @@
 import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
-import 'package:operit2/l10n/generated/app_localizations.dart';
 
+import '../../../../../../core/runtime/RuntimeBootstrapManager.dart';
 import '../../../../../../data/preferences/UserPreferencesManager.dart';
 import '../../../../../../util/ChatMarkupRegex.dart';
 import '../../../../../common/ChatAvatarImage.dart';
@@ -13,6 +13,7 @@ import '../../../../../theme/OperitThemeAssets.dart';
 import '../../attachments/ChatMessageImageAttachments.dart';
 import '../../../viewmodel/ChatViewModel.dart';
 import 'BubbleSurface.dart';
+import '../common/HiddenUserMessagePlaceholder.dart';
 
 export '../../attachments/ChatMessageImageAttachments.dart'
     show AttachmentData, ChatMessageAttachments, ChatMessageImageAttachments;
@@ -50,103 +51,121 @@ class BubbleUserMessageComposable extends StatefulWidget {
 
 class _BubbleUserMessageComposableState
     extends State<BubbleUserMessageComposable> {
+  /// Observes profile changes even when the transcript keeps this row cached.
   @override
-  Widget build(BuildContext context) {
+  Widget build(BuildContext context) => ListenableBuilder(
+    listenable: RuntimeBootstrapManager.instance,
+    builder: (context, _) => _buildMessage(context),
+  );
+
+  /// Applies message fonts and resolves the user name from its actual source.
+  Widget _buildMessage(BuildContext context) {
+    final theme = Theme.of(context);
+    if (widget.message.isHiddenUserPlaceholder) {
+      return Padding(
+        padding: EdgeInsets.symmetric(
+          horizontal: widget.bubbleContentPaddingRight,
+        ),
+        child: HiddenUserMessagePlaceholder(
+          message: widget.message,
+          textColor: widget.textColor,
+          enableDialogs: widget.enableDialogs,
+        ),
+      );
+    }
     final snapshot = OperitTheme.of(context).themePreferenceSnapshot;
-    final isHiddenPlaceholder =
-        widget.message.sender == 'user' &&
-        widget.message.displayMode.value == 'HIDDEN_PLACEHOLDER';
-    final parseResult = isHiddenPlaceholder
-        ? const MessageParseResult(processedText: '', trailingAttachments: [])
-        : parseMessageContent(widget.message.displayText);
+    final parseResult = parseMessageContent(widget.message.displayText);
     final isProxySender =
         parseResult.proxySenderName != null &&
         parseResult.proxySenderName!.isNotEmpty;
-    final backgroundColor = isHiddenPlaceholder
-        ? Colors.transparent
-        : widget.backgroundColor;
+    final backgroundColor = widget.backgroundColor;
     final textColor = widget.textColor;
-    final shouldShowAvatar = !isHiddenPlaceholder && snapshot.bubbleShowAvatar;
+    final shouldShowAvatar = snapshot.bubbleShowAvatar;
     final resolvedDisplayName = isProxySender
-        ? parseResult.proxySenderName
-        : null;
+        ? parseResult.proxySenderName!
+        : RuntimeBootstrapManager.instance.activeIdentity.name.trim();
     final shouldShowResolvedName =
-        !isHiddenPlaceholder &&
         (isProxySender || snapshot.showUserName) &&
-        resolvedDisplayName != null &&
         resolvedDisplayName.isNotEmpty;
     final messageFontFamily = operitMessageFontFamily(snapshot, isUser: true);
     final messageFontFamilyFallback = operitMessageFontFamilyFallback(
       snapshot,
       isUser: true,
     );
-    final effectiveBubbleImageStyle =
-        isHiddenPlaceholder ? null : widget.bubbleImageStyle;
+    final effectiveBubbleImageStyle = widget.bubbleImageStyle;
     final bubbleShape = widget.bubbleRoundedCornersEnabled
         ? const BorderRadius.all(Radius.circular(16))
         : BorderRadius.zero;
     final contentPadding = EdgeInsets.fromLTRB(
       widget.bubbleContentPaddingLeft,
-      isHiddenPlaceholder ? 0 : 12,
+      12,
       widget.bubbleContentPaddingRight,
-      isHiddenPlaceholder ? 0 : 12,
+      12,
     );
 
-    return DefaultTextStyle.merge(
-      style: TextStyle(
-        fontFamily: messageFontFamily,
-        fontFamilyFallback: messageFontFamilyFallback,
+    return Theme(
+      data: theme.copyWith(
+        textTheme: theme.textTheme.apply(
+          fontFamily: messageFontFamily,
+          fontFamilyFallback: messageFontFamilyFallback,
+        ),
+        primaryTextTheme: theme.primaryTextTheme.apply(
+          fontFamily: messageFontFamily,
+          fontFamilyFallback: messageFontFamilyFallback,
+        ),
       ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: <Widget>[
-          if (snapshot.bubbleWideLayoutEnabled)
-            _WideUserBubbleLayout(
-              parseResult: parseResult,
-              enableDialogs: widget.enableDialogs,
-              shouldShowAvatar: shouldShowAvatar,
-              shouldShowResolvedName: shouldShowResolvedName,
-              resolvedDisplayName: resolvedDisplayName,
-              isProxySender: isProxySender,
-              avatarImagePath: isProxySender
-                  ? widget.proxyAvatarImagePath
-                  : snapshot.customUserAvatarUri,
-              avatarShape: snapshot.avatarShape,
-              avatarCornerRadius: snapshot.avatarCornerRadius,
-              bubbleShape: bubbleShape,
-              backgroundColor: backgroundColor,
-              textColor: textColor,
-              imageStyle: effectiveBubbleImageStyle,
-              transparentSurface:
-                  !isHiddenPlaceholder && widget.transparentSurface,
-              contentPadding: contentPadding,
-              isHiddenPlaceholder: isHiddenPlaceholder,
-              textContent: parseResult.processedText,
-            )
-          else
-            _NormalUserBubbleLayout(
-              parseResult: parseResult,
-              enableDialogs: widget.enableDialogs,
-              shouldShowAvatar: shouldShowAvatar,
-              shouldShowResolvedName: shouldShowResolvedName,
-              resolvedDisplayName: resolvedDisplayName,
-              isProxySender: isProxySender,
-              avatarImagePath: isProxySender
-                  ? widget.proxyAvatarImagePath
-                  : snapshot.customUserAvatarUri,
-              avatarShape: snapshot.avatarShape,
-              avatarCornerRadius: snapshot.avatarCornerRadius,
-              bubbleShape: bubbleShape,
-              backgroundColor: backgroundColor,
-              textColor: textColor,
-              imageStyle: effectiveBubbleImageStyle,
-              transparentSurface:
-                  !isHiddenPlaceholder && widget.transparentSurface,
-              contentPadding: contentPadding,
-              isHiddenPlaceholder: isHiddenPlaceholder,
-              textContent: parseResult.processedText,
-            ),
-        ],
+      child: DefaultTextStyle.merge(
+        style: TextStyle(
+          fontFamily: messageFontFamily,
+          fontFamilyFallback: messageFontFamilyFallback,
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: <Widget>[
+            if (snapshot.bubbleWideLayoutEnabled)
+              _WideUserBubbleLayout(
+                parseResult: parseResult,
+                enableDialogs: widget.enableDialogs,
+                shouldShowAvatar: shouldShowAvatar,
+                shouldShowResolvedName: shouldShowResolvedName,
+                resolvedDisplayName: resolvedDisplayName,
+                isProxySender: isProxySender,
+                avatarImagePath: isProxySender
+                    ? widget.proxyAvatarImagePath
+                    : snapshot.customUserAvatarUri,
+                avatarShape: snapshot.avatarShape,
+                avatarCornerRadius: snapshot.avatarCornerRadius,
+                bubbleShape: bubbleShape,
+                backgroundColor: backgroundColor,
+                textColor: textColor,
+                imageStyle: effectiveBubbleImageStyle,
+                transparentSurface: widget.transparentSurface,
+                contentPadding: contentPadding,
+                textContent: parseResult.processedText,
+              )
+            else
+              _NormalUserBubbleLayout(
+                parseResult: parseResult,
+                enableDialogs: widget.enableDialogs,
+                shouldShowAvatar: shouldShowAvatar,
+                shouldShowResolvedName: shouldShowResolvedName,
+                resolvedDisplayName: resolvedDisplayName,
+                isProxySender: isProxySender,
+                avatarImagePath: isProxySender
+                    ? widget.proxyAvatarImagePath
+                    : snapshot.customUserAvatarUri,
+                avatarShape: snapshot.avatarShape,
+                avatarCornerRadius: snapshot.avatarCornerRadius,
+                bubbleShape: bubbleShape,
+                backgroundColor: backgroundColor,
+                textColor: textColor,
+                imageStyle: effectiveBubbleImageStyle,
+                transparentSurface: widget.transparentSurface,
+                contentPadding: contentPadding,
+                textContent: parseResult.processedText,
+              ),
+          ],
+        ),
       ),
     );
   }
@@ -163,7 +182,6 @@ class _UserBubbleWithAttachments extends StatefulWidget {
     required this.imageStyle,
     required this.transparentSurface,
     required this.contentPadding,
-    required this.isHiddenPlaceholder,
     required this.textContent,
   });
 
@@ -176,7 +194,6 @@ class _UserBubbleWithAttachments extends StatefulWidget {
   final BubbleImageStyle? imageStyle;
   final bool transparentSurface;
   final EdgeInsets contentPadding;
-  final bool isHiddenPlaceholder;
   final String textContent;
 
   @override
@@ -223,27 +240,26 @@ class _UserBubbleWithAttachmentsState
   }
 
   double? _calculateInitialBubbleWidth(BuildContext context) {
-    if (widget.isHiddenPlaceholder) {
-      return 220.0;
-    }
     if (widget.textContent.isEmpty) {
       return 44.0;
     }
-    final textPainter = TextPainter(
-      text: TextSpan(
-        text: widget.textContent,
-        style: Theme.of(context)
-            .textTheme
-            .bodyMedium
-            ?.copyWith(color: widget.textColor),
-      ),
-      textDirection: Directionality.of(context),
-    )..layout(
-        maxWidth: (widget.maxBubbleWidth - widget.contentPadding.horizontal)
-            .clamp(0.0, double.infinity),
-      );
-    return (textPainter.width + widget.contentPadding.horizontal)
-        .clamp(44.0, widget.maxBubbleWidth);
+    final textPainter =
+        TextPainter(
+          text: TextSpan(
+            text: widget.textContent,
+            style: Theme.of(
+              context,
+            ).textTheme.bodyMedium?.copyWith(color: widget.textColor),
+          ),
+          textDirection: Directionality.of(context),
+        )..layout(
+          maxWidth: (widget.maxBubbleWidth - widget.contentPadding.horizontal)
+              .clamp(0.0, double.infinity),
+        );
+    return (textPainter.width + widget.contentPadding.horizontal).clamp(
+      44.0,
+      widget.maxBubbleWidth,
+    );
   }
 
   @override
@@ -288,7 +304,6 @@ class _UserBubbleWithAttachmentsState
                 imageStyle: widget.imageStyle,
                 transparentSurface: widget.transparentSurface,
                 contentPadding: widget.contentPadding,
-                isHiddenPlaceholder: widget.isHiddenPlaceholder,
                 textContent: widget.textContent,
               ),
             ),
@@ -325,7 +340,6 @@ class _WideUserBubbleLayout extends StatelessWidget {
     required this.imageStyle,
     required this.transparentSurface,
     required this.contentPadding,
-    required this.isHiddenPlaceholder,
     required this.textContent,
   });
 
@@ -344,14 +358,13 @@ class _WideUserBubbleLayout extends StatelessWidget {
   final BubbleImageStyle? imageStyle;
   final bool transparentSurface;
   final EdgeInsets contentPadding;
-  final bool isHiddenPlaceholder;
   final String textContent;
 
   @override
   Widget build(BuildContext context) {
     final headerVisible = shouldShowAvatar || shouldShowResolvedName;
     return Padding(
-      padding: EdgeInsets.symmetric(vertical: isHiddenPlaceholder ? 0 : 4),
+      padding: const EdgeInsets.symmetric(vertical: 4),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: <Widget>[
@@ -389,9 +402,7 @@ class _WideUserBubbleLayout extends StatelessWidget {
           ],
           LayoutBuilder(
             builder: (context, constraints) {
-              final maxBubbleWidth = isHiddenPlaceholder
-                  ? constraints.maxWidth.clamp(0, 320).toDouble()
-                  : constraints.maxWidth;
+              final maxBubbleWidth = constraints.maxWidth;
               return Align(
                 alignment: Alignment.centerRight,
                 child: _UserBubbleWithAttachments(
@@ -404,7 +415,6 @@ class _WideUserBubbleLayout extends StatelessWidget {
                   imageStyle: imageStyle,
                   transparentSurface: transparentSurface,
                   contentPadding: contentPadding,
-                  isHiddenPlaceholder: isHiddenPlaceholder,
                   textContent: textContent,
                 ),
               );
@@ -433,7 +443,6 @@ class _NormalUserBubbleLayout extends StatelessWidget {
     required this.imageStyle,
     required this.transparentSurface,
     required this.contentPadding,
-    required this.isHiddenPlaceholder,
     required this.textContent,
   });
 
@@ -452,13 +461,12 @@ class _NormalUserBubbleLayout extends StatelessWidget {
   final BubbleImageStyle? imageStyle;
   final bool transparentSurface;
   final EdgeInsets contentPadding;
-  final bool isHiddenPlaceholder;
   final String textContent;
 
   @override
   Widget build(BuildContext context) {
     return Padding(
-      padding: EdgeInsets.symmetric(vertical: isHiddenPlaceholder ? 0 : 4),
+      padding: const EdgeInsets.symmetric(vertical: 4),
       child: Row(
         mainAxisAlignment: MainAxisAlignment.end,
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -488,11 +496,7 @@ class _NormalUserBubbleLayout extends StatelessWidget {
                     ),
                   LayoutBuilder(
                     builder: (context, constraints) {
-                      final maxBubbleWidth = isHiddenPlaceholder
-                          ? (constraints.maxWidth * 0.85)
-                                .clamp(0, 320)
-                                .toDouble()
-                          : constraints.maxWidth * 0.85;
+                      final maxBubbleWidth = constraints.maxWidth * 0.85;
                       return Align(
                         alignment: Alignment.centerRight,
                         child: _UserBubbleWithAttachments(
@@ -505,7 +509,6 @@ class _NormalUserBubbleLayout extends StatelessWidget {
                           imageStyle: imageStyle,
                           transparentSurface: transparentSurface,
                           contentPadding: contentPadding,
-                          isHiddenPlaceholder: isHiddenPlaceholder,
                           textContent: textContent,
                         ),
                       );
@@ -538,7 +541,6 @@ class _UserBubbleBody extends StatelessWidget {
     required this.imageStyle,
     required this.transparentSurface,
     required this.contentPadding,
-    required this.isHiddenPlaceholder,
     required this.textContent,
   });
 
@@ -548,7 +550,6 @@ class _UserBubbleBody extends StatelessWidget {
   final BubbleImageStyle? imageStyle;
   final bool transparentSurface;
   final EdgeInsets contentPadding;
-  final bool isHiddenPlaceholder;
   final String textContent;
 
   @override
@@ -560,59 +561,12 @@ class _UserBubbleBody extends StatelessWidget {
       transparentSurface: transparentSurface,
       child: Padding(
         padding: contentPadding,
-        child: isHiddenPlaceholder
-            ? _HiddenUserMessagePlaceholderContent(textColor: textColor)
-            : SelectableText(
-                textContent,
-                style: Theme.of(
-                  context,
-                ).textTheme.bodyMedium?.copyWith(color: textColor),
-              ),
-      ),
-    );
-  }
-}
-
-class _HiddenUserMessagePlaceholderContent extends StatelessWidget {
-  const _HiddenUserMessagePlaceholderContent({required this.textColor});
-
-  final Color textColor;
-
-  @override
-  Widget build(BuildContext context) {
-    final l10n = AppLocalizations.of(context);
-    return ConstrainedBox(
-      constraints: const BoxConstraints(maxWidth: 220),
-      child: Row(
-        mainAxisSize: MainAxisSize.min,
-        crossAxisAlignment: CrossAxisAlignment.center,
-        children: <Widget>[
-          Expanded(
-            child: Divider(
-              color: Theme.of(
-                context,
-              ).colorScheme.primary.withValues(alpha: 0.28),
-              thickness: 1,
-            ),
-          ),
-          const SizedBox(width: 8),
-          Text(
-            l10n?.hiddenUserMessage ?? 'Hidden user message',
-            style: Theme.of(context).textTheme.labelSmall?.copyWith(
-              color: textColor.withValues(alpha: 0.72),
-              fontWeight: FontWeight.w500,
-            ),
-          ),
-          const SizedBox(width: 8),
-          Expanded(
-            child: Divider(
-              color: Theme.of(
-                context,
-              ).colorScheme.primary.withValues(alpha: 0.28),
-              thickness: 1,
-            ),
-          ),
-        ],
+        child: SelectableText(
+          textContent,
+          style: Theme.of(
+            context,
+          ).textTheme.bodyMedium?.copyWith(color: textColor),
+        ),
       ),
     );
   }
@@ -747,6 +701,8 @@ MessageParseResult _buildMessageParseResult({
           size: raw.size,
           content: raw.content,
           mediaPoolType: 'image',
+          path: raw.path,
+          nodeId: raw.nodeId,
         ),
       );
     } else if (link != null) {
@@ -902,18 +858,9 @@ MessageParseResult parseMessageContent(String content) {
   for (var index = 0; index < matches.length; index++) {
     final match = matches[index].match;
     final startIndex = match.start;
-    final id = decodeChatXmlText(match.group(1)!);
-    final filename = decodeChatXmlText(match.group(2)!);
-    final type = decodeChatXmlText(match.group(3)!);
-    final size = _parseLong(match.group(4));
-    final attachmentContent = decodeChatXmlText(match.group(5) ?? '');
-    final attachment = AttachmentData(
-      id: id,
-      filename: filename,
-      type: type,
-      size: size,
-      content: attachmentContent,
-    );
+    final attachment = AttachmentData.fromMarkupMatch(match);
+    final filename = attachment.filename;
+    final type = attachment.type;
     final isTrailingAttachment = trailingAttachmentIndices.contains(index);
     final isScreenContent =
         type == 'text/json' && filename == 'screen_content.json';
@@ -952,17 +899,6 @@ MessageParseResult parseMessageContent(String content) {
     replyInfo: replyInfo,
     proxySenderName: proxySenderName,
   );
-}
-
-int _parseLong(String? value) {
-  if (value == null || value.isEmpty) {
-    return 0;
-  }
-  final parsed = int.tryParse(value);
-  if (parsed == null) {
-    return 0;
-  }
-  return parsed;
 }
 
 class _ReplyInfoView extends StatelessWidget {

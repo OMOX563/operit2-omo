@@ -30,6 +30,12 @@ class AppLocalizationsZh extends AppLocalizations {
   String get fullscreenInput => '全屏输入';
 
   @override
+  String get noticeExpand => '展开全文';
+
+  @override
+  String get noticeCollapse => '收起';
+
+  @override
   String get expandInput => '展开输入框';
 
   @override
@@ -165,6 +171,27 @@ class AppLocalizationsZh extends AppLocalizations {
 
   @override
   String get summaryGenerating => '正在生成总结...';
+
+  @override
+  String get summaryStageCore => '正在整理核心任务...';
+
+  @override
+  String get summaryStageConstraints => '正在整理用户需求与约束...';
+
+  @override
+  String get summaryStageFiles => '正在整理关键文件与代码...';
+
+  @override
+  String get summaryStageErrors => '正在整理错误与修复...';
+
+  @override
+  String get summaryStageInteraction => '正在整理互动与设定...';
+
+  @override
+  String get summaryStageNext => '正在整理下一步...';
+
+  @override
+  String get summaryStageFormatting => '正在调整总结格式...';
 
   @override
   String get chatCompressingHistory => '正在压缩历史记录...';
@@ -331,6 +358,11 @@ class AppLocalizationsZh extends AppLocalizations {
   String get messageLocatorLoadFailed => '暂时无法加载消息，请重试';
 
   @override
+  String messageTransformFailed(String error) {
+    return '消息显示处理失败：$error';
+  }
+
+  @override
   String get messageLocatorFavoriteFailed => '收藏更新失败，请重试';
 
   @override
@@ -395,6 +427,9 @@ class AppLocalizationsZh extends AppLocalizations {
 
   @override
   String get hiddenUserMessage => '隐藏的用户消息';
+
+  @override
+  String get autoTriggeredUserMessage => '自动触发';
 
   @override
   String get workspaceSetupTitle => '设置工作区';
@@ -747,6 +782,12 @@ class AppLocalizationsZh extends AppLocalizations {
   String get openFile => '打开文件';
 
   @override
+  String get workspaceFileOpening => '正在打开文件…';
+
+  @override
+  String get workspaceFileOpenTimedOut => '打开文件超时，请重试。';
+
+  @override
   String get openLocation => '打开位置';
 
   @override
@@ -1082,12 +1123,6 @@ class AppLocalizationsZh extends AppLocalizations {
   String get settingsModelSetCurrentActive => '设为当前';
 
   @override
-  String get settingsChatThinkingMode => '思考模式';
-
-  @override
-  String get settingsChatThinkingModeDescription => '让支持的模型输出更稳的推理过程。';
-
-  @override
   String get settingsChatStreamOutput => '流式输出';
 
   @override
@@ -1286,6 +1321,12 @@ class AppLocalizationsZh extends AppLocalizations {
   String get settingsModelApiKey => 'API Key';
 
   @override
+  String get settingsModelShowApiKey => '显示 API Key';
+
+  @override
+  String get settingsModelHideApiKey => '隐藏 API Key';
+
+  @override
   String get settingsModelCodexLogin => 'ChatGPT 登录';
 
   @override
@@ -1332,7 +1373,7 @@ class AppLocalizationsZh extends AppLocalizations {
 
   @override
   String get settingsModelApiKeyPoolDescription =>
-      '给同一个模型配置准备多个 Key，用于多 Key 轮换。';
+      '持续使用健康的 Key；遇到鉴权、额度、限流或临时故障时切换，并跳过冷却中的 Key。';
 
   @override
   String settingsModelApiKeyPoolCount(int count) {
@@ -1340,7 +1381,7 @@ class AppLocalizationsZh extends AppLocalizations {
   }
 
   @override
-  String get settingsModelApiKeyPoolEmpty => '还没有 Key。添加后，运行时会按当前配置使用 Key 池。';
+  String get settingsModelApiKeyPoolEmpty => 'Key 池为空，请添加 Key 后再启用。';
 
   @override
   String get settingsModelAddApiKey => '添加 Key';
@@ -1353,6 +1394,33 @@ class AppLocalizationsZh extends AppLocalizations {
 
   @override
   String get settingsModelApiKeyEnabled => '启用这个 Key';
+
+  @override
+  String get settingsModelPoolAddSingle => '添加当前单 Key';
+
+  @override
+  String get settingsModelPoolPaste => '每行粘贴一个 Key，可批量添加。';
+
+  @override
+  String get settingsModelPoolNoEligible => '请至少启用一个非空且未标记为不可用的 Key。';
+
+  @override
+  String get settingsModelPoolUntested => '未测试';
+
+  @override
+  String get settingsModelPoolAvailable => '可用';
+
+  @override
+  String get settingsModelPoolUnavailable => '不可用';
+
+  @override
+  String get settingsModelPoolClearMarks => '重置 Key 状态';
+
+  @override
+  String get settingsModelPoolTest => '测试未检测的 Key';
+
+  @override
+  String get settingsModelPoolNeedsModel => '保存供应商并添加模型后，即可测试 Key。';
 
   @override
   String get settingsModelProviderId => '供应商 ID';
@@ -1734,6 +1802,30 @@ class AppLocalizationsZh extends AppLocalizations {
       '没有拉取到的模型。可选择「包含历史」查看目录中的模型 ID。';
 
   @override
+  String get settingsModelUnrecognized => '未识别';
+
+  @override
+  String settingsModelCatalogUpdatedAt(String time) {
+    return '能力和上下文信息来自 models.dev，$time 更新';
+  }
+
+  @override
+  String settingsModelCatalogUpdateFailed(String error) {
+    return '模型信息下载失败：$error';
+  }
+
+  @override
+  String settingsModelCatalogUpdateFailedUsing(String time, String error) {
+    return '模型信息更新失败，暂用 $time 的信息：$error';
+  }
+
+  @override
+  String get settingsModelCatalogBundled => '使用内置模型信息，联网更新成功后自动替换';
+
+  @override
+  String get settingsModelCatalogRetry => '更新';
+
+  @override
   String get settingsModelCustomModel => '自定义模型';
 
   @override
@@ -1803,13 +1895,7 @@ class AppLocalizationsZh extends AppLocalizations {
   String get settingsModelMaxContextLengthInvalid => '请输入大于 0 的最大上下文长度';
 
   @override
-  String get settingsModelSummaryThreshold => '总结 Token 阈值';
-
-  @override
-  String get settingsModelSummaryByMessageCount => '按消息数总结';
-
-  @override
-  String get settingsModelSummaryMessageCount => '总结消息数阈值';
+  String get settingsModelSummaryThreshold => '总结阈值';
 
   @override
   String get settingsModelCustomHeaders => '自定义 Headers';
@@ -1848,7 +1934,7 @@ class AppLocalizationsZh extends AppLocalizations {
   String get settingsModelGoogleSearchDescription => '启用供应商侧搜索能力。';
 
   @override
-  String get settingsModelContext => '上下文窗口';
+  String get settingsModelContext => '上下文';
 
   @override
   String get settingsModelSummary => '自动总结';
@@ -1857,10 +1943,68 @@ class AppLocalizationsZh extends AppLocalizations {
   String get settingsModelThinking => '思考';
 
   @override
-  String get settingsModelThinkingOption => '思考档位';
+  String get thinkingLevelLabel => '思考程度';
 
   @override
-  String get settingsModelThinkingRules => '思考规则 JSON';
+  String get thinkingAlwaysOn => '始终思考';
+
+  @override
+  String get thinkingChip => '思考';
+
+  @override
+  String get settingsModelThinkingSourceDeclared => '档位按你的描述';
+
+  @override
+  String get settingsModelThinkingSourceLocalRuntime =>
+      '本地运行：可以开关思考，模型本身不会思考时开关不起作用';
+
+  @override
+  String get settingsModelThinkingUnknown => '目录里没有这个模型的思考信息';
+
+  @override
+  String get settingsModelThinkingNotAdjustable => '当前接口不能调节这个模型的思考';
+
+  @override
+  String get settingsModelThinkingNotSupported => '这个模型不会思考';
+
+  @override
+  String get settingsModelThinkingCarried => '沿用你最近一次设置的档位';
+
+  @override
+  String get settingsModelThinkingDescribe => '手动描述';
+
+  @override
+  String get settingsModelThinkingUseCatalog => '改回目录描述';
+
+  @override
+  String get settingsModelThinkingDescribeTitle => '这个模型怎么思考';
+
+  @override
+  String get settingsModelThinkingKindNone => '不会思考';
+
+  @override
+  String get settingsModelThinkingKindAlways => '总是思考，不能调节';
+
+  @override
+  String get settingsModelThinkingKindSwitch => '只能开关';
+
+  @override
+  String get settingsModelThinkingKindLevels => '分档位';
+
+  @override
+  String get settingsModelThinkingKindBudget => '按 token 预算';
+
+  @override
+  String get settingsModelThinkingCanTurnOff => '可以关闭思考';
+
+  @override
+  String get settingsModelThinkingBudgetMin => '最少 token';
+
+  @override
+  String get settingsModelThinkingBudgetMax => '最多 token';
+
+  @override
+  String get settingsModelThinkingLevelsRequired => '至少选一个档位';
 
   @override
   String get settingsModelMediaHistory => '媒体历史';
@@ -1875,13 +2019,117 @@ class AppLocalizationsZh extends AppLocalizations {
   String get settingsModelBuiltinToolExclusive => '开启后会关闭外部工具调用';
 
   @override
-  String get settingsModelConnectionTestSection => '连接测试';
-
-  @override
   String get settingsModelRunConnectionTest => '测试当前模型';
 
   @override
-  String get settingsModelTestModel => '测试模型';
+  String get settingsModelTestModel => '测试';
+
+  @override
+  String get settingsModelCapabilityToolCall => '工具调用';
+
+  @override
+  String get settingsModelCapabilityImage => '图片';
+
+  @override
+  String get settingsModelCapabilityAudio => '音频';
+
+  @override
+  String get settingsModelCapabilityVideo => '视频';
+
+  @override
+  String get settingsModelClaudeCache => 'Claude 1 小时缓存';
+
+  @override
+  String get settingsModelClaudeCacheDescription =>
+      '为显式缓存断点设置 1 小时 TTL；关闭时使用默认 TTL。';
+
+  @override
+  String get settingsModelSummaryThresholdDescription =>
+      '上下文占用达到这个比例时自动总结，填 0 关闭。';
+
+  @override
+  String get settingsModelMoreActions => '更多操作';
+
+  @override
+  String get settingsModelRestoreDefaults => '恢复默认值';
+
+  @override
+  String get settingsModelDescribeThinking => '手动描述思考档位';
+
+  @override
+  String get settingsModelDeleteModel => '删除模型';
+
+  @override
+  String settingsModelSaveFailed(String error) {
+    return '保存失败：$error';
+  }
+
+  @override
+  String get settingsModelTestAll => '测试全部';
+
+  @override
+  String settingsModelTestProgress(int done, int total) {
+    return '测试中 $done/$total';
+  }
+
+  @override
+  String settingsModelTestSummary(int passed, int failed) {
+    return '$passed 个通过，$failed 个失败';
+  }
+
+  @override
+  String settingsModelTestSummaryWithRestricted(
+    int passed,
+    int failed,
+    int restricted,
+  ) {
+    return '$passed 个通过，$failed 个失败，$restricted 个受限';
+  }
+
+  @override
+  String settingsModelTestAllPassed(int count) {
+    return '$count 个全部通过';
+  }
+
+  @override
+  String get settingsModelTestCouldNotRun => '测试没能运行';
+
+  @override
+  String get settingsModelCopyError => '复制错误信息';
+
+  @override
+  String get settingsModelSelect => '多选';
+
+  @override
+  String get settingsModelCheckAll => '全选';
+
+  @override
+  String settingsModelCheckedCount(int count) {
+    return '已选 $count 个';
+  }
+
+  @override
+  String settingsModelDeleteModelsTitle(int count) {
+    return '删除 $count 个模型？';
+  }
+
+  @override
+  String get settingsModelDeleteModelsMessage => '这些模型的设置会一起删除。';
+
+  @override
+  String settingsModelDeleteModelsKept(int count, String names) {
+    return '$count 个正在被功能使用，会保留：$names';
+  }
+
+  @override
+  String settingsModelDeleteModelsBlocked(String functions) {
+    return '所选模型正在被这些功能使用，请先更改功能模型分配：$functions';
+  }
+
+  @override
+  String settingsModelDeletedCount(int count) {
+    return '已删除 $count 个模型';
+  }
 
   @override
   String get settingsModelTestingConnection => '正在测试当前模型连接…';
@@ -1894,6 +2142,15 @@ class AppLocalizationsZh extends AppLocalizations {
 
   @override
   String get settingsModelConnectionTestFailed => '存在失败项';
+
+  @override
+  String get settingsModelConnectionTestRestricted => '检测受限';
+
+  @override
+  String get settingsModelTestCreditRestricted => '账户额度或输出预算受限';
+
+  @override
+  String get settingsModelTestRateRestricted => '上游限流或冷却中';
 
   @override
   String get settingsModelCapabilitiesApplied => '已按测试结果更新模型能力开关。';
@@ -2855,7 +3112,22 @@ class AppLocalizationsZh extends AppLocalizations {
   String get settingsAppearanceBubbleImagePreview => '预览';
 
   @override
-  String get settingsAppearanceBubbleImagePreviewText => '这是一条气泡预览，切线展示九宫格区域';
+  String get settingsAppearanceBubbleImagePreviewText =>
+      '这是一条气泡预览消息。\n可以查看边角和中间区域的实际效果。';
+
+  @override
+  String get settingsAppearanceBubbleImageSourceHint =>
+      '原图 · 白框为裁切边界，蓝线分出九宫格；可双指缩放、拖动查看';
+
+  @override
+  String get settingsAppearanceBubbleImageFitSource => '完整显示原图';
+
+  @override
+  String get settingsAppearanceBubbleImageGrid => '九宫格';
+
+  @override
+  String get settingsAppearanceBubbleImageGridHint =>
+      '两横两竖分出九块：四角保留，上下边横向重复、左右边纵向重复，中间双向重复；拉伸模式则拉伸对应区域。起点和终点相对于裁切后的图片。';
 
   @override
   String settingsAppearanceBubbleImageImportFailed(String error) {
@@ -3812,6 +4084,32 @@ class AppLocalizationsZh extends AppLocalizations {
   String get settingsPeerPortModeAutomatic => '自动分配端口';
 
   @override
+  String get settingsPeerNetworkDiscoveryHelp =>
+      '跨网络发现需要共同的目录地址和组密钥。要由本机提供目录，请留空目录地址并设置组密钥。';
+
+  @override
+  String get settingsPeerDiscoveryDirectory => '发现目录地址（可选）';
+
+  @override
+  String get settingsPeerDiscoveryGroup => '发现组密钥';
+
+  @override
+  String get settingsPeerDiscoveryGenerateKey => '生成新的发现组密钥';
+
+  @override
+  String get settingsPeerDiscoveryCopyKey => '复制发现组密钥';
+
+  @override
+  String get settingsPeerDiscoveryPort => '目录监听端口';
+
+  @override
+  String get settingsPeerDiscoveryPortHelp => '仅目录设备使用此端口；其他设备使用目录地址中的端口。';
+
+  @override
+  String get settingsPeerNetworkDiscoveryInvalid =>
+      '请检查发现设置：目录为不含路径的 HTTP(S) 地址，密钥为 16–128 字节；本机提供目录时，监听端口应为 1–65535。';
+
+  @override
   String get settingsPeerAdvanced => '高级选项';
 
   @override
@@ -3955,7 +4253,7 @@ class AppLocalizationsZh extends AppLocalizations {
   String get deviceSpaceMemberNotPaired => '空间成员 · 未直连';
 
   @override
-  String get deviceSpaceMemberPaired => '空间成员 · 已直连';
+  String get deviceSpaceMemberPaired => '空间成员 · 已配对';
 
   @override
   String get deviceSpacePairedOnly => '已配对';
@@ -4073,10 +4371,12 @@ class AppLocalizationsZh extends AppLocalizations {
   String get settingsAppearanceThemeConfigNameRequired => '请输入主题名称';
 
   @override
-  String get settingsAppearanceThemeConfigCustomHint => '点击 + 创建和管理独立的主题配置。';
+  String get settingsAppearanceThemeConfigCustomHint =>
+      '创建主题保存你的外观。点击卡片切换，点击编辑调整细节。';
 
   @override
-  String get settingsAppearanceThemeConfigEditingHint => '修改外观会自动保存到当前主题配置。';
+  String get settingsAppearanceThemeConfigEditingHint =>
+      '点击卡片切换主题；上方明暗切换仅修改当前主题。编辑后自动保存。';
 
   @override
   String settingsAppearanceThemeConfigFailed(String detail) {
@@ -4294,7 +4594,7 @@ class AppLocalizationsZh extends AppLocalizations {
   String get deviceSpaceSyncRetrying => '同步暂时中断，稍后自动重试';
 
   @override
-  String get deviceSpaceSyncPending => '部分数据尚未处理完成，稍后自动重试';
+  String get deviceSpaceSyncPending => '部分数据尚未处理完成';
 
   @override
   String deviceSpaceSyncCurrentFile(String done, String total) {
@@ -4372,6 +4672,10 @@ class AppLocalizationsZh extends AppLocalizations {
 
   @override
   String get peerQrWrongDevice => '此连接码属于其他设备，请扫描当前所选设备的连接码。';
+
+  @override
+  String get peerPairTimeoutHint =>
+      '连接超时：未能与对方设备建立连接。常见原因是对方设备的防火墙拦截了入站连接。可改由对方设备发起连接，或在对方设备的防火墙中放行 Operit（公用网络尤其需要）。';
 
   @override
   String get peerQrImageInvalid => '未能从图片中识别二维码。请选择清晰的二维码图片（不超过 16 MB）。';
@@ -4519,4 +4823,100 @@ class AppLocalizationsZh extends AppLocalizations {
   String settingsDataTimelineUnknownSavings(int count) {
     return '$count 次请求无法估算节省金额';
   }
+
+  @override
+  String get contextStatsSummaryLoadFailed => '无法加载上下文信息';
+
+  @override
+  String get contextStatsDevicesLoadFailed => '无法加载设备信息';
+
+  @override
+  String get settingsAppearanceThemeLibrary => '我的主题';
+
+  @override
+  String get settingsAppearanceThemeLibraryHint => '选一个喜欢的外观，再把它调成你的样子。';
+
+  @override
+  String get settingsAppearanceThemeActive => '使用中';
+
+  @override
+  String get settingsAppearanceThemeApply => '使用此主题';
+
+  @override
+  String get settingsAppearanceThemeMore => '更多主题操作';
+
+  @override
+  String get settingsAppearanceThemeDuplicate => '创建副本';
+
+  @override
+  String get settingsAppearanceThemeUnboundHint => '保留当前外观，自由调整，不绑定已保存的主题。';
+
+  @override
+  String get settingsAppearanceThemeDeleteTitle => '删除主题';
+
+  @override
+  String settingsAppearanceThemeDeleteConfirm(String name) {
+    return '确定删除「$name」？删除后无法恢复。';
+  }
+
+  @override
+  String get settingsAppearancePreviewCollapse => '收起';
+
+  @override
+  String get settingsAppearancePreviewExpand => '展开';
+
+  @override
+  String get settingsAppearanceThemeNew => '新建主题';
+
+  @override
+  String get settingsAppearanceDeviceFonts => '设备字体';
+
+  @override
+  String get settingsAppearanceChooseDeviceFont => '选择设备字体';
+
+  @override
+  String get settingsAppearanceNoDeviceFonts => '没有匹配的设备字体';
+
+  @override
+  String get settingsAppearanceDeviceFontPreview =>
+      '字体预览：你好，世界\nThe quick brown fox · 0123456789';
+
+  @override
+  String get workspaceFileRename => '重命名';
+
+  @override
+  String get workspaceFileCopy => '复制';
+
+  @override
+  String get workspaceFileCut => '剪切';
+
+  @override
+  String get workspaceFilePaste => '粘贴';
+
+  @override
+  String get workspaceFileName => '名称';
+
+  @override
+  String get workspaceFileInvalidName => '请输入有效名称，不能包含路径分隔符。';
+
+  @override
+  String get workspaceDeleteFolderTitle => '删除文件夹？';
+
+  @override
+  String workspaceDeleteFolderMessage(String name) {
+    return '确定删除“$name”及其全部内容？此操作无法撤销。';
+  }
+
+  @override
+  String workspaceFileOperationFailed(String error) {
+    return '文件操作失败：$error';
+  }
+
+  @override
+  String workspaceFileCopyName(String name, int index) {
+    return '$name（副本 $index）';
+  }
+
+  @override
+  String get workspaceFileSaving => '文件正在保存，请保存完成后重试。';
 }

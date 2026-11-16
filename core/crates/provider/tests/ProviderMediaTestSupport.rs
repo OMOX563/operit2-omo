@@ -2,6 +2,7 @@
 
 use crate::chat::llmprovider::AIService::SendMessageRequest;
 use crate::chat::llmprovider::MediaLinkBuilder::MediaLinkBuilder;
+use crate::chat::llmprovider::ThinkingDialect::RequestThinking;
 use operit_model::PromptTurn::{PromptTurn, PromptTurnKind};
 use operit_model::ToolPrompt::ToolPrompt;
 use operit_util::ImagePoolManager::ImagePoolManager;
@@ -17,20 +18,28 @@ use serde_json::Value;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-pub(crate) const IMAGE_DATA_URL: &str = "data:image/png;base64,aW1hZ2U=";
-
 /// Owns one unique pool entry without clearing other tests' images.
 pub(crate) struct TestImage(String);
 
 impl TestImage {
+    /// Registers a complete image through the production normalization boundary.
     pub(crate) fn new() -> Self {
-        let id = ImagePoolManager::add_image_from_base64("aW1hZ2U=", "image/png", None);
+        let id = ImagePoolManager::add_image_bytes(
+            include_bytes!("fixtures/pixel.png"), Some("image/png"), None,
+        );
         assert_ne!(id, "error");
         Self(id)
     }
 
+    /// Returns the serialized image reference used in prompt fixtures.
     pub(crate) fn link(&self) -> String {
         MediaLinkBuilder::image(&self.0)
+    }
+
+    /// Returns the actual normalized payload expected in provider request bodies.
+    pub(crate) fn data_url(&self) -> String {
+        let image = ImagePoolManager::get_image(&self.0).unwrap();
+        format!("data:{};base64,{}", image.mime_type, image.base64)
     }
 }
 
@@ -44,10 +53,7 @@ pub(crate) fn send_request(chat_history: Vec<PromptTurn>) -> SendMessageRequest 
     SendMessageRequest {
         chat_history,
         model_parameters: Vec::new(),
-        enable_thinking: false,
-        thinking_quality_level: 1,
-        thinking_configurations: "[]".to_string(),
-        thinking_option_id: String::new(),
+        thinking: RequestThinking::default(),
         stream: false,
         available_tools: Vec::new(),
         preserve_think_in_history: false,
@@ -83,14 +89,7 @@ struct TestRuntimeSupport;
 
 impl ProviderRuntimeSupport for TestRuntimeSupport {
     /// Returns no filesystem root in the isolated test runtime.
-    fn dataDir(&self) -> Result<PathBuf, String> {
-        Err("test runtime does not expose a data directory".to_string())
-    }
 
-    /// Returns a stable thinking quality level for the test runtime.
-    fn thinkingQualityLevel(&self) -> Result<i32, String> {
-        Ok(2)
-    }
 
     /// Accepts token updates without persisting them.
     fn updateTokensForProviderModel(
@@ -131,7 +130,6 @@ impl ProviderRuntimeSupport for TestRuntimeSupport {
     /// Returns no function binding in the isolated test runtime.
     fn modelBindingForFunction(
         &self,
-        _rootDir: PathBuf,
         _functionType: FunctionType,
     ) -> Result<ProviderFunctionModelBinding, String> {
         Err("test runtime does not expose model bindings".to_string())
@@ -140,20 +138,37 @@ impl ProviderRuntimeSupport for TestRuntimeSupport {
     /// Returns no model configuration in the isolated test runtime.
     fn resolvedModelConfig(
         &self,
-        _rootDir: PathBuf,
         _providerId: &str,
         _modelId: &str,
     ) -> Result<ResolvedModelConfig, String> {
         Err("test runtime does not expose model configuration".to_string())
     }
 
+    /// Reports that no auxiliary recognition model is configured in this fixture.
+    fn modelCapabilitiesForFunction(
+        &self,
+        _functionType: FunctionType,
+    ) -> Result<Option<operit_model::ModelConfigData::ModelCapabilities>, String> {
+        Ok(None)
+    }
+
     /// Returns no provider profile in the isolated test runtime.
     fn providerProfile(
         &self,
-        _rootDir: PathBuf,
         _providerId: &str,
     ) -> Result<ProviderProfile, String> {
         Err("test runtime does not expose provider profiles".to_string())
+    }
+
+    /// Rejects pool reservation in the media-only test runtime.
+    fn reserveProviderApiKey(&self, _providerId: &str) -> Result<String, String> {
+        Err("test runtime does not expose API key pools".to_string())
+    }
+
+    /// Rejects feedback in the media-only test runtime.
+    fn reportProviderApiKey(&self, _: &str, _: &str, _: i64,
+        _: crate::chat::llmprovider::ApiKeyProvider::ApiKeyOutcome) -> Result<(), String> {
+        Err("test runtime does not expose API key pools".to_string())
     }
 
     /// Reports that no package AI provider is registered in the test runtime.

@@ -46,8 +46,8 @@ desktop.ini
 **/flutter_export_environment.sh
 **/ephemeral/
 **/.plugin_symlinks/
-**/app.*.symbols
-**/app.*.map.json
+**/operitapp.*.symbols
+**/operitapp.*.map.json
 
 # Flutter platform build outputs
 **/android/.gradle/
@@ -120,6 +120,8 @@ tools/web-runtime/.wrangler/
 
 # Local dependency extraction/package scratch
 package/
+!apps/android-module/package/
+!apps/android-module/package/**
 
 # Go
 go.work.sum
@@ -190,6 +192,7 @@ core/crates/runtime/application/assets/plugins/external/*.toolpkg
 core/crates/runtime/application/assets/plugins/buildin/**/*.js
 core/crates/runtime/application/assets/plugins/buildin/
 core/crates/runtime/application/assets/plugins/external/
+core/crates/runtime/application/assets/models_dev/
 plugins/**/build/
 plugins/**/out/
 plugins/**/.cache/
@@ -207,6 +210,7 @@ plugins/**/.sync_hot_reload_state.json
 
 # Local build tool caches
 .ci-tools/
+tools/release/bases/
 
 
 AGENTS.md

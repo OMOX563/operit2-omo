@@ -31,6 +31,12 @@ class AppLocalizationsEn extends AppLocalizations {
   String get fullscreenInput => 'Fullscreen input';
 
   @override
+  String get noticeExpand => 'Expand';
+
+  @override
+  String get noticeCollapse => 'Collapse';
+
+  @override
   String get expandInput => 'Expand input';
 
   @override
@@ -173,6 +179,29 @@ class AppLocalizationsEn extends AppLocalizations {
 
   @override
   String get summaryGenerating => 'Generating summary...';
+
+  @override
+  String get summaryStageCore => 'Summarizing the core task...';
+
+  @override
+  String get summaryStageConstraints =>
+      'Summarizing user requests and constraints...';
+
+  @override
+  String get summaryStageFiles => 'Summarizing key files and code...';
+
+  @override
+  String get summaryStageErrors => 'Summarizing errors and fixes...';
+
+  @override
+  String get summaryStageInteraction =>
+      'Summarizing interaction and context...';
+
+  @override
+  String get summaryStageNext => 'Summarizing next steps...';
+
+  @override
+  String get summaryStageFormatting => 'Formatting the summary...';
 
   @override
   String get chatCompressingHistory => 'Compressing history records...';
@@ -342,6 +371,11 @@ class AppLocalizationsEn extends AppLocalizations {
       'Could not load messages. Please try again.';
 
   @override
+  String messageTransformFailed(String error) {
+    return 'Failed to process message display: $error';
+  }
+
+  @override
   String get messageLocatorFavoriteFailed =>
       'Could not update favorite. Please try again.';
 
@@ -408,6 +442,9 @@ class AppLocalizationsEn extends AppLocalizations {
 
   @override
   String get hiddenUserMessage => 'Hidden user message';
+
+  @override
+  String get autoTriggeredUserMessage => 'AUTO';
 
   @override
   String get workspaceSetupTitle => 'Set up workspace';
@@ -771,6 +808,13 @@ class AppLocalizationsEn extends AppLocalizations {
   String get openFile => 'Open file';
 
   @override
+  String get workspaceFileOpening => 'Opening file…';
+
+  @override
+  String get workspaceFileOpenTimedOut =>
+      'Opening the file timed out. Please try again.';
+
+  @override
   String get openLocation => 'Open location';
 
   @override
@@ -1122,13 +1166,6 @@ class AppLocalizationsEn extends AppLocalizations {
   String get settingsModelSetCurrentActive => 'Set active';
 
   @override
-  String get settingsChatThinkingMode => 'Thinking mode';
-
-  @override
-  String get settingsChatThinkingModeDescription =>
-      'Let supported models produce steadier reasoning.';
-
-  @override
   String get settingsChatStreamOutput => 'Stream output';
 
   @override
@@ -1339,6 +1376,12 @@ class AppLocalizationsEn extends AppLocalizations {
   String get settingsModelApiKey => 'API key';
 
   @override
+  String get settingsModelShowApiKey => 'Show API key';
+
+  @override
+  String get settingsModelHideApiKey => 'Hide API key';
+
+  @override
   String get settingsModelCodexLogin => 'ChatGPT login';
 
   @override
@@ -1385,7 +1428,7 @@ class AppLocalizationsEn extends AppLocalizations {
 
   @override
   String get settingsModelApiKeyPoolDescription =>
-      'Prepare multiple keys for one model profile so runtime can rotate between them.';
+      'Keep using a healthy key. Switch on authentication, quota, rate limit, or temporary failures; cooling keys are skipped.';
 
   @override
   String settingsModelApiKeyPoolCount(int count) {
@@ -1394,7 +1437,7 @@ class AppLocalizationsEn extends AppLocalizations {
 
   @override
   String get settingsModelApiKeyPoolEmpty =>
-      'No keys yet. Add keys and this profile will use the key pool.';
+      'No keys yet. Add a key before enabling this pool.';
 
   @override
   String get settingsModelAddApiKey => 'Add key';
@@ -1407,6 +1450,36 @@ class AppLocalizationsEn extends AppLocalizations {
 
   @override
   String get settingsModelApiKeyEnabled => 'Enable this key';
+
+  @override
+  String get settingsModelPoolAddSingle => 'Add current single key';
+
+  @override
+  String get settingsModelPoolPaste =>
+      'Paste one key per line to add several at once.';
+
+  @override
+  String get settingsModelPoolNoEligible =>
+      'Enable at least one nonempty key that is not marked unavailable.';
+
+  @override
+  String get settingsModelPoolUntested => 'Untested';
+
+  @override
+  String get settingsModelPoolAvailable => 'Available';
+
+  @override
+  String get settingsModelPoolUnavailable => 'Unavailable';
+
+  @override
+  String get settingsModelPoolClearMarks => 'Reset key health';
+
+  @override
+  String get settingsModelPoolTest => 'Test untested keys';
+
+  @override
+  String get settingsModelPoolNeedsModel =>
+      'Save the provider and add a model before testing keys.';
 
   @override
   String get settingsModelProviderId => 'Provider ID';
@@ -1794,6 +1867,31 @@ class AppLocalizationsEn extends AppLocalizations {
       'No fetched models. Choose Include history to see catalog IDs.';
 
   @override
+  String get settingsModelUnrecognized => 'Unrecognized';
+
+  @override
+  String settingsModelCatalogUpdatedAt(String time) {
+    return 'Capabilities and context from models.dev, updated $time';
+  }
+
+  @override
+  String settingsModelCatalogUpdateFailed(String error) {
+    return 'Could not download model details: $error';
+  }
+
+  @override
+  String settingsModelCatalogUpdateFailedUsing(String time, String error) {
+    return 'Could not update model details, using those from $time: $error';
+  }
+
+  @override
+  String get settingsModelCatalogBundled =>
+      'Using bundled model details; online updates replace them automatically';
+
+  @override
+  String get settingsModelCatalogRetry => 'Update';
+
+  @override
   String get settingsModelCustomModel => 'Custom model';
 
   @override
@@ -1873,13 +1971,7 @@ class AppLocalizationsEn extends AppLocalizations {
       'Enter a max context length greater than 0';
 
   @override
-  String get settingsModelSummaryThreshold => 'Summary token threshold';
-
-  @override
-  String get settingsModelSummaryByMessageCount => 'Summarize by message count';
-
-  @override
-  String get settingsModelSummaryMessageCount => 'Summary message threshold';
+  String get settingsModelSummaryThreshold => 'Summarize at';
 
   @override
   String get settingsModelCustomHeaders => 'Custom headers';
@@ -1923,7 +2015,7 @@ class AppLocalizationsEn extends AppLocalizations {
       'Enable provider-side search capability.';
 
   @override
-  String get settingsModelContext => 'Context window';
+  String get settingsModelContext => 'Context';
 
   @override
   String get settingsModelSummary => 'Auto summary';
@@ -1932,10 +2024,72 @@ class AppLocalizationsEn extends AppLocalizations {
   String get settingsModelThinking => 'Thinking';
 
   @override
-  String get settingsModelThinkingOption => 'Thinking option';
+  String get thinkingLevelLabel => 'Thinking';
 
   @override
-  String get settingsModelThinkingRules => 'Thinking rules JSON';
+  String get thinkingAlwaysOn => 'Always thinking';
+
+  @override
+  String get thinkingChip => 'Thinking';
+
+  @override
+  String get settingsModelThinkingSourceDeclared =>
+      'Levels from your description';
+
+  @override
+  String get settingsModelThinkingSourceLocalRuntime =>
+      'Runs locally: thinking switches on or off, and the switch does nothing for a model that cannot think';
+
+  @override
+  String get settingsModelThinkingUnknown =>
+      'The catalog has no thinking details for this model';
+
+  @override
+  String get settingsModelThinkingNotAdjustable =>
+      'This API cannot change how this model thinks';
+
+  @override
+  String get settingsModelThinkingNotSupported => 'This model does not think';
+
+  @override
+  String get settingsModelThinkingCarried =>
+      'Carried over from the level you set last';
+
+  @override
+  String get settingsModelThinkingDescribe => 'Describe';
+
+  @override
+  String get settingsModelThinkingUseCatalog => 'Use catalog';
+
+  @override
+  String get settingsModelThinkingDescribeTitle => 'How this model thinks';
+
+  @override
+  String get settingsModelThinkingKindNone => 'Does not think';
+
+  @override
+  String get settingsModelThinkingKindAlways => 'Always thinks, no control';
+
+  @override
+  String get settingsModelThinkingKindSwitch => 'On or off';
+
+  @override
+  String get settingsModelThinkingKindLevels => 'Levels';
+
+  @override
+  String get settingsModelThinkingKindBudget => 'Token budget';
+
+  @override
+  String get settingsModelThinkingCanTurnOff => 'Can be turned off';
+
+  @override
+  String get settingsModelThinkingBudgetMin => 'Minimum tokens';
+
+  @override
+  String get settingsModelThinkingBudgetMax => 'Maximum tokens';
+
+  @override
+  String get settingsModelThinkingLevelsRequired => 'Pick at least one level';
 
   @override
   String get settingsModelMediaHistory => 'Media history';
@@ -1951,13 +2105,118 @@ class AppLocalizationsEn extends AppLocalizations {
       'Turns off external tool calling when enabled';
 
   @override
-  String get settingsModelConnectionTestSection => 'Connection test';
-
-  @override
   String get settingsModelRunConnectionTest => 'Test current model';
 
   @override
-  String get settingsModelTestModel => 'Test model';
+  String get settingsModelTestModel => 'Test';
+
+  @override
+  String get settingsModelCapabilityToolCall => 'Tools';
+
+  @override
+  String get settingsModelCapabilityImage => 'Image';
+
+  @override
+  String get settingsModelCapabilityAudio => 'Audio';
+
+  @override
+  String get settingsModelCapabilityVideo => 'Video';
+
+  @override
+  String get settingsModelClaudeCache => 'Claude 1h cache';
+
+  @override
+  String get settingsModelClaudeCacheDescription =>
+      'Sets a 1-hour TTL on explicit cache breakpoints; when off, the default TTL applies.';
+
+  @override
+  String get settingsModelSummaryThresholdDescription =>
+      'Summarize when the context fills to this share. 0 turns summaries off.';
+
+  @override
+  String get settingsModelMoreActions => 'More actions';
+
+  @override
+  String get settingsModelRestoreDefaults => 'Restore defaults';
+
+  @override
+  String get settingsModelDescribeThinking => 'Describe thinking levels';
+
+  @override
+  String get settingsModelDeleteModel => 'Delete model';
+
+  @override
+  String settingsModelSaveFailed(String error) {
+    return 'Could not save: $error';
+  }
+
+  @override
+  String get settingsModelTestAll => 'Test all';
+
+  @override
+  String settingsModelTestProgress(int done, int total) {
+    return 'Testing $done/$total';
+  }
+
+  @override
+  String settingsModelTestSummary(int passed, int failed) {
+    return '$passed passed, $failed failed';
+  }
+
+  @override
+  String settingsModelTestSummaryWithRestricted(
+    int passed,
+    int failed,
+    int restricted,
+  ) {
+    return '$passed passed, $failed failed, $restricted restricted';
+  }
+
+  @override
+  String settingsModelTestAllPassed(int count) {
+    return 'All $count passed';
+  }
+
+  @override
+  String get settingsModelTestCouldNotRun => 'The test could not run';
+
+  @override
+  String get settingsModelCopyError => 'Copy error';
+
+  @override
+  String get settingsModelSelect => 'Select';
+
+  @override
+  String get settingsModelCheckAll => 'Select all';
+
+  @override
+  String settingsModelCheckedCount(int count) {
+    return '$count selected';
+  }
+
+  @override
+  String settingsModelDeleteModelsTitle(int count) {
+    return 'Delete $count models?';
+  }
+
+  @override
+  String get settingsModelDeleteModelsMessage =>
+      'Their settings are deleted with them.';
+
+  @override
+  String settingsModelDeleteModelsKept(int count, String names) {
+    return '$count in use by functions will be kept: $names';
+  }
+
+  @override
+  String settingsModelDeleteModelsBlocked(String functions) {
+    return 'The selected models are used by these functions. Change the function model assignments first: $functions';
+  }
+
+  @override
+  String settingsModelDeletedCount(int count) {
+    return 'Deleted $count models';
+  }
 
   @override
   String get settingsModelTestingConnection =>
@@ -1971,6 +2230,17 @@ class AppLocalizationsEn extends AppLocalizations {
 
   @override
   String get settingsModelConnectionTestFailed => 'Some checks failed';
+
+  @override
+  String get settingsModelConnectionTestRestricted => 'Test restricted';
+
+  @override
+  String get settingsModelTestCreditRestricted =>
+      'Credit or output budget limit';
+
+  @override
+  String get settingsModelTestRateRestricted =>
+      'Upstream rate limit or cooldown';
 
   @override
   String get settingsModelCapabilitiesApplied =>
@@ -2971,7 +3241,21 @@ class AppLocalizationsEn extends AppLocalizations {
 
   @override
   String get settingsAppearanceBubbleImagePreviewText =>
-      'Bubble preview with 9-slice guides';
+      'This is a bubble preview message.\nCheck the corners, edges, and center at their rendered size.';
+
+  @override
+  String get settingsAppearanceBubbleImageSourceHint =>
+      'Original · White: crop boundary. Blue: nine-slice grid. Pinch to zoom and drag to inspect.';
+
+  @override
+  String get settingsAppearanceBubbleImageFitSource => 'Fit original image';
+
+  @override
+  String get settingsAppearanceBubbleImageGrid => '9-slice';
+
+  @override
+  String get settingsAppearanceBubbleImageGridHint =>
+      'Two horizontal and two vertical cuts form nine regions. Corners stay fixed; edges tile along one axis and the center tiles along both. Stretch mode stretches those regions instead. Boundaries are relative to the cropped image.';
 
   @override
   String settingsAppearanceBubbleImageImportFailed(String error) {
@@ -3969,6 +4253,33 @@ class AppLocalizationsEn extends AppLocalizations {
   String get settingsPeerPortModeAutomatic => 'Automatic port';
 
   @override
+  String get settingsPeerNetworkDiscoveryHelp =>
+      'For discovery across routed networks, configure a shared directory and group key. To host the directory, leave the address empty and set a group key.';
+
+  @override
+  String get settingsPeerDiscoveryDirectory => 'Discovery directory (optional)';
+
+  @override
+  String get settingsPeerDiscoveryGroup => 'Discovery group key';
+
+  @override
+  String get settingsPeerDiscoveryGenerateKey => 'Generate new group key';
+
+  @override
+  String get settingsPeerDiscoveryCopyKey => 'Copy group key';
+
+  @override
+  String get settingsPeerDiscoveryPort => 'Directory listener port';
+
+  @override
+  String get settingsPeerDiscoveryPortHelp =>
+      'Only used on the directory host. Other devices use the port in the directory URL.';
+
+  @override
+  String get settingsPeerNetworkDiscoveryInvalid =>
+      'Check the discovery settings: use an HTTP(S) origin without a path, a shared key of 16–128 bytes, and a nonzero port when hosting the directory.';
+
+  @override
   String get settingsPeerAdvanced => 'Advanced options';
 
   @override
@@ -4245,11 +4556,11 @@ class AppLocalizationsEn extends AppLocalizations {
 
   @override
   String get settingsAppearanceThemeConfigCustomHint =>
-      'Click + to create and manage independent theme configurations.';
+      'Create a theme to save your appearance. Tap a card to switch; choose Edit to customize.';
 
   @override
   String get settingsAppearanceThemeConfigEditingHint =>
-      'Appearance changes are saved to the selected theme configuration.';
+      'Tap a card to switch themes. Mode shortcuts change only the current theme. Edits save automatically.';
 
   @override
   String settingsAppearanceThemeConfigFailed(String detail) {
@@ -4473,8 +4784,7 @@ class AppLocalizationsEn extends AppLocalizations {
       'Sync interrupted. Retrying automatically.';
 
   @override
-  String get deviceSpaceSyncPending =>
-      'Some data is still pending. Retrying automatically.';
+  String get deviceSpaceSyncPending => 'Some data is still pending.';
 
   @override
   String deviceSpaceSyncCurrentFile(String done, String total) {
@@ -4558,6 +4868,10 @@ class AppLocalizationsEn extends AppLocalizations {
   @override
   String get peerQrWrongDevice =>
       'This code belongs to a different device. Scan the code for the selected device.';
+
+  @override
+  String get peerPairTimeoutHint =>
+      'Connection timed out: could not reach the other device. A common cause is the other device’s firewall blocking incoming connections. Try initiating the connection from the other device, or allow Operit through the other device’s firewall (especially on public networks).';
 
   @override
   String get peerQrImageInvalid =>
@@ -4726,4 +5040,106 @@ class AppLocalizationsEn extends AppLocalizations {
   String settingsDataTimelineUnknownSavings(int count) {
     return 'Savings unknown for $count requests';
   }
+
+  @override
+  String get contextStatsSummaryLoadFailed =>
+      'Unable to load context statistics';
+
+  @override
+  String get contextStatsDevicesLoadFailed =>
+      'Unable to load device information';
+
+  @override
+  String get settingsAppearanceThemeLibrary => 'Your themes';
+
+  @override
+  String get settingsAppearanceThemeLibraryHint =>
+      'Choose a look. Make it yours.';
+
+  @override
+  String get settingsAppearanceThemeActive => 'In use';
+
+  @override
+  String get settingsAppearanceThemeApply => 'Use this theme';
+
+  @override
+  String get settingsAppearanceThemeMore => 'More theme actions';
+
+  @override
+  String get settingsAppearanceThemeDuplicate => 'Create a copy';
+
+  @override
+  String get settingsAppearanceThemeUnboundHint =>
+      'Keep the current look and edit without binding a saved theme.';
+
+  @override
+  String get settingsAppearanceThemeDeleteTitle => 'Delete theme';
+
+  @override
+  String settingsAppearanceThemeDeleteConfirm(String name) {
+    return 'Delete “$name”? This cannot be undone.';
+  }
+
+  @override
+  String get settingsAppearancePreviewCollapse => 'Collapse';
+
+  @override
+  String get settingsAppearancePreviewExpand => 'Expand';
+
+  @override
+  String get settingsAppearanceThemeNew => 'New theme';
+
+  @override
+  String get settingsAppearanceDeviceFonts => 'Device fonts';
+
+  @override
+  String get settingsAppearanceChooseDeviceFont => 'Choose device font';
+
+  @override
+  String get settingsAppearanceNoDeviceFonts => 'No matching device fonts';
+
+  @override
+  String get settingsAppearanceDeviceFontPreview =>
+      'The quick brown fox · 0123456789\n字体预览：你好，世界';
+
+  @override
+  String get workspaceFileRename => 'Rename';
+
+  @override
+  String get workspaceFileCopy => 'Copy';
+
+  @override
+  String get workspaceFileCut => 'Cut';
+
+  @override
+  String get workspaceFilePaste => 'Paste';
+
+  @override
+  String get workspaceFileName => 'Name';
+
+  @override
+  String get workspaceFileInvalidName =>
+      'Enter a valid name without path separators.';
+
+  @override
+  String get workspaceDeleteFolderTitle => 'Delete folder?';
+
+  @override
+  String workspaceDeleteFolderMessage(String name) {
+    return 'Delete “$name” and all its contents? This cannot be undone.';
+  }
+
+  @override
+  String workspaceFileOperationFailed(String error) {
+    return 'File operation failed: $error';
+  }
+
+  @override
+  String workspaceFileCopyName(String name, int index) {
+    return '$name (copy $index)';
+  }
+
+  @override
+  String get workspaceFileSaving =>
+      'This file is being saved. Please try again when saving finishes.';
 }

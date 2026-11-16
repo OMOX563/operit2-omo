@@ -2,8 +2,12 @@ package app.operit
 
 import android.content.Context
 import android.net.Uri
+import android.os.Build
+import android.os.Environment
+import android.os.storage.StorageManager
 import android.provider.DocumentsContract
 import android.provider.DocumentsContract.Document
+import java.io.File
 import java.io.FileNotFoundException
 import java.io.InputStream
 import java.io.OutputStream
@@ -13,6 +17,8 @@ interface DocumentTreeAccess {
     fun hasReadGrant(tree: String): Boolean
     fun hasWriteGrant(tree: String): Boolean
     fun rootId(tree: String): String
+    fun nativeDirectory(tree: String, documentId: String): String =
+        throw IllegalArgumentException("Selected document provider does not expose a native terminal directory")
     fun children(tree: String, parentId: String): List<DocumentMetadata>
     fun describe(tree: String, documentId: String): DocumentMetadata
     fun create(tree: String, parentId: String, name: String, directory: Boolean): String
@@ -33,14 +39,22 @@ data class DocumentMetadata(
 
 /** Each URI is constructed using the original authorized tree, never a raw file path. */
 class ContentResolverDocumentTreeAccess(context: Context) : DocumentTreeAccess {
-    private val resolver = context.applicationContext.contentResolver
+    private val resolverContext = context.applicationContext
+    private val resolver = resolverContext.contentResolver
     private fun tree(value: String): Uri {
         val uri = Uri.parse(value)
-        require(uri.scheme == "content" && DocumentsContract.isTreeUri(uri)) { "Expected a content tree URI" }
+        require(uri.scheme == "content" && !uri.authority.isNullOrEmpty() && uri.query == null && uri.fragment == null &&
+            (DocumentsContract.isTreeUri(uri) || DocumentsContract.isDocumentUri(resolverContext, uri))) {
+            "Expected an authorized content document or tree URI"
+        }
         return uri
     }
-    private fun document(tree: String, id: String): Uri =
-        DocumentsContract.buildDocumentUriUsingTree(tree(tree), id)
+    private fun document(tree: String, id: String): Uri {
+        val uri = tree(tree)
+        if (DocumentsContract.isTreeUri(uri)) return DocumentsContract.buildDocumentUriUsingTree(uri, id)
+        require(id == DocumentsContract.getDocumentId(uri)) { "A selected file does not authorize sibling documents" }
+        return uri
+    }
 
     override fun hasReadGrant(tree: String): Boolean {
         val uri = tree(tree)
@@ -50,7 +64,28 @@ class ContentResolverDocumentTreeAccess(context: Context) : DocumentTreeAccess {
         val uri = tree(tree)
         return resolver.persistedUriPermissions.any { it.uri == uri && it.isWritePermission }
     }
-    override fun rootId(tree: String): String = DocumentsContract.getTreeDocumentId(tree(tree))
+    override fun rootId(tree: String): String {
+        val uri = tree(tree)
+        return if (DocumentsContract.isTreeUri(uri)) DocumentsContract.getTreeDocumentId(uri) else DocumentsContract.getDocumentId(uri)
+    }
+
+    override fun nativeDirectory(tree: String, documentId: String): String {
+        val uri = tree(tree)
+        val volumes = mutableMapOf<String, File>()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            val manager = requireNotNull(resolverContext.getSystemService(StorageManager::class.java)) {
+                "Android storage manager is unavailable"
+            }
+            for (volume in manager.storageVolumes) {
+                val key = if (volume.isPrimary) "primary" else volume.uuid ?: continue
+                volume.directory?.let { volumes[key] = it }
+            }
+        } else {
+            @Suppress("DEPRECATION")
+            volumes["primary"] = Environment.getExternalStorageDirectory()
+        }
+        return AndroidDocumentNativeDirectory.resolve(uri.authority, rootId(tree), documentId, volumes)
+    }
 
     private val columns = arrayOf(Document.COLUMN_DOCUMENT_ID, Document.COLUMN_DISPLAY_NAME,
         Document.COLUMN_MIME_TYPE, Document.COLUMN_SIZE, Document.COLUMN_LAST_MODIFIED, Document.COLUMN_FLAGS)

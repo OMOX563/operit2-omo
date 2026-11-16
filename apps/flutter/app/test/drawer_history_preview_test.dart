@@ -1,8 +1,8 @@
 import 'dart:async';
-import 'dart:typed_data';
 
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:operit2/ui/features/chat/viewmodel/ChatMessageLookupRequests.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:operit2/core/bridge/OperitRuntimeBridge.dart';
@@ -42,25 +42,531 @@ void main() {
     },
   );
 
+  for (final desktop in [false, true]) {
+    testWidgets(
+      'workspace branches collapse independently and search reveals ancestors / desktop:$desktop',
+      (tester) async {
+        final bridge = _DrawerBridge();
+        final histories = [
+          _history('A', 0),
+          _history('A', 1, parentChatId: 'A-0'),
+          _history('A', 2, parentChatId: 'A-1'),
+        ];
+        await _pumpDrawer(
+          tester,
+          bridge,
+          histories,
+          conversationsOnly: desktop,
+        );
+        expect(_workspaceIds(tester), ['A-0']);
+        await tester.tap(find.byKey(const ValueKey('chat-children:A-0')));
+        await _pumpSidebar(tester);
+        expect(_workspaceIds(tester), ['A-0', 'A-1']);
+        await tester.tap(find.byKey(const ValueKey('chat-children:A-1')));
+        await _pumpSidebar(tester);
+        expect(_workspaceIds(tester), ['A-0', 'A-1', 'A-2']);
+        await tester.tap(find.byKey(const ValueKey('chat-children:A-0')));
+        await _pumpSidebar(tester);
+        expect(_workspaceIds(tester), ['A-0']);
+        await tester.tap(find.byTooltip('搜索对话'));
+        await _pumpSidebar(tester);
+        await tester.enterText(find.byType(TextField), 'A-2');
+        await _pumpSidebar(tester);
+        expect(_workspaceIds(tester), ['A-0', 'A-1', 'A-2']);
+        await tester.enterText(find.byType(TextField), '');
+        await _pumpSidebar(tester);
+        expect(_workspaceIds(tester), ['A-0']);
+        expect(tester.takeException(), isNull);
+      },
+    );
+  }
+
   testWidgets(
-    'workspace conversations stay flat and search finds direct titles',
+    'workspace preview retains parents of active descendants and counts roots',
     (tester) async {
       final bridge = _DrawerBridge();
       final histories = [
-        _history('A', 0),
+        for (var i = 0; i < 6; i++) _history('A', i),
+        _history('A', 6, parentChatId: 'A-5'),
+      ];
+      await _pumpDrawer(tester, bridge, histories, streamingIds: {'A-6'});
+      expect(_workspaceIds(tester), ['A-0', 'A-1', 'A-2', 'A-3', 'A-5']);
+      expect(find.text('展开更多 1'), findsOneWidget);
+      await tester.tap(find.byKey(const ValueKey('chat-children:A-5')));
+      await _pumpSidebar(tester);
+      expect(_workspaceIds(tester).last, 'A-6');
+      await _pumpDrawer(tester, bridge, histories, streamingIds: {'A-6'});
+      expect(_workspaceIds(tester).last, 'A-6');
+      expect(tester.takeException(), isNull);
+    },
+  );
+
+  testWidgets(
+    'children follow their parent group and missing parents remain roots',
+    (tester) async {
+      final bridge = _DrawerBridge();
+      final histories = [
+        _history('A', 0, groupName: 'Research'),
         _history('A', 1, parentChatId: 'A-0'),
-        _history('A', 2, parentChatId: 'A-1'),
+        _history('A', 2, parentChatId: 'missing-parent', groupName: 'Research'),
       ];
       await _pumpDrawer(tester, bridge, histories);
-      expect(_visibleIds(tester), ['A-0', 'A-1', 'A-2']);
+      expect(_workspaceIds(tester), ['A-0', 'A-2']);
+      expect(find.text('未分组'), findsNothing);
+      await tester.tap(find.byKey(const ValueKey('chat-children:A-0')));
+      await _pumpSidebar(tester);
+      expect(_workspaceIds(tester), ['A-0', 'A-1', 'A-2']);
+      expect(tester.takeException(), isNull);
+    },
+  );
+
+  testWidgets(
+    'desktop recents combine projects and unbound chats in activity order',
+    (tester) async {
+      final bridge = _DrawerBridge();
+      final histories = [
+        _history('A', 0, pinned: true, updatedAt: '2026-11-04T06:00:00Z'),
+        _history(
+          'B',
+          0,
+          groupName: 'Design',
+          updatedAt: '2026-11-04T16:30:00+08:00',
+        ),
+        core.ChatHistoryListItem.fromJson({
+          ..._history('unbound', 0, updatedAt: '2026-11-04T07:00:00Z').toJson(),
+          'workspaceId': null,
+          'workspaceName': null,
+        }),
+        _history('A', 1, updatedAt: '2026-11-04T08:00:00Z'),
+        _history('B', 1, updatedAt: '2026-11-04T08:00:00Z'),
+        core.ChatHistoryListItem.fromJson({
+          ..._history('missing', 0, updatedAt: 'invalid').toJson(),
+          'workspaceName': null,
+        }),
+      ];
+      await _pumpDrawer(
+        tester,
+        bridge,
+        histories,
+        currentChatId: 'B-0',
+        conversationsOnly: true,
+      );
+      expect(find.text('最近会话'), findsOneWidget);
+      expect(find.text('未关联项目'), findsOneWidget);
+      expect(_recentIds(tester), ['B-0', 'A-1', 'B-1', 'unbound-0']);
+      final recentRow = tester.widget<ConversationDrawerItem>(
+        find.byKey(const ValueKey('recent-chat:B-0')),
+      );
+      expect(recentRow.selected, isTrue);
+      expect(recentRow.history.workspaceId, 'B');
+      expect(recentRow.history.group, 'Design');
+      expect(recentRow.canAcceptDrop(histories[4]), isFalse);
+      recentRow.onMoveTo(histories[4]);
+      await _pumpSidebar(tester);
+      expect(
+        bridge.calls.where((call) => call.methodName == 'updateChatOrder'),
+        isEmpty,
+      );
+      await tester.tap(find.byKey(const ValueKey('recent-history-limit')));
+      await _pumpSidebar(tester);
+      expect(_recentIds(tester), [
+        'B-0',
+        'A-1',
+        'B-1',
+        'unbound-0',
+        'A-0',
+        'missing-0',
+      ]);
+      await tester.tap(find.byKey(const ValueKey('recent-history-header')));
+      await _pumpSidebar(tester);
+      expect(_recentIds(tester), isEmpty);
+      expect(_workspaceIds(tester), [
+        'unbound-0',
+        'A-0',
+        'A-1',
+        'B-0',
+        'B-1',
+        'missing-0',
+      ]);
+      await tester.tap(find.byKey(const ValueKey('recent-history-header')));
+      await _pumpSidebar(tester);
+      await tester.tap(find.byKey(const ValueKey('recent-history-limit')));
+      await _pumpSidebar(tester);
+      expect(_recentIds(tester), ['B-0', 'A-1', 'B-1', 'unbound-0']);
+      expect(tester.takeException(), isNull);
+    },
+  );
+
+  testWidgets(
+    'desktop recents exist with only bound chats and update with canonical metadata',
+    (tester) async {
+      final bridge = _DrawerBridge();
+      final first = _history('A', 0, updatedAt: '2026-11-04T06:00:00Z');
+      final second = _history(
+        'B',
+        0,
+        groupName: 'Design',
+        updatedAt: '2026-11-04T08:00:00Z',
+      );
+      await _pumpDrawer(tester, bridge, [
+        first,
+        second,
+      ], conversationsOnly: true);
+      expect(find.text('未关联项目'), findsNothing);
+      expect(_recentIds(tester), ['B-0', 'A-0']);
+      await tester.tap(find.byKey(const ValueKey('recent-chat:B-0')));
+      await _pumpSidebar(tester);
+      final activated = bridge.calls.singleWhere(
+        (call) => call.methodName == 'switchChat',
+      );
+      expect((activated.args as Map)['chatId'], 'B-0');
+      expect(
+        bridge.calls.where((call) => call.methodName == 'updateChatGroups'),
+        isEmpty,
+      );
+      expect(
+        bridge.calls.where((call) => call.methodName == 'bindChatToWorkspace'),
+        isEmpty,
+      );
+      final changed = core.ChatHistoryListItem.fromJson({
+        ...first.toJson(),
+        'title': 'Updated A',
+        'updatedAt': '2026-11-04T09:00:00Z',
+      });
+      await _pumpDrawer(
+        tester,
+        bridge,
+        [changed, second],
+        currentChatId: 'B-0',
+        conversationsOnly: true,
+      );
+      expect(_recentIds(tester), ['A-0', 'B-0']);
+      expect(
+        tester
+            .widget<ConversationDrawerItem>(
+              find.byKey(const ValueKey('recent-chat:A-0')),
+            )
+            .title,
+        'Updated A',
+      );
+      for (final prefix in ['recent', 'workspace']) {
+        final selected = tester.widget<ConversationDrawerItem>(
+          find.byKey(ValueKey('$prefix-chat:B-0')),
+        );
+        expect(selected.selected, isTrue);
+        expect(selected.history.workspaceId, 'B');
+        expect(selected.history.group, 'Design');
+      }
+      await _pumpDrawer(tester, bridge, [changed], conversationsOnly: true);
+      expect(_recentIds(tester), ['A-0']);
+      expect(find.byKey(const ValueKey('recent-chat:B-0')), findsNothing);
+      expect(tester.takeException(), isNull);
+    },
+  );
+
+  testWidgets('desktop lists every project with compact group hierarchy', (
+    tester,
+  ) async {
+    final unbound = core.ChatHistoryListItem.fromJson({
+      ..._history('recent', 0).toJson(),
+      'workspaceId': null,
+      'workspaceName': null,
+    });
+    await _pumpDrawer(
+      tester,
+      _DrawerBridge(),
+      [
+        unbound,
+        _history('A', 0),
+        _history('A', 1, groupName: 'Research'),
+        _history('B', 0, groupName: 'Design'),
+      ],
+      currentChatId: 'A-0',
+      conversationsOnly: true,
+    );
+    expect(
+      find.byKey(const ValueKey('desktop-workspace-picker')),
+      findsNothing,
+    );
+    expect(_workspaceIds(tester), ['recent-0', 'A-0', 'A-1', 'B-0']);
+    expect(find.text('未分组'), findsNWidgets(2));
+    expect(find.text('Research'), findsOneWidget);
+    expect(find.text('Design'), findsOneWidget);
+    final toolbar = find.byKey(const ValueKey('workspace-create-toolbar'));
+    final project = find.byKey(const ValueKey('workspace-header:workspace:A'));
+    expect(
+      tester.getTopLeft(project).dy,
+      greaterThan(tester.getBottomLeft(toolbar).dy),
+    );
+    final projectStart = tester.getTopLeft(find.text('A')).dx;
+    final groupStart = tester.getTopLeft(find.text('Research')).dx;
+    final conversationStart = tester
+        .getTopLeft(
+          find.descendant(
+            of: find.byKey(const ValueKey('workspace-chat:A-1')),
+            matching: find.text('A-1'),
+          ),
+        )
+        .dx;
+    expect(groupStart, greaterThan(projectStart));
+    expect(conversationStart - groupStart, inExclusiveRange(0, 16));
+    await tester.tap(find.text('Research'));
+    await _pumpSidebar(tester);
+    expect(_workspaceIds(tester), ['recent-0', 'A-0', 'B-0']);
+    await tester.tap(find.text('A'));
+    await _pumpSidebar(tester);
+    expect(_workspaceIds(tester), ['recent-0', 'B-0']);
+    await tester.tap(find.text('A'));
+    await _pumpSidebar(tester);
+    expect(_workspaceIds(tester), ['recent-0', 'A-0', 'B-0']);
+    await tester.tap(find.text('Research'));
+    await _pumpSidebar(tester);
+    expect(_workspaceIds(tester), ['recent-0', 'A-0', 'A-1', 'B-0']);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets(
+    'desktop creation inherits active chat and project actions stay explicit',
+    (tester) async {
+      final bridge = _DrawerBridge();
+      final unbound = core.ChatHistoryListItem.fromJson({
+        ..._history('recent', 0).toJson(),
+        'workspaceId': null,
+        'workspaceName': null,
+      });
+      await _pumpDrawer(
+        tester,
+        bridge,
+        [unbound, _history('A', 0), _history('B', 0)],
+        currentChatId: 'A-0',
+        conversationsOnly: true,
+      );
+      await tester.tap(find.byKey(const ValueKey('workspace-create-chat')));
+      await _pumpSidebar(tester);
+      var calls = bridge.calls.where(
+        (call) => call.methodName == 'createNewChat',
+      );
+      expect((calls.last.args as Map)['workspaceId'], 'A');
+      for (final entry in [('B', 'B'), ('unbound', null)]) {
+        final header = find.byKey(
+          ValueKey('workspace-header:workspace:${entry.$1}'),
+        );
+        await tester.tap(
+          find.descendant(of: header, matching: find.byTooltip('项目操作')),
+        );
+        await _pumpSidebar(tester);
+        expect(find.text('新建分组'), findsOneWidget);
+        expect(
+          find.text('删除工作区'),
+          entry.$2 == null ? findsNothing : findsOneWidget,
+        );
+        await tester.tap(find.text('新建对话').last);
+        await _pumpSidebar(tester);
+        calls = bridge.calls.where(
+          (call) => call.methodName == 'createNewChat',
+        );
+        expect((calls.last.args as Map)['workspaceId'], entry.$2);
+      }
+      expect(calls, hasLength(3));
+      expect(tester.takeException(), isNull);
+    },
+  );
+
+  testWidgets(
+    'desktop search reveals collapsed projects and groups without changing folds',
+    (tester) async {
+      await _pumpDrawer(
+        tester,
+        _DrawerBridge(),
+        [_history('A', 0), _history('B', 0, groupName: 'Design')],
+        currentChatId: 'A-0',
+        conversationsOnly: true,
+      );
+      await tester.tap(find.text('Design'));
+      await _pumpSidebar(tester);
+      await tester.tap(find.text('B'));
+      await _pumpSidebar(tester);
+      await tester.tap(find.byKey(const ValueKey('recent-history-header')));
+      await _pumpSidebar(tester);
+      expect(_recentIds(tester), isEmpty);
       await tester.tap(find.byTooltip('搜索对话'));
       await _pumpSidebar(tester);
-      await tester.enterText(find.byType(TextField), 'A-2');
+      await tester.enterText(find.byType(TextField), 'B-0');
       await _pumpSidebar(tester);
-      expect(_visibleIds(tester), ['A-2']);
-      await tester.enterText(find.byType(TextField), '');
+      expect(_workspaceIds(tester), ['B-0']);
+      expect(_recentIds(tester), ['B-0']);
+      expect(find.text('Design'), findsOneWidget);
+      await tester.tap(find.byTooltip('收起搜索'));
       await _pumpSidebar(tester);
-      expect(_visibleIds(tester), ['A-0', 'A-1', 'A-2']);
+      expect(_recentIds(tester), isEmpty);
+      expect(_workspaceIds(tester), ['A-0']);
+      await tester.tap(find.text('B'));
+      await _pumpSidebar(tester);
+      expect(find.text('Design'), findsOneWidget);
+      expect(_workspaceIds(tester), ['A-0']);
+      await tester.tap(find.text('Design'));
+      await _pumpSidebar(tester);
+      expect(_workspaceIds(tester), ['A-0', 'B-0']);
+      await tester.tap(find.byTooltip('搜索对话'));
+      await _pumpSidebar(tester);
+      await tester.enterText(find.byType(TextField), 'no-match');
+      await _pumpSidebar(tester);
+      expect(find.text('没有匹配的会话'), findsOneWidget);
+      expect(tester.takeException(), isNull);
+    },
+  );
+
+  testWidgets(
+    'desktop starts with all projects open independently of the mobile drawer',
+    (tester) async {
+      final bridge = _DrawerBridge();
+      final histories = [_history('A', 0), _history('B', 0)];
+      await _pumpDrawer(tester, bridge, histories);
+      await tester.tap(find.text('B'));
+      await _pumpSidebar(tester);
+      expect(_workspaceIds(tester), ['A-0']);
+      await _pumpDrawer(tester, bridge, histories, conversationsOnly: true);
+      expect(_workspaceIds(tester), ['A-0', 'B-0']);
+      await _pumpDrawer(tester, bridge, histories);
+      expect(_workspaceIds(tester), ['A-0']);
+      await tester.tap(find.text('B'));
+      await _pumpSidebar(tester);
+      expect(_workspaceIds(tester), ['A-0', 'B-0']);
+      expect(tester.takeException(), isNull);
+    },
+  );
+
+  testWidgets(
+    'desktop keeps group creation and previews scoped to their project',
+    (tester) async {
+      final bridge = _DrawerBridge();
+      await _pumpDrawer(
+        tester,
+        bridge,
+        [..._histories('A', 6), _history('B', 0, groupName: 'Design')],
+        currentChatId: 'A-0',
+        conversationsOnly: true,
+      );
+      expect(_workspaceIds(tester), ['A-0', 'A-1', 'A-2', 'A-3', 'B-0']);
+      await tester.tap(_limitButton('A'));
+      await _pumpSidebar(tester);
+      expect(_workspaceIds(tester), [
+        'A-0',
+        'A-1',
+        'A-2',
+        'A-3',
+        'A-4',
+        'A-5',
+        'B-0',
+      ]);
+      final group = find.byKey(
+        const ValueKey('workspace-group:workspace:B::group:Design'),
+      );
+      await tester.tap(
+        find.descendant(of: group, matching: find.byTooltip('分组操作')),
+      );
+      await _pumpSidebar(tester);
+      expect(find.text('重命名'), findsOneWidget);
+      expect(find.text('解散分组'), findsOneWidget);
+      await tester.tap(find.text('新建对话').last);
+      await _pumpSidebar(tester);
+      final created = bridge.calls.lastWhere(
+        (call) => call.methodName == 'createNewChat',
+      );
+      expect((created.args as Map)['workspaceId'], 'B');
+      final grouped = bridge.calls.lastWhere(
+        (call) => call.methodName == 'updateChatGroups',
+      );
+      expect((grouped.args as Map)['groupName'], 'Design');
+      expect(tester.takeException(), isNull);
+    },
+  );
+
+  testWidgets('desktop creation stays fixed while all projects scroll', (
+    tester,
+  ) async {
+    final projects = List.generate(18, (index) => '项目 $index 的长名称用于检查窄栏显示');
+    await _pumpDrawer(
+      tester,
+      _DrawerBridge(),
+      [for (final project in projects) _history(project, 0)],
+      currentChatId: '${projects.first}-0',
+      conversationsOnly: true,
+    );
+    final toolbar = find.byKey(const ValueKey('workspace-create-toolbar'));
+    final before = tester.getTopLeft(toolbar);
+    final scroll = find.byKey(
+      const PageStorageKey<String>('desktop-workspace-scroll'),
+    );
+    await tester.drag(scroll, const Offset(0, -500));
+    await _pumpSidebar(tester);
+    expect(tester.getTopLeft(toolbar), before);
+    expect(
+      find.byKey(const ValueKey('workspace-create-chat')).hitTestable(),
+      findsOneWidget,
+    );
+    final last = find.byKey(
+      ValueKey('workspace-header:workspace:${projects.last}'),
+    );
+    await tester.scrollUntilVisible(
+      last,
+      420,
+      scrollable: find
+          .descendant(of: scroll, matching: find.byType(Scrollable))
+          .first,
+    );
+    await _pumpSidebar(tester);
+    expect(last.hitTestable(), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets(
+    'default and named groups keep controls with shallow indentation',
+    (tester) async {
+      final bridge = _DrawerBridge();
+      final unbound = core.ChatHistoryListItem.fromJson({
+        ..._history('unbound', 0).toJson(),
+        'workspaceId': null,
+        'workspaceName': null,
+      });
+      await _pumpDrawer(tester, bridge, [
+        unbound,
+        _history('A', 0),
+        _history('A', 1, groupName: 'Research'),
+      ]);
+      expect(find.text('未分组'), findsNWidgets(2));
+      expect(find.text('未绑定项目'), findsNothing);
+      expect(find.text('未关联项目'), findsOneWidget);
+      expect(find.text('Research'), findsOneWidget);
+      expect(_visibleIds(tester), ['unbound-0', 'A-0', 'A-1']);
+      for (final row in tester.widgetList<ConversationDrawerItem>(
+        find.byType(ConversationDrawerItem),
+      )) {
+        expect(row.nested, isFalse);
+      }
+      expect(
+        tester.getTopLeft(find.text('A-1')).dx -
+            tester.getTopLeft(find.text('A-0')).dx,
+        0,
+      );
+      final defaultGroup = find.byKey(
+        const ValueKey('workspace-group:workspace:A'),
+      );
+      expect(
+        find.descendant(of: defaultGroup, matching: find.byTooltip('分组操作')),
+        findsOneWidget,
+      );
+      await tester.tap(
+        find.descendant(of: defaultGroup, matching: find.text('未分组')),
+      );
+      await _pumpSidebar(tester);
+      expect(find.text('A-0'), findsNothing);
+      expect(find.text('A-1'), findsOneWidget);
+      await tester.tap(
+        find.descendant(of: defaultGroup, matching: find.text('未分组')),
+      );
+      await _pumpSidebar(tester);
+      expect(find.text('A-0'), findsOneWidget);
       expect(tester.takeException(), isNull);
     },
   );
@@ -124,51 +630,56 @@ void main() {
     );
   }
 
-  testWidgets('brand header fits the narrow drawer beside the tab switch', (
+  testWidgets('brand header constrains plugin tabs inside narrow drawers', (
     tester,
   ) async {
     for (final scale in [1.0, 1.4]) {
-      await tester.pumpWidget(
-        MaterialApp(
-          home: Scaffold(
-            body: MediaQuery(
-              data: MediaQueryData(textScaler: TextScaler.linear(scale)),
-              child: Align(
-                alignment: Alignment.topLeft,
-                child: SizedBox(
-                  width: 195,
-                  child: SidebarInfoCard(
-                    brandName: 'Operit',
-                    appearance: const NavigationDrawerAppearance(
-                      containerColor: Colors.white,
-                      titleColor: Colors.black,
-                      statusAvailableColor: Colors.blue,
-                      itemColor: Colors.black87,
-                      buttonContainerColor: Colors.white70,
-                      selectedContainerColor: Colors.blue,
-                      selectedContentColor: Colors.white,
-                      dividerColor: Colors.black12,
-                      transparentSurfaceEnabled: false,
-                    ),
-                    trailing: const SizedBox(
-                      key: ValueKey('test-tab-switch'),
-                      width: 98,
-                      height: 23,
+      for (final (headerWidth, tabWidth) in [(195.0, 98.0), (125.0, 245.0)]) {
+        await tester.pumpWidget(
+          MaterialApp(
+            home: Scaffold(
+              body: MediaQuery(
+                data: MediaQueryData(textScaler: TextScaler.linear(scale)),
+                child: Align(
+                  alignment: Alignment.topLeft,
+                  child: SizedBox(
+                    width: headerWidth,
+                    child: SidebarInfoCard(
+                      brandName: 'Operit',
+                      appearance: const NavigationDrawerAppearance(
+                        containerColor: Colors.white,
+                        titleColor: Colors.black,
+                        statusAvailableColor: Colors.blue,
+                        itemColor: Colors.black87,
+                        buttonContainerColor: Colors.white70,
+                        selectedContainerColor: Colors.blue,
+                        selectedContentColor: Colors.white,
+                        dividerColor: Colors.black12,
+                        transparentSurfaceEnabled: false,
+                      ),
+                      trailing: SizedBox(
+                        key: const ValueKey('test-tab-switch'),
+                        width: tabWidth,
+                        height: 23,
+                      ),
                     ),
                   ),
                 ),
               ),
             ),
           ),
-        ),
-      );
-      await tester.pumpAndSettle();
-      expect(tester.takeException(), isNull);
-      expect(
-        tester.getSize(find.byKey(const ValueKey('test-tab-switch'))).width,
-        98,
-      );
-      expect(tester.getSize(find.text('Operit')).width, lessThanOrEqualTo(63));
+        );
+        await tester.pumpAndSettle();
+        expect(tester.takeException(), isNull);
+        final tabs = tester.getRect(
+          find.byKey(const ValueKey('test-tab-switch')),
+        );
+        final brand = tester.getRect(find.text('Operit'));
+        expect(tabs.right, lessThanOrEqualTo(headerWidth));
+        expect(brand.right, lessThanOrEqualTo(tabs.left));
+        expect(brand.width, greaterThan(0));
+        if (headerWidth == 195) expect(tabs.width, 98);
+      }
     }
   });
 
@@ -214,7 +725,60 @@ void main() {
   );
 
   testWidgets(
-    'workspace headers restore the legacy accent marker and row style',
+    'conversation paint and hit bounds fill the row without moving title centers',
+    (tester) async {
+      final bridge = _DrawerBridge();
+      await _pumpDrawer(
+        tester,
+        bridge,
+        _histories('A', 2),
+        currentChatId: 'A-0',
+        conversationsOnly: true,
+      );
+      for (final prefix in ['recent', 'workspace']) {
+        final centers = <double>[];
+        for (final id in ['A-0', 'A-1']) {
+          final row = find.byKey(ValueKey('$prefix-chat:$id'));
+          final item = tester.widget<ConversationDrawerItem>(row);
+          final rowRect = tester.getRect(row);
+          final ink = find.descendant(
+            of: row,
+            matching: find.byWidgetPredicate(
+              (widget) => widget is InkWell && widget.onTap == item.onClick,
+            ),
+          );
+          final inkRect = tester.getRect(ink);
+          final title = find.descendant(of: row, matching: find.text(id));
+          centers.add(tester.getCenter(title).dy);
+          expect(rowRect.height, 30);
+          expect(inkRect.top, rowRect.top + 1);
+          expect(inkRect.bottom, rowRect.bottom - 1);
+          expect(tester.getCenter(title).dy, rowRect.center.dy);
+          final material = find
+              .ancestor(of: ink, matching: find.byType(Material))
+              .first;
+          expect(tester.getRect(material), inkRect);
+          for (final y in [inkRect.top + 1, inkRect.bottom - 1]) {
+            final before = bridge.calls
+                .where((call) => call.methodName == 'switchChat')
+                .length;
+            await tester.tapAt(Offset(inkRect.center.dx, y));
+            await _pumpSidebar(tester);
+            final switches = bridge.calls
+                .where((call) => call.methodName == 'switchChat')
+                .toList();
+            expect(switches.length, before + 1);
+            expect((switches.last.args as Map)['chatId'], id);
+          }
+        }
+        expect(centers[1] - centers[0], 30);
+      }
+      expect(tester.takeException(), isNull);
+    },
+  );
+
+  testWidgets(
+    'workspace headers stay compact and conversation rows have no extra rail',
     (tester) async {
       await _pumpDrawer(tester, _DrawerBridge(), _histories('A', 2));
       final header = find.byKey(const ValueKey('workspace-header:workspace:A'));
@@ -227,13 +791,13 @@ void main() {
               container.constraints?.maxWidth == 3 &&
               container.constraints?.maxHeight == 17,
         ),
-        hasLength(1),
+        isEmpty,
       );
       for (final item in tester.widgetList<ConversationDrawerItem>(
         find.byType(ConversationDrawerItem),
       )) {
         expect(item.workspaceStyle, isTrue);
-        expect(item.nested, isTrue);
+        expect(item.nested, isFalse);
       }
       await tester.tap(find.byTooltip('搜索对话'));
       await _pumpSidebar(tester);
@@ -479,7 +1043,7 @@ void main() {
       ];
       final bridge = _DrawerBridge();
       await _pumpDrawer(tester, bridge, histories);
-      expect(find.text('未绑定项目'), findsOneWidget);
+      expect(find.text('未关联项目'), findsOneWidget);
       expect(find.text('项目记录缺失'), findsNWidgets(2));
       expect(_visibleIds(tester), [
         'unbound-a-0',
@@ -500,7 +1064,7 @@ void main() {
           }),
       ];
       await _pumpDrawer(tester, bridge, hydrated);
-      expect(find.text('未绑定项目'), findsOneWidget);
+      expect(find.text('未关联项目'), findsOneWidget);
       expect(find.text('项目记录缺失'), findsNothing);
       expect(find.text('Project A'), findsOneWidget);
       expect(find.text('Project B'), findsOneWidget);
@@ -717,51 +1281,94 @@ void main() {
     },
   );
 
-  testWidgets(
-    'workspace deletion confirms before deleting the whole workspace',
-    (tester) async {
-      final bridge = _DrawerBridge();
-      await _pumpDrawer(tester, bridge, [_history('A', 0), _history('A', 1)]);
-      final header = find.byKey(const ValueKey('workspace-header:workspace:A'));
-      final l10n = AppLocalizations.of(
-        tester.element(find.byType(DrawerContent)),
-      )!;
-      Future<void> openDelete() async {
-        await tester.tap(
-          find.descendant(of: header, matching: find.byTooltip('项目操作')),
-        );
-        await _pumpSidebar(tester);
-        await tester.tap(find.text('删除工作区'));
-        await _pumpSidebar(tester);
-      }
+  for (final desktop in [false, true]) {
+    for (final missing in [false, true]) {
+      testWidgets(
+        'workspace deletion confirms and clears pins / desktop:$desktop / missing:$missing',
+        (tester) async {
+          final bridge = _DrawerBridge();
+          const directory = SidebarDirectory.workspace('A');
+          bridge.directoryPreferences[directory.preferenceKey] = true;
+          final histories = [
+            for (var index = 0; index < 2; index++)
+              core.ChatHistoryListItem.fromJson({
+                ..._history('A', index).toJson(),
+                if (missing) 'workspaceName': null,
+              }),
+          ];
+          await _pumpDrawer(
+            tester,
+            bridge,
+            histories,
+            conversationsOnly: desktop,
+          );
+          final header = find.byKey(
+            const ValueKey('workspace-header:workspace:A'),
+          );
+          final l10n = AppLocalizations.of(
+            tester.element(find.byType(DrawerContent)),
+          )!;
+          Future<void> openDelete() async {
+            await tester.tap(
+              find.descendant(of: header, matching: find.byTooltip('项目操作')),
+            );
+            await _pumpSidebar(tester);
+            await tester.tap(find.text('删除工作区'));
+            await _pumpSidebar(tester);
+          }
 
-      await openDelete();
-      expect(find.textContaining('共享默认区域及其中的文件将被删除'), findsOneWidget);
-      expect(
-        bridge.calls.where((call) => call.methodName == 'deleteWorkspace'),
-        isEmpty,
+          await openDelete();
+          expect(
+            find.textContaining(missing ? '会话和文件会保留' : '共享默认区域及其中的文件将被删除'),
+            findsOneWidget,
+          );
+          expect(
+            bridge.calls.where((call) => call.methodName == 'deleteWorkspace'),
+            isEmpty,
+          );
+          await tester.tap(find.widgetWithText(TextButton, l10n.cancel));
+          await _pumpSidebar(tester);
+          expect(
+            bridge.calls.where((call) => call.methodName == 'deleteWorkspace'),
+            isEmpty,
+          );
+          expect(bridge.directoryPreferences[directory.preferenceKey], isTrue);
+          await openDelete();
+          await tester.tap(find.widgetWithText(TextButton, l10n.delete));
+          await _pumpSidebar(tester);
+          final calls = bridge.calls.where(
+            (call) => call.methodName == 'deleteWorkspace',
+          );
+          expect(calls, hasLength(1));
+          expect((calls.single.args as Map)['workspaceId'], 'A');
+          expect(
+            bridge.calls.where(
+              (call) => call.methodName == 'deleteChatHistory',
+            ),
+            isEmpty,
+          );
+          expect(
+            bridge.directoryPreferences.containsKey(directory.preferenceKey),
+            isFalse,
+          );
+          if (missing) {
+            await _pumpDrawer(tester, bridge, [
+              for (final history in histories)
+                core.ChatHistoryListItem.fromJson({
+                  ...history.toJson(),
+                  'workspaceId': null,
+                }),
+            ], conversationsOnly: desktop);
+            expect(header, findsNothing);
+            expect(find.text('项目记录缺失'), findsNothing);
+            expect(find.text('未关联项目'), findsOneWidget);
+            expect(_workspaceIds(tester), ['A-0', 'A-1']);
+          }
+          expect(tester.takeException(), isNull);
+        },
       );
-      await tester.tap(find.widgetWithText(TextButton, l10n.cancel));
-      await _pumpSidebar(tester);
-      expect(
-        bridge.calls.where((call) => call.methodName == 'deleteWorkspace'),
-        isEmpty,
-      );
-      await openDelete();
-      await tester.tap(find.widgetWithText(TextButton, l10n.delete));
-      await _pumpSidebar(tester);
-      final calls = bridge.calls.where(
-        (call) => call.methodName == 'deleteWorkspace',
-      );
-      expect(calls, hasLength(1));
-      expect((calls.single.args as Map)['workspaceId'], 'A');
-      expect(
-        bridge.calls.where((call) => call.methodName == 'deleteChatHistory'),
-        isEmpty,
-      );
-      expect(tester.takeException(), isNull);
-    },
-  );
+    }
+  }
 
   testWidgets(
     'workspace cleanup errors keep the workspace available for retry',
@@ -1068,10 +1675,13 @@ Future<void> _pumpDrawer(
   _DrawerBridge bridge,
   List<core.ChatHistoryListItem> histories, {
   String? currentChatId,
+  bool conversationsOnly = false,
   Set<String> streamingIds = const <String>{},
 }) async {
   bridge.updateHistories(histories);
-  tester.view.physicalSize = const Size(500, 2400);
+  tester.view.physicalSize = conversationsOnly
+      ? const Size(280, 800)
+      : const Size(500, 2400);
   tester.view.devicePixelRatio = 1;
   addTearDown(tester.view.resetPhysicalSize);
   addTearDown(tester.view.resetDevicePixelRatio);
@@ -1084,6 +1694,7 @@ Future<void> _pumpDrawer(
       hostInteractionHostsEnabled: false,
       child: Scaffold(
         body: DrawerContent(
+          conversationsOnly: conversationsOnly,
           navigationEntries: const [],
           pluginEntries: const [],
           selectedRouteId: ScreenRouteRegistry.routeIdOf(
@@ -1132,6 +1743,23 @@ List<String> _visibleIds(WidgetTester tester) => tester
     .map((item) => item.history.id)
     .toList();
 
+/// Reads project/group rows separately from the recent conversation shortcuts.
+List<String> _workspaceIds(WidgetTester tester) => tester
+    .widgetList<ConversationDrawerItem>(find.byType(ConversationDrawerItem))
+    .where((item) => item.key == ValueKey('workspace-chat:${item.history.id}'))
+    .map((item) => item.history.id)
+    .toList();
+
+List<String> _recentIds(WidgetTester tester) => tester
+    .widgetList<ConversationDrawerItem>(
+      find.descendant(
+        of: find.byKey(const ValueKey('recent-history-section')),
+        matching: find.byType(ConversationDrawerItem),
+      ),
+    )
+    .map((item) => item.history.id)
+    .toList();
+
 /// Creates ordered conversations for one named group.
 List<core.ChatHistoryListItem> _histories(String group, int count) =>
     <core.ChatHistoryListItem>[
@@ -1145,12 +1773,13 @@ core.ChatHistoryListItem _history(
   bool pinned = false,
   String? parentChatId,
   String? groupName,
+  String updatedAt = '2026-10-06T00:00:00Z',
 }) => core.ChatHistoryListItem(
   parentChatId: parentChatId,
   group: groupName,
   id: '$group-$index',
   title: '$group-$index',
-  updatedAt: '2026-10-06T00:00:00Z',
+  updatedAt: updatedAt,
 
   displayOrder: index,
   workspaceId: group,

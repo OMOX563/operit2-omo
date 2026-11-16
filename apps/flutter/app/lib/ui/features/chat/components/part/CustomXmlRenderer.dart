@@ -3,7 +3,6 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
-import 'package:flutter/rendering.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'package:xml/xml.dart' as xml;
 
@@ -13,6 +12,7 @@ import '../../../../../core/proxy/generated/CoreProxyClients.g.dart';
 import '../../../../../core/proxy/generated/CoreProxyModels.g.dart'
     as core_proxy;
 import '../../../../../l10n/generated/app_localizations.dart';
+import '../../../../common/interactions/ChainedScrollController.dart';
 import '../../../../common/interactions/MessagePressShield.dart';
 import '../../../../common/markdown/StreamMarkdownRenderer.dart';
 import '../../../../common/markdown/Utf16Text.dart';
@@ -581,7 +581,7 @@ class _ThinkPanelState extends State<_ThinkPanel> {
     _expanded = _targetExpandedFor(widget);
     _bodyFullHeight = widget.fullHeight && widget.initiallyExpanded;
     _expandSession = _expanded ? 1 : 0;
-    _scrollController = ScrollController();
+    _scrollController = ChainedScrollController();
   }
 
   /// Syncs expansion state when caller defaults change.
@@ -716,9 +716,9 @@ class _ThinkPanelState extends State<_ThinkPanel> {
         : null;
     return SelectionContainer.disabled(
       child: Semantics(
-        label: contentText.isEmpty
-            ? thinkingTitle
-            : '$thinkingTitle\n$contentText',
+        // The visible preview/body owns its text semantics. A collapsed header
+        // must not also expose the full hidden transcript to accessibility.
+        label: thinkingTitle,
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: <Widget>[
@@ -1027,11 +1027,12 @@ class _ThinkingPreviewTicker extends StatefulWidget {
 
 class _ThinkingPreviewTickerState extends State<_ThinkingPreviewTicker> {
   late final ScrollController _controller;
-  final GlobalKey _textKey = GlobalKey();
+  final TextPainter _previewMetrics = TextPainter(maxLines: 1);
   bool _scrollScheduled = false;
   bool _scrollAwaitingDimensions = false;
   double _pendingScrollCorrection = 0;
 
+  /// Starts tail tracking after the preview's first layout.
   @override
   void initState() {
     super.initState();
@@ -1041,6 +1042,7 @@ class _ThinkingPreviewTickerState extends State<_ThinkingPreviewTicker> {
     }
   }
 
+  /// Measures evicted text independently of the live paragraph's layout phase.
   @override
   void didUpdateWidget(covariant _ThinkingPreviewTicker oldWidget) {
     super.didUpdateWidget(oldWidget);
@@ -1052,24 +1054,24 @@ class _ThinkingPreviewTickerState extends State<_ThinkingPreviewTicker> {
           removed < oldWidget.text.length &&
           widget.text.startsWith(oldWidget.text.substring(removed))) {
         // The retained suffix shifts left when the ring evicts its prefix.
-        // Reuse the previous paragraph's glyph positions to keep the same
-        // content under the viewport before animating towards the new tail.
-        final paragraph = _textKey.currentContext?.findRenderObject();
-        if (paragraph is RenderParagraph && paragraph.hasSize) {
-          final removedWidth =
-              paragraph
-                  .getOffsetForCaret(TextPosition(offset: removed), Rect.zero)
-                  .dx -
-              paragraph
-                  .getOffsetForCaret(const TextPosition(offset: 0), Rect.zero)
-                  .dx;
-          if (removedWidth > 0) _pendingScrollCorrection += removedWidth;
-        }
+        // The old render paragraph can already need layout when inherited
+        // geometry changes. Keep its previous text configuration in a separate
+        // painter so build-time updates never read live render geometry.
+        _previewMetrics.layout();
+        final removedWidth =
+            _previewMetrics
+                .getOffsetForCaret(TextPosition(offset: removed), Rect.zero)
+                .dx -
+            _previewMetrics
+                .getOffsetForCaret(const TextPosition(offset: 0), Rect.zero)
+                .dx;
+        if (removedWidth > 0) _pendingScrollCorrection += removedWidth;
       }
       _scrollToEnd();
     }
   }
 
+  /// Applies pending prefix corrections once the viewport has valid metrics.
   void _scrollToEnd() {
     if (_scrollScheduled) return;
     _scrollScheduled = true;
@@ -1103,14 +1105,28 @@ class _ThinkingPreviewTickerState extends State<_ThinkingPreviewTicker> {
     });
   }
 
+  /// Releases both viewport tracking and the independent glyph measurement.
   @override
   void dispose() {
     _controller.dispose();
+    _previewMetrics.dispose();
     super.dispose();
   }
 
+  /// Keeps measurement configuration identical to the displayed preview text.
   @override
   Widget build(BuildContext context) {
+    final style = ChatActivityRowStyle.textStyle(
+      context,
+    ).copyWith(color: widget.textColor);
+    _previewMetrics
+      ..text = TextSpan(
+        text: widget.text,
+        style: DefaultTextStyle.of(context).style.merge(style),
+      )
+      ..textDirection = Directionality.of(context)
+      ..textScaler = MediaQuery.textScalerOf(context)
+      ..locale = Localizations.maybeLocaleOf(context);
     return ShaderMask(
       shaderCallback: (Rect bounds) {
         return LinearGradient(
@@ -1133,15 +1149,7 @@ class _ThinkingPreviewTickerState extends State<_ThinkingPreviewTicker> {
           child: Row(
             mainAxisSize: MainAxisSize.min,
             children: <Widget>[
-              Text(
-                widget.text,
-                key: _textKey,
-                maxLines: 1,
-                softWrap: false,
-                style: ChatActivityRowStyle.textStyle(
-                  context,
-                ).copyWith(color: widget.textColor),
-              ),
+              Text(widget.text, maxLines: 1, softWrap: false, style: style),
               if (widget.isStreaming) ...<Widget>[
                 const SizedBox(width: 4),
                 const StreamingCursor(),

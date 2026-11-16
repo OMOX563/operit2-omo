@@ -40,6 +40,9 @@ pub(crate) fn ownerSystemOperation<T: serde::de::DeserializeOwned>(
         Duration::from_secs(120),
     )
     .map_err(HostError::new)?;
+    if operation == "ui_automation" {
+        return operit_host_api::UiAutomation::decode_ui_json(response.resultJson.as_bytes());
+    }
     serde_json::from_str(&response.resultJson)
         .map_err(|error| HostError::new(format!("{operation} response decode failed: {error}")))
 }
@@ -179,13 +182,13 @@ pub(crate) fn ownerScreenshot() -> HostResult<String> {
 
 /// Recognizes text through the owner OCR boundary.
 pub(crate) fn ownerRecognizeText(
-    imagePath: &str,
+    source: &dyn operit_host_api::FileSource,
     language: OCRLanguage,
     quality: OCRQuality,
 ) -> HostResult<String> {
     requestOwnerSystemRecognizeText(
         RuntimeHostInteractionSystemRecognizeTextPayload {
-            imagePath: imagePath.to_string(),
+            imagePath: source.nativePath()?,
             language: language.asHostValue().to_string(),
             quality: quality.asHostValue().to_string(),
         },
@@ -256,7 +259,7 @@ pub(crate) struct FlutterSystemBindings {
     pub location: Arc<dyn Fn(i32, bool, bool) -> HostResult<LocationData> + Send + Sync>,
     pub deviceInfo: Arc<dyn Fn() -> HostResult<DeviceInfoData> + Send + Sync>,
     pub screenshot: Arc<dyn Fn() -> HostResult<String> + Send + Sync>,
-    pub recognition: Arc<dyn Fn(&str, OCRLanguage, OCRQuality) -> HostResult<String> + Send + Sync>,
+    pub recognition: Arc<dyn Fn(&dyn operit_host_api::FileSource, OCRLanguage, OCRQuality) -> HostResult<String> + Send + Sync>,
 }
 
 /// Adds owner authorization and UI operations to an already selected system host.
@@ -273,6 +276,16 @@ impl FlutterSystemOperationBridge {
 }
 
 impl SystemOperationHost for FlutterSystemOperationBridge {
+    /// Preserves installed-package access instead of replacing it with the desktop default.
+    fn applicationUpdateBase(&self) -> HostResult<operit_host_api::ApplicationUpdateBase> {
+        self.host.applicationUpdateBase()
+    }
+    /// Preserves the selected host's application installation identity.
+    fn applicationUpdateTarget(
+        &self,
+    ) -> HostResult<Option<operit_host_api::ApplicationUpdateTarget>> {
+        self.host.applicationUpdateTarget()
+    }
     /// Reads the selected host's language.
     fn getSystemLanguageCode(&self) -> HostResult<String> {
         self.host.getSystemLanguageCode()
@@ -294,9 +307,9 @@ impl SystemOperationHost for FlutterSystemOperationBridge {
     fn getSystemSetting(&self, namespace: &str, setting: &str) -> HostResult<SystemSettingData> {
         self.host.getSystemSetting(namespace, setting)
     }
-    /// Installs an app through the selected system host.
-    fn installApp(&self, path: &str) -> HostResult<AppOperationData> {
-        self.host.installApp(path)
+    /// Forwards the file reference and execution timing without resolving native paths.
+    fn installApp(&self, source: &dyn operit_host_api::FileSource, timing: operit_host_api::AppInstallTiming) -> HostResult<AppOperationData> {
+        self.host.installApp(source, timing)
     }
     /// Uninstalls an app through the selected system host.
     fn uninstallApp(&self, name: &str) -> HostResult<AppOperationData> {
@@ -309,6 +322,13 @@ impl SystemOperationHost for FlutterSystemOperationBridge {
     /// Starts an app through the selected system host.
     fn startApp(&self, name: &str) -> HostResult<AppOperationData> {
         self.host.startApp(name)
+    }
+    fn startAppWithActivity(
+        &self,
+        name: &str,
+        activity: Option<&str>,
+    ) -> HostResult<AppOperationData> {
+        self.host.startAppWithActivity(name, activity)
     }
     /// Stops an app through the selected system host.
     fn stopApp(&self, name: &str) -> HostResult<AppOperationData> {
@@ -342,13 +362,22 @@ impl SystemOperationHost for FlutterSystemOperationBridge {
         (self.bindings.deviceInfo)()
     }
     /// Captures a screen through the callback selected at host assembly.
+    /// Writes image bytes through the selected VFS capability and removes native staging.
+    fn captureScreenshotTo(&self, target: &dyn operit_host_api::FileTarget) -> HostResult<()> {
+        let path = self.captureScreenshot()?;
+        let bytes = std::fs::read(&path).map_err(|error| operit_host_api::HostError::new(error.to_string()))?;
+        let written = target.writeBytes(&bytes);
+        std::fs::remove_file(&path).map_err(|error| operit_host_api::HostError::new(error.to_string()))?;
+        written
+    }
+
     fn captureScreenshot(&self) -> HostResult<String> {
         (self.bindings.screenshot)()
     }
     /// Recognizes text through the owner's OCR implementation.
     fn recognizeText(
         &self,
-        path: &str,
+        path: &dyn operit_host_api::FileSource,
         language: OCRLanguage,
         quality: OCRQuality,
     ) -> HostResult<String> {
@@ -539,6 +568,14 @@ impl TtsPlaybackHost for FlutterTtsPlaybackHost {
 pub(crate) struct FlutterTtsSynthesisHost;
 
 impl TtsSynthesisHost for FlutterTtsSynthesisHost {
+    /// Exports synthesized audio while keeping temporary native files inside the host.
+    fn synthesizeSpeechBytes(&self, request: TtsSynthesisRequest) -> HostResult<Vec<u8>> {
+        let result = self.synthesizeSpeech(request)?;
+        let bytes = std::fs::read(&result.audioPath).map_err(|error| operit_host_api::HostError::new(error.to_string()))?;
+        std::fs::remove_file(&result.audioPath).map_err(|error| operit_host_api::HostError::new(error.to_string()))?;
+        Ok(bytes)
+    }
+
     /// Forwards the exact synthesis request to the authorized owner.
     fn synthesizeSpeech(&self, request: TtsSynthesisRequest) -> HostResult<TtsSynthesisResponse> {
         let result = requestOwnerTtsSynthesis(
@@ -624,6 +661,10 @@ impl RuntimeSessionPublishingTerminalHost {
 }
 
 impl operit_host_api::TerminalHost for RuntimeSessionPublishingTerminalHost {
+    fn resolveNativeWorkingDirectory(&self, path: &str) -> operit_host_api::HostResult<String> {
+        self.inner.resolveNativeWorkingDirectory(path)
+    }
+
     /// Preserves the wrapped terminal's ownership of its working-directory namespace.
     fn resolveWorkingDirectory(
         &self,
@@ -734,6 +775,41 @@ impl operit_host_api::TerminalHost for RuntimeSessionPublishingTerminalHost {
         timeoutMs: u64,
     ) -> operit_host_api::HostResult<operit_host_api::TerminalCommandOutput> {
         self.inner.executeInSession(sessionId, command, timeoutMs)
+    }
+
+    /// Preserves raw streaming when terminal access passes through the Flutter owner wrapper.
+    fn executeInSessionStreaming(
+        &self,
+        sessionId: &str,
+        command: &str,
+        timeoutMs: u64,
+        onOutput: &mut dyn FnMut(&[u8]) -> HostResult<()>,
+    ) -> HostResult<operit_host_api::TerminalCommandOutput> {
+        self.inner.executeInSessionStreaming(sessionId, command, timeoutMs, onOutput)
+    }
+
+    /// Retains the concrete Host's scheduling model and publishes command lifecycle changes.
+    fn scheduleInSessionStreaming(
+        self: Arc<Self>,
+        scheduler: Arc<dyn operit_host_api::HostRuntimeTaskSchedulerHost>,
+        sessionId: String,
+        command: String,
+        timeoutMs: u64,
+        mut onOutput: operit_host_api::TerminalOutputCallback,
+        onComplete: operit_host_api::TerminalCompletionCallback,
+    ) -> HostResult<()> {
+        let publisher = self.clone();
+        let mut started = false;
+        self.inner.clone().scheduleInSessionStreaming(
+            scheduler, sessionId, command, timeoutMs,
+            Box::new(move |bytes, finalFrame| {
+                if !started { publisher.publish_sessions()?; started = true; }
+                onOutput(bytes, finalFrame)
+            }),
+            Box::new(move |result| {
+                onComplete(result.and_then(|receipt| { self.publish_sessions()?; Ok(receipt) }));
+            }),
+        )
     }
 
     /// Executes a hidden command through the wrapped host.

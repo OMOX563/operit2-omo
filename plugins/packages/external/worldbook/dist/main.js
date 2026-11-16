@@ -182,13 +182,10 @@ async function readPreparation(event, consume) {
         throw error;
     }
 }
+/** Renders entry variables before adding injection wrappers. */
 function renderEntries(entries, variableContext) {
-    if (!variableContext) {
-        return entries;
-    }
-    return entries.map((entry) => ({
-        ...entry,
-        content: (0, worldbook_variables_js_1.renderWorldBookContent)(String(entry.content || ""), variableContext)
+    return entries.map(entry => ({ ...entry,
+        content: (0, worldbook_variables_js_1.renderWorldBookContent)(entry.content, variableContext),
     }));
 }
 async function resolveVariableContext(chatId, callerCardId, allEntries) {
@@ -323,6 +320,7 @@ async function finalizeHook(event) {
 async function onServiceInitialize(_event) {
     await (0, worldbook_storage_js_1.initializeWorldBookStorage)();
 }
+/** Registers lifecycle, management UI, and matching send and estimate prompt handlers. */
 function registerToolPkg() {
     ToolPkg.registerAppLifecycleHook({
         id: "service-initialize",
@@ -357,6 +355,10 @@ function registerToolPkg() {
     });
     ToolPkg.registerPromptFinalizeHook({
         id: "worldbook_keyword_inject",
+        function: finalizeHook
+    });
+    ToolPkg.registerPromptEstimateFinalizeHook({
+        id: "worldbook_keyword_estimate",
         function: finalizeHook
     });
     return true;

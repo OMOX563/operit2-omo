@@ -68,6 +68,34 @@ the top-level runtime injects an SDK `JsExecutionProvider`.
 
 See `core/CRATE_BOUNDARIES.md` for the full dependency direction.
 
+## Concurrent Invocations
+
+All registered executors are `Send + Sync` services invoked through `&self`.
+The registry retains an `Arc` for each invocation and releases its own lock
+before validation, admission or execution. Calls with the same tool name can
+overlap, including nested package and CLI calls waiting on other chats.
+Arguments, captured caller context and results belong to each invocation.
+Resource services own synchronization for a specific terminal session, database
+handle or other mutable resource; the registry does not serialize entire tools.
+Replacing or removing a registration affects new calls while existing calls
+retain their original service. Built-in registration initializes once across
+concurrent callers. AI tool batches remain serial and preserve result order;
+scripts may dispatch multiple calls with `Promise.all`.
+
+## MCP Transport Lifecycle
+
+Remote MCP uses the HTTP Host for both POST responses and server event streams.
+Streamable HTTP opens its GET event channel after initialization; HTTP 405
+explicitly declares that the server does not provide this optional channel.
+An accepted HTTP 202 request waits for its matching JSON-RPC result on the
+existing channel under the original deadline. It never resends the tool POST.
+The POST stream is released after acknowledgment, and the GET stream belongs
+to the MCP session until that session closes.
+
+Local and remote tool discovery follow `nextCursor` through every page before
+marking a server ready. Repeated cursors, malformed pages and later-page errors
+fail initialization instead of publishing an incomplete tool catalog.
+
 ## Finalized AI Tool Results
 
 `ToolExecutionManager` retains serial invocation ordering and aggregates each

@@ -25,7 +25,8 @@ pub fn spaceCallError(message: String) -> CoreLinkError {
     let code = message.split(':').next().unwrap_or("");
     if matches!(code, "SPACE_MESSAGE_LIMIT" | "SPACE_PROTOCOL_INCOMPATIBLE"
         | "SPACE_EXPORT_CHANGED" | "SPACE_EXPORT_CURSOR_INVALID"
-        | "SPACE_EXPORT_MIGRATION_REQUIRED" | "SPACE_EXPORT_INVALID") {
+        | "SPACE_EXPORT_MIGRATION_REQUIRED" | "SPACE_EXPORT_INVALID"
+        | "PEER_PROTOCOL_MISMATCH" | "PEER_PROTOCOL_UPGRADE_REQUIRED") {
         CoreLinkError::new(code.to_owned(), message)
     } else { CoreLinkError::internal(message) }
 }
@@ -357,6 +358,7 @@ pub trait NodeSpaceContext: Send + Sync {
 }
 
 /// Shared Space protocol dispatch. Each receiver checks its authenticated direct peer first.
+#[inline(never)]
 pub(crate) fn dispatchPeerSpaceCall(
     service: &dyn NodeSpaceContext, peer: &str, request: CoreCallRequest,
 ) -> Result<CoreValue, String> {
@@ -389,6 +391,7 @@ pub(crate) fn peerSpaceSnapshot(service: &dyn NodeSpaceContext) -> Result<PeerSp
     let space = service.spaceStore().initialize()?;
     peerSpaceSnapshotFor(service, space)
 }
+#[inline(never)]
 pub(crate) fn peerSpaceSnapshotFor(service: &dyn NodeSpaceContext, space: CoreSpace) -> Result<PeerSpaceSnapshot, String> {
     // Presentation history is local to the store. A Space snapshot carries only
     // the members of this projection, not devices retained from earlier Spaces.
@@ -406,6 +409,7 @@ pub(crate) fn peerSpaceSnapshotFor(service: &dyn NodeSpaceContext, space: CoreSp
 }
 
 /// Only direct former neighbors receive this node's pending exit receipts.
+#[inline(never)]
 pub(crate) fn peerSpaceSnapshotForPeer(service: &dyn NodeSpaceContext, peer: &str) -> Result<PeerSpaceSnapshot, String> {
     space_projection::requireLegacySnapshotFits(service, peer)?;
     let mut snapshot = peerSpaceSnapshot(service)?;
@@ -413,6 +417,7 @@ pub(crate) fn peerSpaceSnapshotForPeer(service: &dyn NodeSpaceContext, peer: &st
     Ok(snapshot)
 }
 
+#[inline(never)]
 pub(crate) fn observePeerSpaceSnapshot(service: &dyn NodeSpaceContext, peerNodeId: &str, snapshot: PeerSpaceSnapshot) -> Result<CoreSpace, String> {
         CoreSpaceStore::validateSpaceProfiles(&snapshot.space, &snapshot.deviceProfiles)?;
         if !snapshot.space.members.iter().any(|node| node == peerNodeId) {
@@ -426,7 +431,7 @@ pub(crate) fn observePeerSpaceSnapshot(service: &dyn NodeSpaceContext, peerNodeI
         if crossing {
             let localOperations = service.networkControlStore().currentSpaceOperations()?;
             let localAdmittedSource = localOperations.iter().map(|operation| {
-                serde_json::from_value::<operit_store::NetworkControlStore::NetworkControlCommandRecord>(operation.payload.clone())
+                operit_store::NetworkControlStore::NetworkControlCommandRecord::deserialize(&operation.payload)
                     .map_err(|error| error.to_string())
             }).collect::<Result<Vec<_>, _>>()?.iter().any(|record| {
                 record.spaceId == local.spaceId && matches!(&record.command,
@@ -517,15 +522,20 @@ impl NodeSpaceService {
     }
     /// Initialize the same membership and creator policy, but keep this endpoint
     /// projection node-local rather than registering a business data replica.
-    pub fn initialize(&self, profile: CoreSpaceDeviceProfile) -> Result<(), String> {
+    pub fn initialize(&self, mut profile: CoreSpaceDeviceProfile) -> Result<(), String> {
         if profile.nodeId != self.localNodeId { return Err("Local profile identity mismatch".into()); }
+        profile.protocolVersion = Some(crate::PeerProtocol::VERSION);
         self.space.initialize()?;
         self.control.migrateNodeLocalProjection(self.storage.as_ref())?;
         self.space.pruneNodeLocalProjection()?;
         self.control.pruneNodeLocalProjection()?;
         let existing = self.space.deviceProfiles()?.remove(&self.localNodeId);
+        if let Some(old) = &existing {
+            profile.updatedAt = profile.updatedAt.max(old.updatedAt.saturating_add(1));
+        }
         if !existing.is_some_and(|old| old.displayName == profile.displayName && old.userName == profile.userName
-            && old.platform == profile.platform && old.model == profile.model && old.coreVersion == profile.coreVersion) {
+            && old.platform == profile.platform && old.model == profile.model && old.coreVersion == profile.coreVersion
+            && old.protocolVersion == profile.protocolVersion) {
             self.space.importDeviceProfiles(vec![profile])?;
         }
         self.control.initializeCurrentSpace()?;
@@ -621,7 +631,14 @@ impl NodeSpaceService {
         if self.space.space()?.members.len() == 1 && !space_join::hasInbound(self)? { return Ok(Vec::new()); }
         space_join::incoming(self).await
     }
-    pub async fn decideDeviceSpaceJoin(&self, id: String, version: u64, approve: bool) -> Result<SpaceJoinRequest, String> { space_join::decide(self, id, version, approve).await }
+    // Keep the decision future behind a polling boundary. Embeddings await it
+    // from small Host tasks; fusing the full approval workflow into their poll
+    // frames can exhaust a fixed device stack before storage decoding begins.
+    #[inline(never)]
+    pub fn decideDeviceSpaceJoin(&self, id: String, version: u64, approve: bool)
+        -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<SpaceJoinRequest, String>> + '_>> {
+        Box::pin(space_join::decide(self, id, version, approve))
+    }
     /// Local outgoing approvals, shared by the Core facade and bounded Edge UI.
     pub fn outgoingDeviceSpaceJoins(&self) -> Result<Vec<SpaceJoinRequest>, String> { space_join::outgoing(self) }
     pub async fn refreshDeviceSpaceJoin(&self, id: String) -> Result<SpaceJoinRequest, String> { space_join::refresh(self, id).await }
@@ -651,7 +668,7 @@ impl NodeSpaceService {
         departures
     }
     pub fn spaceChannelScope(&self, peer: &str) -> Result<Option<String>, CoreLinkError> {
-        crate::space_policy::spaceChannelScope(&self.space, &self.control, &self.localNodeId, peer)
+        crate::space_policy::spaceChannelScope(&self.control, &self.localNodeId, peer)
     }
 }
 #[async_trait::async_trait(?Send)]
