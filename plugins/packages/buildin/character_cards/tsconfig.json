@@ -10,7 +10,8 @@
     "strict": true,
     "noImplicitReturns": true,
     "skipLibCheck": true,
-    "noEmit": true
+    "noEmit": true,
+    "rootDir": "src"
   },
   "include": [
     "src/**/*.ts",

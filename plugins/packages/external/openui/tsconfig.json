@@ -11,7 +11,8 @@
     "noEmit": true,
     "skipLibCheck": true,
     "esModuleInterop": true,
-    "types": []
+    "types": [],
+    "rootDir": "src"
   },
   "include": [
     "src/**/*.ts",

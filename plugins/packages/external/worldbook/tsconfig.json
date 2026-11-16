@@ -1,19 +1,20 @@
 {
   "compilerOptions": {
     "target": "es2020",
-    "module": "commonjs",
+    "module": "node16",
     "outDir": "./dist",
-    "lib": ["es2020"],
+    "lib": [
+      "es2020"
+    ],
     "declaration": false,
     "strict": false,
     "noImplicitAny": false,
     "strictNullChecks": true,
     "noImplicitThis": true,
-    "alwaysStrict": false,
     "noUnusedLocals": false,
     "noUnusedParameters": false,
     "noImplicitReturns": true,
-    "moduleResolution": "node",
+    "moduleResolution": "node16",
     "rootDir": "./src",
     "allowSyntheticDefaultImports": true,
     "esModuleInterop": true,
