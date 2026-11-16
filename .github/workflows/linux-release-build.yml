@@ -82,6 +82,16 @@ jobs:
           toolchain: ${{ env.RUST_TOOLCHAIN_VERSION }}
           targets: x86_64-unknown-linux-musl,aarch64-unknown-linux-gnu
 
+      # Fork 补丁：sync 脚本调 corepack pnpm，而 pack:toolpkg 内部又调裸 pnpm，
+      # 缺 shim 会报 pnpm: not found。
+      - name: Enable corepack pnpm shim
+        run: |
+          corepack enable pnpm
+          pnpm --version
+
+      - name: Bundle models.dev catalog
+        run: python3 tools/build_scripts/models_dev_bundle.py
+
       - name: Check build environment
         run: python3 tools/build_scripts/check_build_environment.py --products "${{ inputs.products }}" --cli-arches "${{ inputs.cli_arches }}" --github-runner
 

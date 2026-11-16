@@ -93,6 +93,12 @@ jobs:
       # 2) build_flutter_windows.py 不调 generate_dart_proxy_artifacts()
       #    （android/ios/macos 脚本都调），.g.dart 是 gitignored 生成物 → Dart
       #    编译报 'RuntimeDeviceSpaceDevice' isn't a type。cargo check 会生成它们。
+      # 3) core/crates/runtime/application/build.rs 要求预置 models.dev catalog，
+      #    上游只在 deploy-web-experience.yml 生成，release 构建没跑 → panic。
+      - name: Bundle models.dev catalog
+        shell: pwsh
+        run: python tools/build_scripts/models_dev_bundle.py
+
       - name: Generate Dart proxy artifacts
         shell: pwsh
         run: |
