@@ -64,7 +64,7 @@ jobs:
           # GitHub runners. Zig bundles musl libc + libc++ for
           # x86_64-linux-musl, so expose it under the names cc/cmake probe.
           python3 -m pip install --user --break-system-packages ziglang
-          ZIG="$HOME/.local/bin/zig"
+          ZIG="$(python3 -c 'import ziglang, os; print(os.path.join(os.path.dirname(ziglang.__file__), "zig"))')"
           "$ZIG" version
           sudo tee /usr/bin/musl-gcc >/dev/null <<WRAPPER
           #!/bin/sh
