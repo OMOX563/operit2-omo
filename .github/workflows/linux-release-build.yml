@@ -57,6 +57,18 @@ jobs:
             ninja-build \
             pkg-config
 
+      - name: Provide musl-g++ wrapper for native C++ builds
+        run: |
+          # musl-tools ships only the C driver; the local-inference CMake build
+          # needs a C++ driver next to it, otherwise cc/cmake resolves
+          # /usr/bin/musl-g++ and fails with "ToolNotFound".
+          sudo tee /usr/bin/musl-g++ >/dev/null <<'WRAPPER'
+          #!/bin/sh
+          exec g++ -specs /usr/lib/x86_64-linux-musl/musl-gcc.specs "$@"
+          WRAPPER
+          sudo chmod +x /usr/bin/musl-g++
+          musl-g++ --version | head -n 1
+
       - name: Install bootstrap Dart
         uses: dart-lang/setup-dart@v1
         with:
