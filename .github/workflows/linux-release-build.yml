@@ -77,9 +77,7 @@ jobs:
             esac
             args+=("$arg")
           done
-          # rustc links its own musl crt objects; letting zig add musl's crt1.o
-          # duplicates _start/_start_c.
-          exec "@ZIG@" @MODE@ -target x86_64-linux-musl -nostartfiles "${args[@]}"
+          exec "@ZIG@" @MODE@ -target x86_64-linux-musl "${args[@]}"
           WRAPPER
           sed -e "s|@ZIG@|$ZIG|" -e "s|@MODE@|cc|" /tmp/musl-cxx-wrapper > /tmp/musl-gcc
           sed -e "s|@ZIG@|$ZIG|" -e "s|@MODE@|c++|" /tmp/musl-cxx-wrapper > /tmp/musl-g++

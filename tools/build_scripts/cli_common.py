@@ -287,6 +287,11 @@ def linux_cross_target_env(target: CliBuildTarget) -> dict[str, str]:
         linker = require_command("musl-gcc")
         build_env["CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER"] = linker
         build_env["CC_x86_64_unknown_linux_musl"] = linker
+        # rustc's bundled musl crt and the toolchain's crt both define _start;
+        # let the linker supply crt objects so they do not collide.
+        build_env["CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS"] = (
+            "-C link-self-contained=no"
+        )
         return build_env
     if target.rust_target == "aarch64-unknown-linux-gnu":
         linker = require_command("aarch64-linux-gnu-gcc")
