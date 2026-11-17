@@ -84,6 +84,13 @@ jobs:
 
       # Fork 补丁：sync 脚本调 corepack pnpm，而 pack:toolpkg 内部又调裸 pnpm，
       # 缺 shim 会报 pnpm: not found。
+      # Fork 补丁：插件同步脚本优先用 .ci-tools/typescript，缺失时回退 runner 自带
+      # 的 tsc（TypeScript 6），旧 tsconfig 写法会被判非法。与 Windows 对齐到 5.9.3。
+      - name: Install repository-managed TypeScript compiler
+        run: |
+          npm install --prefix .ci-tools/typescript --no-audit --no-fund typescript@5.9.3
+          .ci-tools/typescript/node_modules/.bin/tsc --version
+
       - name: Enable corepack pnpm shim
         run: |
           corepack enable pnpm
