@@ -77,15 +77,17 @@ jobs:
             esac
             args+=("$arg")
           done
-          exec "@ZIG@" @MODE@ -target x86_64-linux-musl "${args[@]}"
+          # rustc links its own musl crt objects; letting zig add musl's crt1.o
+          # duplicates _start/_start_c.
+          exec "@ZIG@" @MODE@ -target x86_64-linux-musl -nostartfiles "${args[@]}"
           WRAPPER
           sed -e "s|@ZIG@|$ZIG|" -e "s|@MODE@|cc|" /tmp/musl-cxx-wrapper > /tmp/musl-gcc
           sed -e "s|@ZIG@|$ZIG|" -e "s|@MODE@|c++|" /tmp/musl-cxx-wrapper > /tmp/musl-g++
           sudo install -m 755 /tmp/musl-gcc /usr/bin/musl-gcc
           sudo install -m 755 /tmp/musl-g++ /usr/bin/musl-g++
           printf '#include <vector>\n#include <string>\nint main(){std::vector<std::string> v; v.push_back(std::string()); return v.size()==1?0:1;}\n' > /tmp/musl_cxx_probe.cpp
-          musl-g++ -O2 /tmp/musl_cxx_probe.cpp -o /tmp/musl_cxx_probe
-          /tmp/musl_cxx_probe
+          musl-g++ -O2 -c /tmp/musl_cxx_probe.cpp -o /tmp/musl_cxx_probe.o
+          ls -l /tmp/musl_cxx_probe.o
 
       - name: Install bootstrap Dart
         uses: dart-lang/setup-dart@v1
