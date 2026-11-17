@@ -75,11 +75,14 @@ jobs:
             case "$arg" in
               --target=*) continue ;;
             esac
+            # zig always links its own musl crt1.o; rustc's bundled rcrt1.o would
+            # define _start/_start_c twice, so drop the Rust-provided copy.
+            case "$(basename "$arg")" in
+              rcrt1.o|crt1.o) continue ;;
+            esac
             args+=("$arg")
           done
-          # zig always adds its own musl crt1.o while rustc ships rcrt1.o; both
-          # define _start/_start_c, so let the linker keep the first one.
-          exec "@ZIG@" @MODE@ -target x86_64-linux-musl -Wl,--allow-multiple-definition "${args[@]}"
+          exec "@ZIG@" @MODE@ -target x86_64-linux-musl "${args[@]}"
           WRAPPER
           sed -e "s|@ZIG@|$ZIG|" -e "s|@MODE@|cc|" /tmp/musl-cxx-wrapper > /tmp/musl-gcc
           sed -e "s|@ZIG@|$ZIG|" -e "s|@MODE@|c++|" /tmp/musl-cxx-wrapper > /tmp/musl-g++
