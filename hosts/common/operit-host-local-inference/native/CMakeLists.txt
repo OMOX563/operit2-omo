@@ -22,11 +22,6 @@ foreach(library IN LISTS CMAKE_CXX_IMPLICIT_LINK_LIBRARIES)
         string(APPEND operit_cxx_runtime "${library}\n")
     endif()
 endforeach()
-# Toolchains such as zig's C++ driver report no implicit link libraries while
-# still linking libc++; report it explicitly so Rust links the runtime too.
-if(operit_cxx_runtime STREQUAL "")
-    set(operit_cxx_runtime "c++\n")
-endif()
 file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/operit_cxx_runtime.txt" "${operit_cxx_runtime}")
 include(FetchContent)
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
