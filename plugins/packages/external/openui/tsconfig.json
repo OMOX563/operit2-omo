@@ -12,7 +12,7 @@
     "skipLibCheck": true,
     "esModuleInterop": true,
     "types": [],
-    "rootDir": "src"
+    "rootDir": "."
   },
   "include": [
     "src/**/*.ts",

@@ -11,7 +11,7 @@
     "strict": true,
     "noEmit": true,
     "skipLibCheck": true,
-    "rootDir": "src"
+    "rootDir": "."
   },
   "include": [
     "**/*.ts",

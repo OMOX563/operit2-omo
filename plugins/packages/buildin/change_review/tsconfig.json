@@ -10,7 +10,7 @@
       "ES2020"
     ],
     "noEmit": true,
-    "rootDir": "src"
+    "rootDir": "."
   },
   "include": [
     "src/**/*.ts",
