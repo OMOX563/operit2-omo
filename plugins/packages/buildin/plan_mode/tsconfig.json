@@ -2,7 +2,7 @@
   "compilerOptions": {
     "target": "es2020",
     "module": "node16",
-    "rootDir": "./src",
+    "rootDir": "src",
     "outDir": "./dist",
     "lib": [
       "es2020"
@@ -27,8 +27,7 @@
     ]
   },
   "include": [
-    "./**/*.ts",
-    "./**/*.d.ts",
+    "src/**/*.ts",
     "../../../types/**/*.d.ts"
   ],
   "exclude": [

@@ -5,11 +5,16 @@
     "moduleResolution": "node16",
     "rootDir": "src",
     "outDir": "dist",
-    "lib": ["es2020"],
+    "lib": [
+      "es2020"
+    ],
     "strict": true,
     "noImplicitReturns": true,
     "skipLibCheck": true,
     "noEmit": true
   },
-  "include": ["src/**/*.ts", "../../../types/**/*.d.ts"]
+  "include": [
+    "src/**/*.ts",
+    "../../../types/**/*.d.ts"
+  ]
 }
