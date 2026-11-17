@@ -12,7 +12,7 @@
     "skipLibCheck": true,
     "noEmit": true,
     "esModuleInterop": true,
-    "rootDir": "."
+    "rootDir": ".."
   },
   "include": [
     "**/*.tsx",
