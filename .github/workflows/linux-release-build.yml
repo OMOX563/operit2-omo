@@ -62,11 +62,20 @@ jobs:
           # musl-tools ships only the C driver; the local-inference CMake build
           # needs a C++ driver next to it, otherwise cc/cmake resolves
           # /usr/bin/musl-g++ and fails with "ToolNotFound".
+          # The musl spec disables the default include chain (-nostdinc), so the
+          # C++ standard headers have to be re-added explicitly.
           sudo tee /usr/bin/musl-g++ >/dev/null <<'WRAPPER'
           #!/bin/sh
-          exec g++ -specs /usr/lib/x86_64-linux-musl/musl-gcc.specs "$@"
+          cxx_version="$(g++ -dumpversion)"
+          exec g++ -specs /usr/lib/x86_64-linux-musl/musl-gcc.specs \
+            -isystem "/usr/include/c++/${cxx_version}" \
+            -isystem "/usr/include/x86_64-linux-gnu/c++/${cxx_version}" \
+            -isystem "/usr/include/c++/${cxx_version}/backward" \
+            "$@"
           WRAPPER
           sudo chmod +x /usr/bin/musl-g++
+          printf '#include <vector>\nint main(){return 0;}\n' > /tmp/musl_cxx_probe.cpp
+          musl-g++ -c /tmp/musl_cxx_probe.cpp -o /tmp/musl_cxx_probe.o
           musl-g++ --version | head -n 1
 
       - name: Install bootstrap Dart
