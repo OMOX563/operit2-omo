@@ -132,6 +132,17 @@ jobs:
           toolchain: ${{ env.RUST_TOOLCHAIN_VERSION }}
           targets: x86_64-unknown-linux-musl,aarch64-unknown-linux-gnu
 
+      # Fork 补丁：character_cards 插件的 USearch WASM（vendor/usearch/build.py）要
+      # Emscripten 才能编，runner 镜像不带 em++，上游 Linux 工作流也没装 → 插件同步
+      # 阶段直接 FileNotFoundError。装到 .ci-tools/emsdk，build.py 会自动探测该路径。
+      - name: Install Emscripten SDK
+        run: |
+          git clone --depth 1 https://github.com/emscripten-core/emsdk.git .ci-tools/emsdk
+          .ci-tools/emsdk/emsdk install latest
+          .ci-tools/emsdk/emsdk activate latest
+          echo "EMXX=$(pwd)/.ci-tools/emsdk/upstream/emscripten/em++" >> "$GITHUB_ENV"
+          "$(pwd)/.ci-tools/emsdk/upstream/emscripten/em++" --version
+
       # Fork 补丁：sync 脚本调 corepack pnpm，而 pack:toolpkg 内部又调裸 pnpm，
       # 缺 shim 会报 pnpm: not found。
       # Fork 补丁：插件同步脚本优先用 .ci-tools/typescript，缺失时回退 runner 自带
