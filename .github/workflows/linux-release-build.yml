@@ -144,8 +144,10 @@ jobs:
       - name: Install Emscripten SDK
         run: |
           git clone --depth 1 https://github.com/emscripten-core/emsdk.git .ci-tools/emsdk
-          .ci-tools/emsdk/emsdk install latest
-          .ci-tools/emsdk/emsdk activate latest
+          # 固定 4.0.14：仓库文档（edge/boards/esp32/editor/README.md）标定的版本。
+          # latest（emcc 7.x）编 USearch 的 lib.cpp 会直接失败。
+          .ci-tools/emsdk/emsdk install 4.0.14
+          .ci-tools/emsdk/emsdk activate 4.0.14
           echo "EMXX=$(pwd)/.ci-tools/emsdk/upstream/emscripten/em++" >> "$GITHUB_ENV"
           "$(pwd)/.ci-tools/emsdk/upstream/emscripten/em++" --version
 
