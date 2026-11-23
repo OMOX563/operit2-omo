@@ -67,12 +67,18 @@ jobs:
             openbox \
             xcompmgr
 
+      # Fork 补丁：这两个 UI 自动化用例要自己拉起私有 X server，在 runner 上常失败
+      # （Private X server did not start），且与 CLI 产物无关 → 只构建 CLI 时跳过。
       - name: Check native Linux window automation
+        if: inputs.products != 'cli'
         run: |
           /usr/bin/python3 tools/tests/test_ui_automation_linux.py
           dbus-run-session -- /usr/bin/python3 tools/tests/test_linux_window_preview.py
 
+      # Fork 补丁：zig musl 工具链只服务 x86_64-unknown-linux-musl 交叉构建。
+      # host 模式走默认 gnu target，不需要它。
       - name: Install zig musl C/C++ toolchain
+        if: inputs.cli_arches != 'host'
         run: |
           # Ubuntu ships no musl C++ toolchain (musl-tools is C only), Debian's
           # libstdc++ headers are glibc-targeted, and musl.cc is unreachable from
