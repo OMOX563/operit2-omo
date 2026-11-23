@@ -18,7 +18,7 @@ function __operitCreateV1SoftwareSettings(current, packageName) {
 }
 
 /**
- * Adapts historical one-shot system speech to the canonical playback request.
+ * Adapts historical one-shot speech to the configured host playback request.
  * @param {(request: import('../../../../../../../plugins/types/tts').Tts.SpeakRequest) => Promise<import('../../../../../../../plugins/types/results').TtsSpeakResultData>} speak
  * @returns {typeof import('../../../../../../../plugins/types-v1/software_settings').SoftwareSettings.testTtsPlayback}
  */
@@ -57,11 +57,8 @@ function __operitCreateV1TtsPlayback(speak) {
             }
         }
         var result = await speak(request);
-        if (result.providerType !== 'SYSTEM_TTS') {
-            throw new Error('Unsupported v1 system speech provider: ' + result.providerType);
-        }
         return {
-            ttsServiceType: 'SIMPLE_TTS',
+            ttsServiceType: result.providerType === 'SYSTEM_TTS' ? 'SIMPLE_TTS' : result.providerType,
             providerClass: 'TtsPlaybackHost',
             initialized: true,
             playbackTriggered: result.started,
@@ -332,13 +329,10 @@ function installV1Adapters(runtime) {
         Tools.Chat[chatMethod] = chatBuilder.build('Tools.Chat.' + chatMethod);
     }
     var legacyMemory = __operitCreateV1Memory(
-        /** Sends one package tool request with the active authenticated caller fields. */
+        /** Sends business arguments while the native invocation retains the authenticated caller. */
         function(name, params) {
             var state = runtime.__operitGetCallState(api.currentCallId());
             if (state.params.__operit_package_caller_participant_id !== undefined) legacyCallerCardId();
-            for (var key of ['__operit_package_caller_name', '__operit_package_chat_id', '__operit_package_caller_participant_id', '__operit_package_caller_owner']) {
-                if (state.params[key] !== undefined) params[key] = state.params[key];
-            }
             return runtime.toolCall('character_memory:' + name, params).then(
                 /**
                  * Decodes the package executor's serialized JSON result.

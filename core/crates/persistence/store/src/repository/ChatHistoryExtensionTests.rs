@@ -39,6 +39,33 @@ fn chatTarget() -> PluginExtensionTarget {
     }
 }
 
+/// Copies committed WAL contents and restores every database table through the same shared store.
+#[test]
+fn database_file_copy_preserves_all_tables_and_live_readers() {
+    let _guard = DATABASE_MUTEX.lock().unwrap();
+    let (manager, database) = fixture("daily-database-backup");
+    database.store().executeBatch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; CREATE TABLE backup_private_data(value TEXT); INSERT INTO backup_private_data VALUES('before');").unwrap();
+    manager.updateChatTitle("extensions-chat".into(), "Committed in WAL".into()).unwrap();
+    let host = crate::RuntimeStorageHost::defaultRuntimeStorageHost();
+    let key = crate::RuntimeStorageHost::runtimeStoragePath(database.store().path());
+    let bytes = database.store().withDatabaseFile(|| Ok(host.readBytes(&key)?)).unwrap();
+    assert!(bytes.starts_with(b"SQLite format 3\0"));
+    let lease = database.store().beginChatExecution("extensions-chat").unwrap();
+    assert!(database.restoreDatabaseFile(|| Ok(())).is_err());
+    lease.release().unwrap();
+    manager.updateChatTitle("extensions-chat".into(), "After backup".into()).unwrap();
+    database.store().executeBatch("UPDATE backup_private_data SET value='after'").unwrap();
+    database.restoreDatabaseFile(|| Ok(host.writeBytes(&key, &bytes)?)).unwrap();
+    assert_eq!(database.store().queryScalar::<String>("SELECT title FROM chats", vec![]).unwrap(), "Committed in WAL");
+    assert_eq!(database.store().queryScalar::<String>("SELECT value FROM backup_private_data", vec![]).unwrap(), "before");
+    assert_eq!(database.store().queryScalar::<i64>("SELECT count(*) FROM message_variants", vec![]).unwrap(), 3);
+    let variant = database.messageVariantDao().getVariantForMessage("extensions-chat", 42, 3).unwrap().unwrap();
+    assert_eq!(variant.pluginExtensions["actor"], json!({"revision": 3}));
+    assert_eq!(database.store().queryScalar::<i64>("PRAGMA foreign_keys", vec![]).unwrap(), 1);
+    assert!(database.store().withDatabaseFile::<()>(|| Err(crate::SqliteStore::SqliteStoreError::Message("copy failed".into()))).is_err());
+    assert_eq!(database.store().queryScalar::<String>("SELECT value FROM backup_private_data", vec![]).unwrap(), "before");
+}
+
 /// Selects an exact persisted message revision without implicit selected-state resolution.
 fn messageTarget(index: i32) -> PluginExtensionTarget {
     PluginExtensionTarget::Message {

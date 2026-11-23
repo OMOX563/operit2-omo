@@ -20,7 +20,7 @@ import '../../../../core/bridge/ProxyCoreRuntimeBridge.dart';
 import '../../../../data/preferences/UserPreferencesManager.dart';
 import '../../../../l10n/generated/app_localizations.dart';
 import '../../../common/contributions/ChatAttachmentResult.dart';
-import '../../../common/contributions/ChatUiContributionModels.dart';
+import '../../../common/contributions/EmbeddedContributionDialog.dart';
 import '../../../common/contributions/ContributionPresentationResult.dart';
 import '../../../common/contributions/ToolPkgChatUiCatalog.dart';
 import '../../../main/navigation/ToolPkgCatalogChangeBus.dart';
@@ -44,7 +44,7 @@ import '../components/style/input/common/PendingQueueMessageItem.dart';
 import '../components/workspace/ChatContextStatsTopBarButton.dart';
 import '../components/workspace/WorkspaceLayoutMetrics.dart';
 import '../components/workspace/WorkspaceTopBarButton.dart';
-import '../speech/LocalSpeechRecorder.dart';
+import '../../../../core/host/LocalSpeechRecorder.dart';
 import '../viewmodel/ChatSelectionTransition.dart';
 import '../viewmodel/ChatViewModel.dart';
 
@@ -262,7 +262,12 @@ class _ChatContentData {
   final bool isLoadingDisplayWindow;
   final bool isMultiSelectMode;
   final Set<int> selectedMessageTimestamps;
-  final ChatUiContext? chatUiContext;
+  final ({
+    core_proxy.ChatDisplayIdentity? identity,
+    ({core_proxy.ToolPkgUiRoute route, Object? input})? avatarAction,
+    String? backgroundUri,
+  })?
+  chatUiContext;
   final bool isPreparingChatSwitch;
   final List<PendingQueueMessageItem> pendingQueueMessages;
   final bool isPendingQueueExpanded;
@@ -326,7 +331,12 @@ class _AIChatSurfaceState extends State<_AIChatSurface> {
   late final MainLayoutAttachmentBuilder _workspaceMainLayoutAttachment =
       _buildWorkspaceMainLayoutAttachment;
   String _currentChatTitle = '';
-  ChatUiContext? _chatUiContext;
+  ({
+    core_proxy.ChatDisplayIdentity? identity,
+    ({core_proxy.ToolPkgUiRoute route, Object? input})? avatarAction,
+    String? backgroundUri,
+  })?
+  _chatUiContext;
   int _chatUiContextGeneration = 0;
   StreamSubscription<void>? _chatUiCatalogSubscription;
   String? _currentChatId;
@@ -374,7 +384,7 @@ class _AIChatSurfaceState extends State<_AIChatSurface> {
     _toastMessageNotifier = ValueNotifier<String?>(_toastMessage);
     _workspaceOpen = _chatWorkspaceOpen;
     if (!widget.embedded) {
-      WorkspaceShell.session.onOpenRequested = _openWorkspaceForDiff;
+      WorkspaceShell.session.onOpenRequested = _openWorkspace;
     }
     _watchChatFlows();
     _watchToastEvent();
@@ -427,6 +437,9 @@ class _AIChatSurfaceState extends State<_AIChatSurface> {
       _topBarController?.clearActions(owner: _topBarActionsOwner);
       _topBarController?.clearTitleContent(owner: _topBarTitleOwner);
       _mainLayoutController?.clearAttachment(owner: _mainLayoutOwner);
+      _mainLayoutController?.clearWorkspaceDockDestination(
+        owner: _mainLayoutOwner,
+      );
     }
   }
 
@@ -456,7 +469,10 @@ class _AIChatSurfaceState extends State<_AIChatSurface> {
     _topBarController?.clearActions(owner: _topBarActionsOwner);
     _topBarController?.clearTitleContent(owner: _topBarTitleOwner);
     _mainLayoutController?.clearAttachment(owner: _mainLayoutOwner);
-    if (WorkspaceShell.session.onOpenRequested == _openWorkspaceForDiff) {
+    _mainLayoutController?.clearWorkspaceDockDestination(
+      owner: _mainLayoutOwner,
+    );
+    if (WorkspaceShell.session.onOpenRequested == _openWorkspace) {
       WorkspaceShell.session.onOpenRequested = null;
     }
     super.dispose();
@@ -1005,12 +1021,18 @@ class _AIChatSurfaceState extends State<_AIChatSurface> {
       return;
     }
     _pendingQueueEnqueueInFlight = true;
+    final submittedAttachments = _attachments;
     try {
       await _viewModel.enqueuePendingQueueMessage(
         chatId: chatId,
         messageText: draftText,
+        attachments: submittedAttachments,
       );
       _clearSubmittedDraft(chatId, draftText);
+      if (!mounted || _currentChatId != chatId) {
+        return;
+      }
+      await _refreshAttachments();
       if (!mounted || _currentChatId != chatId) {
         return;
       }
@@ -1198,7 +1220,7 @@ class _AIChatSurfaceState extends State<_AIChatSurface> {
       text: queuedText,
       selectionStart: queuedText.length,
       selectionEnd: queuedText.length,
-      attachments: const [],
+      attachments: item.attachments,
       replyToMessageTimestamp: null,
     );
     if (decision != null) {
@@ -1263,7 +1285,11 @@ class _AIChatSurfaceState extends State<_AIChatSurface> {
     await _viewModel.sendUserMessage(
       queuedText.trim(),
       chatIdOverride: queueChatId,
+      attachmentsOverride: item.attachments,
     );
+    if (mounted && _currentChatId == queueChatId) {
+      await _refreshAttachments();
+    }
   }
 
   /// Persists the pending-queue expanded state through the chat runtime.
@@ -1300,9 +1326,11 @@ class _AIChatSurfaceState extends State<_AIChatSurface> {
     _toastMessageNotifier.value = message;
   }
 
+  /// Publishes a composer snapshot only while its requesting chat remains selected.
   Future<void> _refreshAttachments() async {
+    final chatId = _currentChatId;
     final attachments = await _viewModel.attachments();
-    if (!mounted) {
+    if (!mounted || _currentChatId != chatId) {
       return;
     }
     _attachments = attachments;
@@ -1569,6 +1597,42 @@ class _AIChatSurfaceState extends State<_AIChatSurface> {
         stackTrace: stackTrace,
       );
       rethrow;
+    }
+  }
+
+  /// Adds document context through the same draft attachment path as pasted text.
+  Future<void> _attachWorkspaceFileQuote(String fileName, String text) async {
+    final chatId = _currentChatId;
+    if (chatId == null) return;
+    final request = ChatAttachmentRequest(
+      chatId: chatId,
+      chatSelectionGeneration: _chatSelectionGeneration,
+    );
+    if (!_isPluginAttachmentRequestCurrent(request)) return;
+    final chinese = Localizations.localeOf(context).languageCode == 'zh';
+    final label = chinese
+        ? '额外信息 · 文档选区'
+        : 'Additional information · Document selection';
+    try {
+      await _viewModel.attachPastedText('$label: $fileName\n\n$text');
+      if (!_isPluginAttachmentRequestCurrent(request)) return;
+      final attachments = await _viewModel.attachments();
+      if (_isPluginAttachmentRequestCurrent(request)) {
+        _attachments = attachments;
+        _publishChatContentData();
+      }
+    } catch (error, stackTrace) {
+      ClientLogger.e(
+        'Failed to attach workspace selection',
+        tag: 'AIChatScreen',
+        error: error,
+        stackTrace: stackTrace,
+      );
+      if (_isPluginAttachmentRequestCurrent(request)) {
+        _showLocalToast(
+          chinese ? '无法附加文档选区' : 'Could not attach the selection',
+        );
+      }
     }
   }
 
@@ -2031,6 +2095,7 @@ class _AIChatSurfaceState extends State<_AIChatSurface> {
           _clearMentionSuggestionState();
           _messageController.clear();
           await _viewModel.clearAttachments();
+          await _refreshAttachments();
         }
         final message = decision.message;
         if (message != null && message.trim().isNotEmpty) {
@@ -2577,10 +2642,12 @@ class _AIChatSurfaceState extends State<_AIChatSurface> {
 
   /// Opens only the plugin-provided avatar preview, not the application title.
   Future<void> _showChatAvatarPreview() async {
-    final action = _chatUiContext?.identity?.avatarAction;
+    final action = _chatUiContext?.avatarAction;
     if (action == null) return;
     try {
-      final result = await action.present(
+      final result = await showEmbeddedContributionDialog(
+        route: action.route,
+        input: action.input,
         context: context,
         clients: _viewModel.clients,
         hostState: <String, Object?>{'chatId': _currentChatId},
@@ -2704,8 +2771,8 @@ class _AIChatSurfaceState extends State<_AIChatSurface> {
     _mainLayoutController?.refreshAttachment(owner: _mainLayoutOwner);
   }
 
-  /// Opens the side workspace for a turn diff on both phone and desktop.
-  void _openWorkspaceForDiff() {
+  /// Opens the side workspace for an external request from the active layout.
+  void _openWorkspace() {
     _setWorkspaceOpen(true);
   }
 
@@ -2719,43 +2786,22 @@ class _AIChatSurfaceState extends State<_AIChatSurface> {
       );
     }
     _isCurrentMainScreen = MainScreenActivityScope.isCurrentScreenOf(context);
-    final useMainLayoutWorkspace =
-        MediaQuery.sizeOf(context).width >= workspaceTabletBreakpoint;
-    _syncWorkspaceMainLayoutAttachment(
-      useMainLayoutWorkspace && _isCurrentMainScreen,
-    );
-    final content = _buildChatContent();
-    if (useMainLayoutWorkspace) {
-      return ChatRuntimeScope(
-        chatCore: _viewModel.chatCore,
-        chatId: _currentChatId,
-        child: content,
+    _syncWorkspaceMainLayoutAttachment(_isCurrentMainScreen);
+    if (_isCurrentMainScreen &&
+        MediaQuery.sizeOf(context).width < workspaceTabletBreakpoint) {
+      _mainLayoutController?.setWorkspaceDockDestination(
+        _openWorkspace,
+        owner: _mainLayoutOwner,
+      );
+    } else {
+      _mainLayoutController?.clearWorkspaceDockDestination(
+        owner: _mainLayoutOwner,
       );
     }
     return ChatRuntimeScope(
       chatCore: _viewModel.chatCore,
       chatId: _currentChatId,
-      child: WorkspaceShell(
-        workspaceOpen: _workspaceOpen,
-        onWorkspaceOpenChanged: _setWorkspaceOpen,
-        currentChatId: _currentChatId,
-        hasBoundWorkspace: _currentWorkspacePath?.trim().isNotEmpty == true,
-        workspacePath: _currentWorkspacePath,
-        fileDirectory: _currentFileDirectory,
-        chatCore: _viewModel.chatCore,
-        onListWorkspaceFiles: _viewModel.listWorkspaceFiles,
-        onMutateWorkspaceFile: _viewModel.mutateWorkspaceFile,
-        onListWorkspaceBindingDirectories:
-            _viewModel.listWorkspaceBindingDirectories,
-        onReadWorkspaceTextFile: _viewModel.readWorkspaceTextFile,
-        onReadWorkspaceFileBytes: _viewModel.readWorkspaceFileBytes,
-        onWriteWorkspaceFileBytes: _viewModel.writeWorkspaceFileBytes,
-        onOpenWorkspaceFile: _viewModel.openWorkspaceFile,
-        onCreateWorkspace: _createWorkspace,
-        onBindWorkspace: _bindWorkspace,
-        onUnbindWorkspace: _unbindWorkspace,
-        child: content,
-      ),
+      child: _buildChatContent(),
     );
   }
 
@@ -2827,7 +2873,7 @@ class _AIChatSurfaceState extends State<_AIChatSurface> {
           fileDirectory: _currentFileDirectory,
           chatIdentity: data.chatUiContext?.identity,
           backgroundUri: data.chatUiContext?.backgroundUri,
-          onIdentityTap: data.chatUiContext?.identity?.avatarAction == null
+          onIdentityTap: data.chatUiContext?.avatarAction == null
               ? null
               : _showChatAvatarPreview,
           autoScrollToBottomListenable: _autoScrollToBottomNotifier,
@@ -2983,6 +3029,7 @@ class _AIChatSurfaceState extends State<_AIChatSurface> {
       onCreateWorkspace: _createWorkspace,
       onBindWorkspace: _bindWorkspace,
       onUnbindWorkspace: _unbindWorkspace,
+      onFileQuote: _attachWorkspaceFileQuote,
       child: child,
     );
   }

@@ -595,12 +595,18 @@ export namespace System {
      */
     function close(sessionId: string): Promise<TerminalSessionCloseResultData>;
     /**
+     * Atomically close an idle session only when it belongs to the supplied name.
+     * Hosts without atomic support reject this operation without closing the session.
+     */
+    function closeIfIdle(sessionId: string, sessionName: string): Promise<TerminalSessionCloseResultData>;
+    /**
      * Creates or returns an interactive terminal session with the supplied name.
      * @param sessionName Stable name used to identify the terminal session.
-     * @param type Exact interpreter type; omission requests the host's configured default terminal.
+     * @param type Legacy exact interpreter; cannot be combined with profileId.
+     * @param profileId Saved profile ID from info().profiles; omission of both selectors uses the default.
      * @returns Promise resolving to the actual session creation result.
      */
-    function create(sessionName: string, type?: TerminalType): Promise<TerminalSessionCreationResultData>;
+    function create(sessionName: string, type?: TerminalType, profileId?: string): Promise<TerminalSessionCreationResultData>;
     /**
      * Execute a command in a terminal session.
      * @param sessionId The ID of the session.
@@ -651,6 +657,10 @@ export namespace System {
      * A yielded session is reserved; the next run with this name acquires a new session generation.
      */
     function run(request: TerminalRunRequest): Promise<TerminalCommandResultData>;
+    /**
+     * Streams a named-session command until it completes; returning detaches its observation.
+     */
+    function runStream(request: TerminalRunStreamRequest): AsyncIterable<TerminalExecEvent>;
     /**
      * Get the current visible terminal screen content for a session (single screen only, no history).
      * @param sessionId The ID of the session.
@@ -720,12 +730,29 @@ export interface TerminalExecRequest {
  */
 export interface TerminalRunRequest {
   sessionName: string;
-  terminalType: TerminalType;
+  /**
+   * Exact saved profile; omission together with terminalType uses the configured default.
+   */
+  profileId?: string;
+  /**
+   * Legacy explicit interpreter selection. Cannot be combined with profileId.
+   */
+  terminalType?: TerminalType;
   command: string;
   /**
    * Limits foreground waiting only; zero returns as soon as execution starts.
    */
   waitMs: number;
+}
+
+/**
+ * Streams a named-session command until actual completion, independently of foreground waits.
+ */
+export interface TerminalRunStreamRequest {
+  sessionName: string;
+  profileId?: string;
+  terminalType?: TerminalType;
+  command: string;
 }
 
 /**

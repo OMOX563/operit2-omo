@@ -75,6 +75,10 @@ pub enum ToolResultData {
     MessageSendResultData(MessageSendResultData),
     ChatSendMessageResultData(ChatSendMessageResultData),
     ChatObservationResultData(ChatObservationResultData),
+    ChatPreparedDeliveryResultData(ChatPreparedDeliveryResultData),
+    ChatScheduledMessagesResultData(ChatScheduledMessagesResultData),
+    ChatScheduleMessageResultData(ChatScheduleMessageResultData),
+    ChatCancelScheduledMessageResultData(ChatCancelScheduledMessageResultData),
     ChatCancelResultData(ChatCancelResultData),
     ChatReadExtensionResultData(ChatReadExtensionResultData),
     ChatWriteExtensionResultData(ChatWriteExtensionResultData),
@@ -176,6 +180,10 @@ impl ToolResultData {
             Self::MessageSendResultData(data) => data.toString(),
             Self::ChatSendMessageResultData(data) => data.toString(),
             Self::ChatObservationResultData(data) => data.toString(),
+            Self::ChatPreparedDeliveryResultData(data) => data.toString(),
+            Self::ChatScheduledMessagesResultData(data) => data.toString(),
+            Self::ChatScheduleMessageResultData(data) => data.toString(),
+            Self::ChatCancelScheduledMessageResultData(data) => data.toString(),
             Self::ChatCancelResultData(data) => data.toString(),
             Self::ChatReadExtensionResultData(data) => data.toString(),
             Self::ChatWriteExtensionResultData(data) => data.toString(),
@@ -383,6 +391,9 @@ fn append_ui_summary(node: &SimplifiedUINode, prefix: &str, depth: usize, output
         if node.properties.get("isEnabled").and_then(serde_json::Value::as_bool) == Some(false) {
             fields.push("disabled".into());
         }
+        if node.properties.get("isVisible").and_then(serde_json::Value::as_bool) == Some(false) {
+            fields.push("invisible".into());
+        }
         if node.properties.get("isCheckable").and_then(serde_json::Value::as_bool) == Some(true)
             && node.properties.get("isChecked").and_then(serde_json::Value::as_bool) == Some(false) {
             fields.push("unchecked".into());
@@ -444,6 +455,17 @@ mod ui_summary_tests {
         assert!(summary.contains('…'));
         assert!(summary.len() < 1500);
         assert!(root.children[0].text.as_ref().unwrap().len() > 30_000);
+    }
+
+    /// Preserves hidden native nodes while telling the model they are not current input targets.
+    #[test]
+    fn summary_marks_invisible_and_disabled_nodes() {
+        let mut node = button("Offscreen item");
+        node.properties.insert("isVisible".into(), serde_json::json!(false));
+        node.properties.insert("isEnabled".into(), serde_json::json!(false));
+        let summary = node.toTreeString(None);
+        assert!(summary.contains("disabled invisible"));
+        assert_eq!(node.text.as_deref(), Some("Offscreen item"));
     }
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1316,6 +1338,12 @@ pub struct ChatFindResultData {
 #[derive(Clone, Serialize, Deserialize)]
 /// Reports a chat agent's current state and whether it is idle or processing.
 pub struct AgentStatusResultData {
+    /// Title of the current execution, when the chat has started real work.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub taskTitle: Option<String>,
+    /// Actual model response rounds in this execution; zero before the first response.
+    #[serde(default)]
+    pub currentRound: i32,
     ///Target chat id
     #[serde(rename = "chatId")]
     pub chatId: String,
@@ -1531,6 +1559,51 @@ impl ChatCancelResultData {
     }
 }
 
+/// Reports durable immediate assistant message delivery and optional notification failure.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChatPreparedDeliveryResultData {
+    pub chatId: String,
+    pub timestamp: i64,
+    pub duplicate: bool,
+    pub notificationError: JsNullable<String>,
+}
+impl ChatPreparedDeliveryResultData {
+    pub fn toString(&self) -> String { serde_json::to_string(self).expect("prepared delivery receipt") }
+}
+
+/// Contains the platform-independent outcome of one plugin-owned scheduled message.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChatScheduledMessage {
+    pub id: String,
+    pub chatId: String,
+    pub timestamp: i64,
+    /// preparing, scheduled, delivered, cancelled, invalidated, skipped, or failed.
+    pub status: String,
+    pub error: JsNullable<String>,
+    /// Contains the accepted prepared body, including host-generated replies.
+    pub text: String,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChatScheduleMessageResultData { pub message: ChatScheduledMessage }
+impl ChatScheduleMessageResultData {
+    pub fn toString(&self) -> String { serde_json::to_string(self).expect("scheduled message receipt") }
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChatScheduledMessagesResultData { pub messages: Vec<ChatScheduledMessage> }
+impl ChatScheduledMessagesResultData {
+    pub fn toString(&self) -> String { serde_json::to_string(self).expect("scheduled messages") }
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChatCancelScheduledMessageResultData { pub id: String, pub cancelled: bool }
+impl ChatCancelScheduledMessageResultData {
+    pub fn toString(&self) -> String { serde_json::to_string(self).expect("scheduled message cancellation") }
+}
+
 /// Returns an owner-scoped Chat extension or its explicit absence.
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1650,6 +1723,13 @@ pub struct ChatMessagesResultData {
 #[derive(Clone, Serialize, Deserialize)]
 /// Reports the primary terminal identity and available terminal implementations.
 pub struct TerminalInfoResultData {
+    /// ID of the user-selected default profile on the executing Core device.
+    #[serde(default)]
+    pub defaultProfileId: String,
+    /// Saved configurations, including multiple instances of one interpreter or distribution.
+    #[serde(default)]
+    pub profiles: Vec<TerminalProfileInfoData>,
+
     ///Current runtime platform, such as windows, linux, or android
     #[serde(rename = "platform")]
     pub platform: String,
@@ -1662,6 +1742,15 @@ pub struct TerminalInfoResultData {
     ///Terminal types known to this host
     #[serde(rename = "types")]
     pub types: Vec<TerminalTypeInfoData>,
+}
+#[derive(Clone, Serialize, Deserialize)]
+/// Describes a selectable profile without exposing device-local executable or rootfs paths.
+pub struct TerminalProfileInfoData {
+    pub id: String,
+    pub name: String,
+    pub terminal: TerminalImplementation,
+    pub terminalType: TerminalType,
+    pub available: bool,
 }
 #[derive(Clone, Serialize, Deserialize)]
 /// Reports one available terminal implementation and its shell semantics.
@@ -2617,6 +2706,12 @@ impl TerminalInfoResultData {
         sb.push_str(&format!("Platform: {}\n", self.platform));
         sb.push_str(&format!("Terminal: {}\n", self.terminal));
         sb.push_str(&format!("Terminal Type: {}\n", self.terminalType));
+        sb.push_str(&format!("Default Profile: {}\n", self.defaultProfileId));
+        for profile in &self.profiles {
+            sb.push_str(&format!("- {}: {} ({}/{}, available={})\n", profile.id, profile.name,
+                profile.terminal, profile.terminalType, profile.available));
+        }
+
         if !self.types.is_empty() {
             sb.push_str("Types:\n");
             for terminalType in &self.types {
@@ -2643,6 +2738,7 @@ impl TerminalCommandResultData {
         sb.push_str(&format!("Platform: {}\n", self.platform));
         sb.push_str(&format!("Terminal: {}\n", self.terminal));
         sb.push_str(&format!("Terminal Type: {}\n", self.terminalType));
+
         sb.push_str(&format!("Exit Code: {}\n", self.exitCode));
         if self.timedOut {
             sb.push_str("Background: true\nCommand is still running and was not canceled. The next command uses a new available session. Use Tools.System.terminal.wait(sessionId, 20000), Tools.System.terminal.screen(sessionId), Tools.System.terminal.input(sessionId, options), or Tools.System.terminal.close(sessionId) to manage this session.\n");
@@ -2679,6 +2775,7 @@ impl HiddenTerminalCommandResultData {
         sb.push_str(&format!("Platform: {}\n", self.platform));
         sb.push_str(&format!("Terminal: {}\n", self.terminal));
         sb.push_str(&format!("Terminal Type: {}\n", self.terminalType));
+
         sb.push_str(&format!("Exit Code: {}\n", self.exitCode));
         if self.timedOut {
             sb.push_str("Timed Out: true\n");
@@ -2716,6 +2813,7 @@ impl TerminalSessionScreenResultData {
         sb.push_str(&format!("Platform: {}\n", self.platform));
         sb.push_str(&format!("Terminal: {}\n", self.terminal));
         sb.push_str(&format!("Terminal Type: {}\n", self.terminalType));
+
         sb.push_str(&format!("Size: {}x{}\n", self.cols, self.rows));
         sb.push_str(&format!("Command Running: {}\n", self.commandRunning));
         sb.push('\n');

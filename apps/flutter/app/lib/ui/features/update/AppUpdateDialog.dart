@@ -14,15 +14,21 @@ bool _dialogOpen = false;
 Future<void> showAppUpdateDialog(
   BuildContext context, {
   AppUpdateController? controller,
+  bool automatic = false,
 }) async {
-  if (_dialogOpen) return;
+  final selectedController = controller ?? AppUpdateController.instance;
+  if (_dialogOpen || (automatic && !selectedController.hasUnpromptedUpdate)) {
+    return;
+  }
+  selectedController.markUpdatePrompted();
   _dialogOpen = true;
   try {
     await showDialog<void>(
       context: context,
       barrierDismissible: false,
       builder: (_) => AppUpdateDialog(
-        controller: controller ?? AppUpdateController.instance,
+        controller: selectedController,
+        requireConfirmation: automatic,
       ),
     );
   } finally {
@@ -31,18 +37,27 @@ Future<void> showAppUpdateDialog(
 }
 
 class AppUpdateDialog extends StatefulWidget {
-  const AppUpdateDialog({super.key, required this.controller});
+  const AppUpdateDialog({
+    super.key,
+    required this.controller,
+    this.requireConfirmation = false,
+  });
   final AppUpdateController controller;
+  final bool requireConfirmation;
 
   @override
   State<AppUpdateDialog> createState() => _AppUpdateDialogState();
 }
 
 class _AppUpdateDialogState extends State<AppUpdateDialog> {
+  late bool _awaitingConfirmation;
+
   /// Start after a visible dialog frame, so a tap always gets immediate feedback.
   @override
   void initState() {
     super.initState();
+    _awaitingConfirmation = widget.requireConfirmation;
+    if (_awaitingConfirmation) return;
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (mounted && widget.controller.phase == AppUpdatePhase.available) {
         unawaited(widget.controller.start());
@@ -57,6 +72,7 @@ class _AppUpdateDialogState extends State<AppUpdateDialog> {
       final controller = widget.controller;
       final release = controller.release;
       if (release == null) return const SizedBox.shrink();
+      if (_awaitingConfirmation) return _buildUpdatePrompt(context, release);
       final colors = Theme.of(context).colorScheme;
       final phase = controller.phase;
       if (phase == AppUpdatePhase.unavailable) {
@@ -102,7 +118,18 @@ class _AppUpdateDialogState extends State<AppUpdateDialog> {
           controller.plan?.mode == AppUpdateMode.incremental
               ? '正在下载增量补丁…'
               : '正在下载完整安装包…',
-        AppUpdatePhase.reconstructing => '正在合并并校验安装包…',
+        AppUpdatePhase.reconstructing =>
+          switch (controller.preparation?.phase) {
+            AppUpdatePreparationPhase.verifyingBase => '正在校验原安装包…',
+            AppUpdatePreparationPhase.verifyingPatch => '正在校验增量补丁…',
+            AppUpdatePreparationPhase.expandingBase => '正在准备原安装包…',
+            AppUpdatePreparationPhase.verifyingExpandedBase => '正在校验更新文件…',
+            AppUpdatePreparationPhase.applyingPatch => '正在合并补丁…',
+            AppUpdatePreparationPhase.restoringPackage => '正在生成新安装包…',
+            AppUpdatePreparationPhase.verifyingPackage => '正在校验新安装包…',
+            AppUpdatePreparationPhase.savingPackage => '正在保存安装包…',
+            null => '正在准备更新文件…',
+          },
         AppUpdatePhase.ready => '更新已下载并校验完成，等待你确认安装',
         AppUpdatePhase.preparing => '正在准备安装，请稍候…',
         AppUpdatePhase.installing => '正在启动更新安装，应用即将重启…',
@@ -254,9 +281,44 @@ class _AppUpdateDialogState extends State<AppUpdateDialog> {
                   installing) ...[
                 const SizedBox(height: 14),
                 LinearProgressIndicator(
-                  value: downloading ? controller.progress : null,
+                  value: downloading
+                      ? controller.progress
+                      : reconstructing
+                      ? controller.preparation?.fraction
+                      : null,
                   minHeight: 6,
                   borderRadius: BorderRadius.circular(8),
+                ),
+              ],
+              if (reconstructing) ...[
+                const SizedBox(height: 10),
+                Wrap(
+                  spacing: 16,
+                  runSpacing: 6,
+                  children: [
+                    if (controller.preparation?.fraction
+                        case final double fraction)
+                      Text(
+                        '当前步骤 ${(fraction * 100).floor()}%',
+                        style: const TextStyle(
+                          fontFeatures: [FontFeature.tabularFigures()],
+                        ),
+                      ),
+                    Text(
+                      '已用时 ${formatUpdateDuration(controller.preparationElapsed)}',
+                      style: TextStyle(
+                        color: colors.onSurfaceVariant,
+                        fontSize: 12,
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 10),
+                Text(
+                  '正在本机处理更新文件，生成安装包可能需要一些时间。你可以后台更新，稍后点击 Operit 标志查看进度。',
+                  style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                    color: colors.onSurfaceVariant,
+                  ),
                 ),
               ],
               if (downloading) ...[
@@ -348,6 +410,145 @@ class _AppUpdateDialogState extends State<AppUpdateDialog> {
     },
   );
 
+  Widget _buildUpdatePrompt(BuildContext context, AppUpdateRelease release) {
+    final theme = Theme.of(context);
+    final colors = theme.colorScheme;
+    final ready = widget.controller.phase == AppUpdatePhase.ready;
+    final notes = release.releaseNotes.trim();
+    return OperitDialogScaffold(
+      title: '发现新版本',
+      icon: Container(
+        padding: const EdgeInsets.all(10),
+        decoration: BoxDecoration(
+          color: colors.primaryContainer,
+          borderRadius: BorderRadius.circular(14),
+        ),
+        child: Icon(
+          Icons.system_update_alt_rounded,
+          color: colors.onPrimaryContainer,
+        ),
+      ),
+      maxWidth: 480,
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(),
+          child: const Text('取消'),
+        ),
+        FilledButton.icon(
+          onPressed: () {
+            setState(() => _awaitingConfirmation = false);
+            final controller = widget.controller;
+            if (controller.phase == AppUpdatePhase.ready) {
+              unawaited(controller.confirmInstall());
+            } else if (controller.phase == AppUpdatePhase.available ||
+                controller.phase == AppUpdatePhase.failed) {
+              unawaited(controller.start());
+            }
+          },
+          icon: Icon(
+            ready ? Icons.restart_alt : Icons.system_update_alt_rounded,
+          ),
+          label: Text(ready ? '重启并更新' : '立即更新'),
+        ),
+      ],
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            'Operit 有新版本可用了',
+            style: theme.textTheme.titleMedium?.copyWith(
+              fontWeight: FontWeight.w700,
+            ),
+          ),
+          const SizedBox(height: 8),
+          Text(
+            ready ? '更新已准备就绪，确认后将重启应用并安装。' : '更新到最新版本，体验最新功能与改进。',
+            style: theme.textTheme.bodyMedium?.copyWith(
+              color: colors.onSurfaceVariant,
+            ),
+          ),
+          const SizedBox(height: 20),
+          Container(
+            width: double.infinity,
+            padding: const EdgeInsets.all(16),
+            decoration: BoxDecoration(
+              color: colors.surfaceContainerHighest,
+              borderRadius: BorderRadius.circular(14),
+            ),
+            child: Wrap(
+              spacing: 16,
+              runSpacing: 12,
+              crossAxisAlignment: WrapCrossAlignment.center,
+              children: [
+                _versionLabel(context, '当前版本', release.currentVersion),
+                Icon(
+                  Icons.arrow_forward_rounded,
+                  color: colors.onSurfaceVariant,
+                  size: 20,
+                ),
+                _versionLabel(context, '最新版本', release.version, latest: true),
+              ],
+            ),
+          ),
+          if (notes.isNotEmpty) ...[
+            const SizedBox(height: 20),
+            Text(
+              '本次更新内容',
+              style: theme.textTheme.labelLarge?.copyWith(
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+            const SizedBox(height: 10),
+            ConstrainedBox(
+              constraints: const BoxConstraints(maxHeight: 180),
+              child: SingleChildScrollView(
+                primary: false,
+                child: SelectableText(notes, style: theme.textTheme.bodyMedium),
+              ),
+            ),
+          ],
+          const SizedBox(height: 20),
+          Text(
+            '也可以稍后点击侧栏的 Operit 标志继续更新。',
+            style: theme.textTheme.bodySmall?.copyWith(
+              color: colors.onSurfaceVariant,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _versionLabel(
+    BuildContext context,
+    String label,
+    String version, {
+    bool latest = false,
+  }) {
+    final theme = Theme.of(context);
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(
+          label,
+          style: theme.textTheme.bodySmall?.copyWith(
+            color: theme.colorScheme.onSurfaceVariant,
+          ),
+        ),
+        const SizedBox(height: 4),
+        Text(
+          version,
+          style: theme.textTheme.titleMedium?.copyWith(
+            fontWeight: FontWeight.w700,
+            color: latest ? theme.colorScheme.primary : null,
+          ),
+        ),
+      ],
+    );
+  }
+
   Future<void> _openReleasePage() async {
     try {
       final opened = await launchUrl(
@@ -372,4 +573,11 @@ String formatUpdateBytes(int bytes) {
     return '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
   }
   return '${(bytes / (1024 * 1024 * 1024)).toStringAsFixed(1)} GB';
+}
+
+/// Formats measured local processing time without predicting remaining work.
+String formatUpdateDuration(Duration duration) {
+  final minutes = duration.inMinutes.toString().padLeft(2, '0');
+  final seconds = (duration.inSeconds % 60).toString().padLeft(2, '0');
+  return '$minutes:$seconds';
 }

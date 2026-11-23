@@ -419,12 +419,14 @@ fn managed_file_tracking_captures_ancestor_edits_and_mixed_local_paths() {
             source.writeBytes(log, b"local log").map_err(|e| e.to_string())?;
             source.writeBytes(path, b"shared file").map_err(|e| e.to_string())
         }).unwrap();
+        crate::WorkspaceFileSyncStore::WorkspaceFileSyncStore::new(source.clone(), RUNTIME_SYNC_DIR_PATH).scan().unwrap();
         let ops = operations(&source, &SyncClock::empty());
         assert_eq!(ops.len(), 1, "{ancestor}");
         assert_eq!(ops[0].entityId, path);
         assert_eq!(ops[0].operation, "upsert");
         let before_delete = clock(&source);
         files.trackChanges(&[ancestor.into()], || source.delete(path, false).map_err(|e| e.to_string())).unwrap();
+        crate::WorkspaceFileSyncStore::WorkspaceFileSyncStore::new(source.clone(), RUNTIME_SYNC_DIR_PATH).scan().unwrap();
         let ops = operations(&source, &before_delete);
         assert_eq!(ops.len(), 1, "{ancestor}");
         assert_eq!(ops[0].entityId, path);
@@ -714,7 +716,57 @@ fn exact_record_read_selects_space_and_rejects_mismatched_paths() {
     assert!((selection.sourceFilter("space"))("demo.toolpkg"));
     record.id = "other".into();
     storage.writeBytes(&shared, &serde_json::to_vec(&record).unwrap()).unwrap();
-    assert_eq!(store.record("package", "demo").unwrap_err(), "Extension identity does not match its record path");
+    let message = store.record("package", "demo").unwrap_err();
+    let expected = recordPath("package", "other", "space").unwrap();
+    assert!(
+        message.contains("Extension identity does not match its record path"),
+        "{message}"
+    );
+    assert!(message.contains(&format!("expected {expected}")), "{message}");
+    assert!(message.contains(&format!("actual {shared}")), "{message}");
+    assert!(message.contains("kind=package, id=other, scope=space"), "{message}");
+}
+
+/// Reports both paths and the actual identity through scans and direct lookups.
+#[test]
+fn record_path_mismatch_reports_paths_and_identity() {
+    for (kind, id, scope) in [
+        ("package", "other", "device"),
+        ("package", "demo", "space"),
+        ("skill", "demo", "device"),
+    ] {
+        let storage = host();
+        let store = ExtensionStore::new(storage.clone());
+        register_package_owner(&store, "demo", &["demo"]);
+        let actual = recordPath("package", "demo", "device").unwrap();
+        let mut record = store.record("package", "demo").unwrap();
+        record.kind = kind.into();
+        record.id = id.into();
+        record.scope = scope.into();
+        if kind == "skill" {
+            record.sourceName = "demo".into();
+            record.settings = json!({"visible": true});
+        }
+        let expected = recordPath(kind, id, scope).unwrap();
+        storage
+            .writeBytes(&actual, &serde_json::to_vec(&record).unwrap())
+            .unwrap();
+        for message in [
+            store.records("package").unwrap_err(),
+            store.record("package", "demo").unwrap_err(),
+        ] {
+            assert!(
+                message.contains("Extension identity does not match its record path"),
+                "{message}"
+            );
+            assert!(message.contains(&format!("expected {expected}")), "{message}");
+            assert!(message.contains(&format!("actual {actual}")), "{message}");
+            assert!(
+                message.contains(&format!("kind={kind}, id={id}, scope={scope}")),
+                "{message}"
+            );
+        }
+    }
 }
 
 /// Applies identical ownership and settings isolation to skills, MCP, and A2A.

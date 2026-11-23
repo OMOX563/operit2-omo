@@ -5,12 +5,22 @@ import type { ComposeDslScreen } from "./compose-dsl";
 import type { ToolParams } from "./core";
 
 export namespace ToolPkg {
-  /** Exposes the host registry IPC service. */
-  export const ipc: IpcApi;
-  /** Exposes the host registry WASM service. */
-  export const wasm: WasmApi;
-  /** Groups runtime presentation services for plugin-owned user interfaces. */
+  /**
+   * Observes and resolves tool approvals independently of their presentation surface.
+   */
+  export const toolPermissions: ToolPermissionApi;
+  /**
+   * Groups runtime presentation services for plugin-owned user interfaces.
+   */
   export const ui: UiApi;
+  /**
+   * Exposes inter-context messaging for this ToolPkg registry.
+   */
+  export const ipc: IpcApi;
+  /**
+   * Exposes declared WASM exports for this ToolPkg registry.
+   */
+  export const wasm: WasmApi;
   /**
    * Stores localized strings keyed by language tag.
    */
@@ -590,7 +600,7 @@ export namespace ToolPkg {
   /**
    * Enumerates every hook event that a ToolPkg plugin may register.
    */
-  export type HookEventName = AppLifecycleEvent | HookEventNameVariant2 | HookEventNameVariant3 | HookEventNameVariant4 | ChatInputEventName | ChatViewEventName | ChatMessageEventName | MessageTransformEventName | ChatLifecycleEventName | ChatMessageMenuItemEventName | ChatRuntimeEventName | ChatResponseEventName | HookEventNameVariant7 | ToolLifecycleEventName | PromptInputEventName | PromptHistoryEventName | SystemPromptComposeEventName | ToolPromptComposeEventName | PromptFinalizeEventName | SummaryGenerateEventName | CoreCommandEventName | HostEventName | HookEventNameVariant20;
+  export type HookEventName = AppLifecycleEvent | HookEventNameVariant2 | HookEventNameVariant3 | HookEventNameVariant4 | ChatInputEventName | ChatViewEventName | ChatMessageEventName | MessageTransformEventName | ChatLifecycleEventName | ChatMessageMenuItemEventName | ChatRuntimeEventName | ChatResponseEventName | HookEventNameVariant7 | ToolLifecycleEventName | PromptInputEventName | PromptHistoryEventName | SystemPromptComposeEventName | ToolPromptComposeEventName | PromptFinalizeEventName | SummaryGenerateEventName | CoreCommandEventName | HostEventName | HookEventNameVariant20 | ToolPermissionEventName;
 
   /**
    * Accepts a JSON result, no result, or asynchronous completion from a generic hook.
@@ -1198,6 +1208,10 @@ export namespace ToolPkg {
      */
     chatId?: string;
     /**
+     * Provides the workspace path associated with the conversation.
+     */
+    workspacePath?: string;
+    /**
      * Identifies the host function participating in prompt construction.
      */
     functionType?: string;
@@ -1259,6 +1273,10 @@ export namespace ToolPkg {
      * Identifies the conversation associated with the event.
      */
     chatId?: string;
+    /**
+     * Provides the workspace path associated with the conversation.
+     */
+    workspacePath?: string;
     /**
      * Identifies the host function participating in prompt construction.
      */
@@ -2046,6 +2064,14 @@ export namespace ToolPkg {
      */
     chatId: string;
     /**
+     * Title of the real work item owned by this execution, when available.
+     */
+    taskTitle?: string;
+    /**
+     * Actual model response rounds in the current execution; not tool invocation count.
+     */
+    currentRound: number;
+    /**
      * Identifies the runtime slot that owns the chat.
      */
     slot: ChatRuntimeSlotName;
@@ -2759,7 +2785,7 @@ export namespace ToolPkg {
   /**
    * Enumerates supported navigation surface values.
    */
-  export type NavigationSurface = "toolbox" | "main_sidebar_plugins" | "app_bar" | "chat_attachments" | "chat_sidebar_tabs" | "chat_input_menu" | "chat_input_menu_sections" | "chat_message_after" | "workspace" | "workspace_home";
+  export type NavigationSurface = "toolbox" | "main_sidebar_plugins" | "app_bar" | "chat_attachments" | "chat_sidebar_tabs" | "chat_input_menu" | "chat_input_menu_sections" | "chat_message_after" | "workspace" | "workspace_file" | "workspace_home";
 
   /**
    * Describes a plugin action exposed through a host navigation surface.
@@ -2847,7 +2873,12 @@ export namespace ToolPkg {
   }
 
   /**
-   * Binds an application lifecycle event to a plugin callback.
+   * Binds an application lifecycle event to a durable plugin callback.
+   * Application foreground/background describe the main UI, across all platforms:
+   * minimized/hidden desktop windows, background mobile scenes and hidden Web tabs
+   * are background. Focus loss, occlusion and plugin windows never change this state.
+   * New registrations receive application creation and the latest known foreground
+   * or background state. No raw host-event subscription or visibility query is needed.
    */
   export interface AppLifecycleHookRegistration {
     /**
@@ -3988,9 +4019,24 @@ export namespace ToolPkg {
   }
 
   /**
-   * Window geometry in logical pixels; position uses the host desktop's top-left origin.
+   * Bounds returned by a native accessibility provider in screen coordinates.
+   */
+  export interface FloatingScreenBounds {
+    left: number;
+    top: number;
+    right: number;
+    bottom: number;
+  }
+
+  /**
+   * Window geometry in logical pixels, or an explicit native screen rectangle.
    */
   export interface FloatingWindowOptions {
+    /**
+     * Native accessibility bounds; takes precedence over logical geometry.
+     * Pixels on Windows/Android, screen points on macOS, AT-SPI desktop units on X11. System scope only.
+     */
+    screenBounds?: FloatingScreenBounds;
     /**
      * Sets the left coordinate, when positioning is supported.
      */
@@ -4040,12 +4086,37 @@ export namespace ToolPkg {
     /**
      * Supplies the UI session's initial state.
      */
-    state?: JsonObject;
+    state?: object;
+    /**
+     * Fills the current scope: primary display for system windows, full view for application windows.
+     */
+    fill?: boolean;
     /**
      * Configures geometry and interaction flags.
      */
     options?: FloatingWindowOptions;
   }
+
+  /**
+   * Declares the content of one managed window; route and fill stay fixed while it exists.
+   */
+  export interface FloatingWindowContent {
+    route: string;
+    /**
+     * Shallow-merges supplied JSON state into the live UI session.
+     */
+    state?: object;
+    fill?: boolean;
+    /**
+     * Applies supplied options without resetting other options or the UI session.
+     */
+    options?: FloatingWindowOptions;
+  }
+
+  /**
+   * Reports presentation availability without requesting system authorization implicitly.
+   */
+  export type FloatingWindowSetResult = "shown" | "closed" | "permission_required" | "unsupported";
 
   /**
    * Reports the actual presentation scope and host capabilities.
@@ -4076,9 +4147,37 @@ export namespace ToolPkg {
   }
 
   /**
+   * Configures one bounded microphone capture in an owned window.
+   */
+  export interface FloatingWindowRecordingOptions {
+    /**
+     * Sets the capture limit in milliseconds (1000–20000, default 15000).
+     */
+    maxDurationMs?: number;
+    /**
+     * Stops after this much trailing silence (300–3000 ms) once speech is detected.
+     */
+    silenceMs?: number;
+  }
+
+  /**
+   * Carries a complete speech recording ready for STT.
+   */
+  export interface FloatingWindowRecording {
+    audio: number[];
+    fileName: string;
+    contentType: string;
+  }
+
+  /**
    * Controls general floating windows independently of launcher widgets.
    */
   export interface FloatingWindowApi {
+    /**
+     * Creates, updates and shows one window, or closes it for null content; repeated calls are safe.
+     * The host serializes lifecycle changes. Unavailable hosts return an explicit status; other errors reject.
+     */
+    set(id: string, content: FloatingWindowContent | null): Promise<FloatingWindowSetResult>;
     /**
      * Queries capabilities without opening a window or displaying a permission prompt.
      */
@@ -4094,7 +4193,7 @@ export namespace ToolPkg {
     /**
      * Applies partial window options and shallow-merges optional UI state without recreating the session.
      */
-    update(id: string, options: FloatingWindowOptions, state?: JsonObject): Promise<FloatingWindowInfo>;
+    update(id: string, options: FloatingWindowOptions, state?: object): Promise<FloatingWindowInfo>;
     /**
      * Shows an owned window without resetting its UI session.
      */
@@ -4111,6 +4210,22 @@ export namespace ToolPkg {
      * Lists only the executing plugin's live windows.
      */
     list(): Promise<FloatingWindowInfo[]>;
+    /**
+     * Captures WAV audio while the owned window is visible; returns null when discarded.
+     */
+    record(id: string, options?: FloatingWindowRecordingOptions): Promise<FloatingWindowRecording | null>;
+    /**
+     * Reads the normalized microphone level (0 to 1) for this owned window; zero while idle.
+     */
+    recordingLevel(id: string): Promise<number>;
+    /**
+     * Ends active capture and delivers its WAV to the pending record call.
+     */
+    finishRecording(id: string): Promise<void>;
+    /**
+     * Discards active capture without returning audio.
+     */
+    cancelRecording(id: string): Promise<void>;
   }
 
   /**
@@ -4124,9 +4239,85 @@ export namespace ToolPkg {
   }
 
   /**
+   * Carries one exact argument displayed to the user before tool execution.
+   */
+  export interface ToolPermissionParameter {
+    name: string;
+    value: string;
+  }
+
+  /**
+   * Identifies the tool and its public arguments awaiting approval.
+   */
+  export interface ToolPermissionTool {
+    name: string;
+    parameters: ToolPermissionParameter[];
+  }
+
+  /**
+   * Identifies one pending request across every chat and approval surface.
+   */
+  export interface ToolPermissionRequest {
+    requestId: string;
+    chatId: string;
+    tool: ToolPermissionTool;
+    description: string;
+    requestedAtMillis: number;
+  }
+
+  /**
+   * Names the decisions supported by the existing runtime approval broker.
+   */
+  export type ToolPermissionDecision = "allow" | "deny" | "allow_session";
+
+  /**
+   * Exposes current approvals to enabled packages registering a permission hook.
+   */
+  export interface ToolPermissionApi {
+    /**
+     * Lists unresolved requests in creation order, across chats.
+     */
+    list(): Promise<ToolPermissionRequest[]>;
+    /**
+     * Resolves an existing request once, using its exact chat and request identity.
+     */
+    respond(chatId: string, requestId: string, result: ToolPermissionDecision): Promise<void>;
+  }
+
+  /**
+   * Carries the complete pending snapshot after creation, resolution, timeout or cancellation.
+   */
+  export interface ToolPermissionEventPayload {
+    requests: ToolPermissionRequest[];
+  }
+
+  /**
+   * Names a pending approval snapshot notification.
+   */
+  export type ToolPermissionEventName = "requests_changed";
+
+  /**
+   * Combines dispatch metadata with pending tool approvals.
+   */
+  export interface ToolPermissionHookEvent extends HookEventBase<ToolPermissionEventName, ToolPermissionEventPayload> {
+  }
+
+  /**
+   * Registers a trusted approval presenter and replays the current pending snapshot.
+   */
+  export interface ToolPermissionHookRegistration {
+    id: string;
+    function: (arg0: ToolPermissionHookEvent) => HookReturn;
+  }
+
+  /**
    * Provides runtime and registration services for the current ToolPkg package.
    */
   export interface Registry {
+    /**
+     * Observes and resolves tool approvals independently of their presentation surface.
+     */
+    toolPermissions: ToolPermissionApi;
     /**
      * Groups runtime presentation services for plugin-owned user interfaces.
      */
@@ -4172,7 +4363,9 @@ export namespace ToolPkg {
      */
     registerDesktopWidget(definition: DesktopWidgetRegistration): void;
     /**
-     * Registers a callback for an application or activity lifecycle event.
+     * Registers a durable callback for an application or activity lifecycle event.
+     * Application foreground/background use host-normalized main UI visibility,
+     * independent of focus and plugin windows; activation replays the latest state.
      */
     registerAppLifecycleHook(definition: AppLifecycleHookRegistration): void;
     /**
@@ -4241,6 +4434,10 @@ export namespace ToolPkg {
      * Registers a callback for tool permission and execution stages.
      */
     registerToolLifecycleHook(definition: ToolLifecycleHookRegistration): void;
+    /**
+     * Observes pending approval changes; enables the package's permission presentation API.
+     */
+    registerToolPermissionHook(definition: ToolPermissionHookRegistration): void;
     /**
      * Registers a callback around user-input processing.
      */
@@ -4342,7 +4539,9 @@ export namespace ToolPkg {
    */
   function registerApi<TPayload, TResult>(definition: PublicApiRegistration<TPayload, TResult>): void;
   /**
-   * Registers a callback for an application or activity lifecycle event.
+   * Registers a durable callback for an application or activity lifecycle event.
+   * Application foreground/background use host-normalized main UI visibility,
+   * independent of focus and plugin windows; activation replays the latest state.
    */
   function registerAppLifecycleHook(definition: AppLifecycleHookRegistration): void;
   /**
@@ -4455,6 +4654,10 @@ export namespace ToolPkg {
    * Registers a callback for tool permission and execution stages.
    */
   function registerToolLifecycleHook(definition: ToolLifecycleHookRegistration): void;
+  /**
+   * Observes pending approval changes; enables the package's permission presentation API.
+   */
+  function registerToolPermissionHook(definition: ToolPermissionHookRegistration): void;
   /**
    * Registers a callback for tool-prompt assembly and filtering.
    */

@@ -1288,6 +1288,29 @@ fn sparse_sql_receipts_do_not_hide_earlier_independent_entities() {
     AppDatabase::closeDatabase();
 }
 
+/// Existing databases gain the export index, and page selection avoids scanning later independent entities.
+#[test]
+fn large_sql_export_uses_bounded_entity_lookups_after_reopen() {
+    let _guard = DATABASE_MUTEX.lock().unwrap_or_else(|error|error.into_inner());
+    let (paths, database, store) = openTestStore("export-index");
+    database.store().executeBatch("DROP INDEX sync_sql_operations_entity_state").unwrap();
+    drop(store);
+    let _reopened = SqlChatSyncStore::new(paths, &database).unwrap();
+    let connection = rusqlite::Connection::open_in_memory().unwrap();
+    for row in database.store().queryRows("SELECT sql FROM sqlite_master WHERE tbl_name='sync_sql_operations' AND sql IS NOT NULL ORDER BY type DESC",vec![]).unwrap() {
+        connection.execute_batch(&row.get::<_,String>(0).unwrap()).unwrap();
+    }
+    connection.execute_batch("WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<30000)
+        INSERT INTO sync_sql_operations SELECT 'phone:'||i,'phone',i,'chat','message','chat:'||i,'upsert','entity_state',i,8 FROM n;
+        INSERT INTO sync_sql_operations VALUES('phone:30001','phone',30001,'chat','message','chat:1','upsert','entity_state',30001,8);").unwrap();
+    let mut statement = connection.prepare(EXPORT_OPERATIONS_SQL).unwrap();
+    let sequences = statement.query_map(rusqlite::params!["chat","phone",1,256], |row| row.get::<_,i64>(2))
+        .unwrap().collect::<Result<Vec<_>,_>>().unwrap();
+    assert_eq!(sequences,(2..=257).collect::<Vec<_>>());
+    assert!(statement.get_status(rusqlite::StatementStatus::VmStep) < 20000, "export scanned unrelated later entities");
+    AppDatabase::closeDatabase();
+}
+
 /// Keeps accepted sequence membership after SQL deliberately compacts an older entity snapshot.
 #[test]
 fn native_sql_compaction_does_not_erase_durable_receipts() {
@@ -1431,11 +1454,12 @@ fn incremental_messages_with_different_local_ids_have_equal_content_digests() {
     assert_eq!(source_snapshot.data.revision, target_snapshot.data.revision);
     assert_ne!(source_snapshot.content_digest().unwrap(), target_snapshot.content_digest().unwrap());
 
-    let source_digest = SqlChatSyncStore::snapshotContentDigest(&source_snapshot).unwrap();
-    let target_digest = SqlChatSyncStore::snapshotContentDigest(&target_snapshot).unwrap();
-    let source_manifest = source_snapshot.manifest_with_digest(source_digest).unwrap();
-    let target_manifest = target_snapshot.manifest_with_digest(target_digest).unwrap();
+    let source_digest = SqlChatSyncStore::snapshotContentSummary(&source_snapshot).unwrap();
+    let target_digest = SqlChatSyncStore::snapshotContentSummary(&target_snapshot).unwrap();
+    let source_manifest = source_snapshot.manifest_with_content(source_digest).unwrap();
+    let target_manifest = target_snapshot.manifest_with_content(target_digest).unwrap();
     assert_eq!(source_manifest.digest, target_manifest.digest);
+    assert_eq!(source_manifest.contentBytes, target_manifest.contentBytes, "local row IDs must not affect authority size");
     assert_eq!(
         crate::Transaction::compare_manifests(&source_manifest, &target_manifest).unwrap(),
         crate::Transaction::Source::Equal,
@@ -1446,8 +1470,8 @@ fn incremental_messages_with_different_local_ids_have_equal_content_digests() {
     let parts = changed.data.values.get_mut("message_parts").unwrap();
     let content = parts["columns"].as_array().unwrap().iter().position(|name| name == "content").unwrap();
     parts["rows"][0][content] = serde_json::json!({"Text":"different business content"});
-    assert_ne!(SqlChatSyncStore::snapshotContentDigest(&source_snapshot).unwrap(),
-        SqlChatSyncStore::snapshotContentDigest(&changed).unwrap());
+    assert_ne!(SqlChatSyncStore::snapshotContentSummary(&source_snapshot).unwrap(),
+        SqlChatSyncStore::snapshotContentSummary(&changed).unwrap());
     AppDatabase::closeDatabase();
 }
 
@@ -1491,5 +1515,144 @@ fn correction_replaces_chat_payloads_with_an_exportable_initializer_and_replays_
     let mut collision = first.clone(); collision.createdAt += 99;
     assert!(a.applyOperation(&collision).is_err());
     a.applyOperation(&first).unwrap(); assert_eq!(sqlOperationCount(&a_db),0);
+    AppDatabase::closeDatabase();
+}
+
+/// A restore supersedes larger and newer peers, rejects old lineage, and resumes ordinary edits.
+#[test]
+fn restored_database_baseline_overrides_peers_and_rejects_old_history() {
+    use crate::Transaction::{compare_manifests, Source};
+    let _guard = DATABASE_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let (_, restored_db, restored) = openTestStore("restore-authority");
+    let mut original = upsertOperation(1, "restored");
+    original.createdAt = i64::MAX - 10;
+    restored.applyOperation(&original).unwrap();
+    let old_snapshot = restored.syncSnapshot().unwrap();
+    restored.establishRestoreBaseline(None).unwrap();
+    assert_eq!(restored_db.store().queryScalar::<i64>("SELECT count(*) FROM _operit_transaction_initialization", vec![]).unwrap(), 0);
+    let baseline = restored.syncSnapshot().unwrap();
+    let initializers = restored.operationsSince(&SyncClock::empty(), &[], 100).unwrap();
+    assert_eq!(initializers.len(), 1);
+    assert_eq!(initializers[0].operation, "initialize");
+    assert_eq!(sqlOperationCount(&restored_db), 0);
+
+    let (_, peer_db, peer) = openTestStore("restore-peer");
+    peer.applyOperation(&original).unwrap();
+    let mut future = upsertOperation(2, "much larger remote history that must be replaced");
+    future.createdAt = i64::MAX - 1;
+    peer.applyOperation(&future).unwrap();
+    insertChatMessage(&peer_db, "remote-only", 3000, "must not survive restore");
+    peer.recordChatSnapshot("remote-only").unwrap();
+    let larger = peer.syncSnapshot().unwrap();
+    let a = baseline.manifest().unwrap();
+    let b = larger.manifest().unwrap();
+    assert!(a.contentBytes < b.contentBytes);
+    assert_eq!(compare_manifests(&a, &b).unwrap(), Source::Local);
+    assert_eq!(compare_manifests(&b, &a).unwrap(), Source::Remote);
+    let required = restored.operationsSince(&peer.receipt().unwrap(), &[], 100).unwrap();
+    assert_eq!(required, initializers);
+
+    peer.applyOperation(&initializers[0]).unwrap();
+    assert_eq!(peer.syncSnapshot().unwrap().data, baseline.data);
+    assert!(peer_db.chatDao().getChatById("remote-only").unwrap().is_none());
+    peer.applyOperation(&future).unwrap();
+    restored.applyOperation(&future).unwrap();
+    let stale_initializer = crate::Transaction::compaction::Initialization::from_snapshot(old_snapshot).operation(CHAT_SYNC_DOMAIN, false).unwrap();
+    peer.applyOperation(&stale_initializer).unwrap();
+    assert_eq!(peer.syncSnapshot().unwrap().data, baseline.data);
+    assert_eq!(restored.syncSnapshot().unwrap().data, baseline.data);
+
+    let receipt = restored.receipt().unwrap();
+    insertChatMessage(&peer_db, "chat-remote", 4000, "edit after receiving restored baseline");
+    peer.recordMessageSnapshot("chat-remote", 4000).unwrap();
+    let edits = peer.operationsSince(&receipt, &[], 100).unwrap();
+    assert!(edits.iter().any(|operation| operationRestoration(&operation.originDeviceId).unwrap() == baseline.data.restoration));
+    restored.applyOperations(&edits).unwrap();
+    assert_eq!(restored_db.messagePartDao().getPartsForMessage("chat-remote", 4000, 0).unwrap()[0].content, "edit after receiving restored baseline");
+    assert_eq!(SqlChatSyncStore::snapshotContentSummary(&restored.syncSnapshot().unwrap()).unwrap(),
+        SqlChatSyncStore::snapshotContentSummary(&peer.syncSnapshot().unwrap()).unwrap());
+
+    let previous = restored.restoration().unwrap();
+    restored_db.store().withDatabaseFile(|| Ok(())).unwrap();
+    assert_eq!(restored.restoration().unwrap(), previous);
+    restored.establishRestoreBaseline(previous.clone()).unwrap();
+    assert!(restored.restoration().unwrap() > previous);
+    assert_ne!(restored.operationsSince(&SyncClock::empty(), &[], 100).unwrap()[0].opId, initializers[0].opId);
+    AppDatabase::closeDatabase();
+}
+
+/// A newer desktop title edit cannot make its smaller chat database authoritative.
+#[test]
+fn correction_preserves_larger_phone_history_after_a_newer_desktop_edit() {
+    use crate::Transaction::{compare_manifests, Source};
+    let _guard = DATABASE_MUTEX.lock().unwrap_or_else(|e|e.into_inner());
+    let (_, phone_db, phone) = openTestStore("larger-phone");
+    let shared = upsertOperation(1, "shared message");
+    phone.applyOperation(&shared).unwrap();
+    insertChatMessage(&phone_db, "phone-only-chat", 3000, "phone history must survive");
+    phone.recordChatSnapshot("phone-only-chat").unwrap();
+    let phone_snapshot = phone.syncSnapshot().unwrap();
+    let (_, desktop_db, desktop) = openTestStore("newer-desktop");
+    desktop.applyOperation(&shared).unwrap();
+    let mut edited = desktop_db.chatDao().getChatById("chat-remote").unwrap().unwrap();
+    edited.title = "Edited on Windows".into();
+    desktop_db.chatDao().updateChats(vec![edited]).unwrap();
+    desktop.recordChatSnapshot("chat-remote").unwrap();
+    let desktop_snapshot = desktop.syncSnapshot().unwrap();
+    assert!(phone_snapshot.data.revision < desktop_snapshot.data.revision);
+    let phone_manifest = phone_snapshot.manifest_with_content(SqlChatSyncStore::snapshotContentSummary(&phone_snapshot).unwrap()).unwrap();
+    let desktop_manifest = desktop_snapshot.manifest_with_content(SqlChatSyncStore::snapshotContentSummary(&desktop_snapshot).unwrap()).unwrap();
+    assert_eq!(compare_manifests(&phone_manifest, &desktop_manifest).unwrap(), Source::Local);
+    assert_eq!(compare_manifests(&desktop_manifest, &phone_manifest).unwrap(), Source::Remote);
+    let mut baseline = phone_snapshot.clone();
+    baseline.covered.extend(desktop_snapshot.covered.iter().cloned());
+    for (store, db, before) in [(&phone, &phone_db, &phone_snapshot), (&desktop, &desktop_db, &desktop_snapshot)] {
+        assert!(store.repairSyncedSnapshot(&before.token().unwrap(), &baseline).unwrap());
+        assert!(db.chatDao().getChatById("phone-only-chat").unwrap().is_some());
+        assert_eq!(db.messagePartDao().getPartsForMessage("phone-only-chat", 3000, 0).unwrap()[0].content, "phone history must survive");
+        assert_eq!(db.messagePartDao().getPartsForMessage("chat-remote", 2000, 0).unwrap()[0].content, "shared message");
+    }
+    assert_eq!(phone.operationsSince(&SyncClock::empty(), &[], 100).unwrap(), desktop.operationsSince(&SyncClock::empty(), &[], 100).unwrap());
+    let receipt = phone.receipt().unwrap();
+    insertChatMessage(&desktop_db, "phone-only-chat", 4000, "new desktop reply");
+    desktop.recordMessageSnapshot("phone-only-chat", 4000).unwrap();
+    let newer = desktop.operationsSince(&receipt, &[], 100).unwrap();
+    assert!(!newer.is_empty());
+    phone.applyOperations(&newer).unwrap();
+    assert_eq!(phone_db.messagePartDao().getPartsForMessage("phone-only-chat", 4000, 0).unwrap()[0].content, "new desktop reply");
+    assert_eq!(SqlChatSyncStore::snapshotContentSummary(&phone.syncSnapshot().unwrap()).unwrap(), SqlChatSyncStore::snapshotContentSummary(&desktop.syncSnapshot().unwrap()).unwrap());
+    AppDatabase::closeDatabase();
+}
+
+/// Scope clocks record the last writer of each range, so identical history must not look like drift.
+#[test]
+fn scope_clocks_and_message_ids_are_excluded_from_business_content() {
+    let _guard = DATABASE_MUTEX.lock().unwrap_or_else(|e|e.into_inner());
+    let (_, phone_db, phone) = openTestStore("clock-phone");
+    let (_, desktop_db, desktop) = openTestStore("clock-desktop");
+    let shared = upsertOperation(1, "shared message");
+    phone.applyOperation(&shared).unwrap();
+    desktop.applyOperation(&shared).unwrap();
+    phone.recordChatSnapshot("chat-remote").unwrap();
+    desktop.recordChatSnapshot("chat-remote").unwrap();
+
+    // Each peer keeps its own last-writer clock and its own autoincrement row identity.
+    desktop_db.store().executeBatch("UPDATE sync_sql_versions SET createdAt=createdAt+7000, origin='desktop-writer', sequence=sequence+500;
+        UPDATE messages SET messageId=messageId+900;").unwrap();
+    let phone_snapshot = phone.syncSnapshot().unwrap();
+    let desktop_snapshot = desktop.syncSnapshot().unwrap();
+    let wire = |snapshot: &crate::Transaction::Snapshot| serde_json::to_value(snapshot).unwrap()["data"]["values"].clone();
+    let (phone_wire, desktop_wire) = (wire(&phone_snapshot), wire(&desktop_snapshot));
+    assert_ne!(phone_wire["sync_sql_versions"], desktop_wire["sync_sql_versions"]);
+    assert_ne!(phone_wire["messages"], desktop_wire["messages"]);
+    assert_eq!(SqlChatSyncStore::snapshotContentSummary(&phone_snapshot).unwrap(),
+        SqlChatSyncStore::snapshotContentSummary(&desktop_snapshot).unwrap());
+    assert_ne!(phone_snapshot.token().unwrap(), desktop_snapshot.token().unwrap());
+
+    // A genuinely different clock set is still business drift.
+    desktop_db.store().execute("DELETE FROM sync_sql_versions", vec![]).unwrap();
+    let missing = desktop.syncSnapshot().unwrap();
+    assert_ne!(SqlChatSyncStore::snapshotContentSummary(&phone_snapshot).unwrap(),
+        SqlChatSyncStore::snapshotContentSummary(&missing).unwrap());
     AppDatabase::closeDatabase();
 }

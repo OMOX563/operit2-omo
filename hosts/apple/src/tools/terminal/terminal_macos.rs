@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use operit_host_api::{
     HiddenTerminalCommandOutput, HostError, HostResult, TerminalCloseOutput, TerminalCommandOutput,
@@ -89,6 +90,37 @@ impl AppleTerminalHost {
 }
 
 impl TerminalHost for AppleTerminalHost {
+    /// Declares custom native shell launchers without exposing emulated backend internals.
+    fn terminalProfileSupport(&self) -> HostResult<Vec<operit_host_api::TerminalProfileSupport>> {
+        Ok(self
+            .terminalInfo()?
+            .types
+            .into_iter()
+            .map(|entry| operit_host_api::TerminalProfileSupport {
+                fields: if entry.terminal == TERMINAL {
+                    vec!["executable".into(), "arguments".into()]
+                } else {
+                    Vec::new()
+                },
+                terminal: entry.terminal,
+                terminalType: entry.terminalType,
+            })
+            .collect())
+    }
+    /// Keeps platform metadata and isolation rules around a custom native shell.
+    fn configuredTerminal(
+        &self,
+        profile: &operit_host_api::TerminalProfile,
+    ) -> HostResult<std::sync::Arc<dyn TerminalHost>> {
+        let native = self
+            .hostForType(&profile.terminal, &profile.terminalType)?
+            .withProfile(profile)?;
+        let mut host = self.clone();
+        host.hosts = BTreeMap::from([(profile.terminalType.clone(), native)]);
+        host.primary = profile.terminalType.clone();
+        Ok(std::sync::Arc::new(host))
+    }
+
     /// Resolves macOS working directories through the shared native PTY host.
     fn resolveWorkingDirectory(
         &self,
@@ -118,6 +150,14 @@ impl TerminalHost for AppleTerminalHost {
                 terminal: TERMINAL.to_string(),
                 terminalType: kind.clone(),
                 available: true,
+                nameKey: Some(
+                    if self.sandboxed {
+                        "terminalBuiltinMacSandbox"
+                    } else {
+                        "terminalBuiltinMacNative"
+                    }
+                    .into(),
+                ),
                 description: if self.sandboxed {
                     "macOS sandbox PTY (without controlling TTY)".to_string()
                 } else {
@@ -299,6 +339,22 @@ impl TerminalHost for AppleTerminalHost {
             })
     }
 
+    /// Observes the session's actual backend without holding a worker while it runs.
+    fn beginInSessionStreaming(self: Arc<Self>, sessionId: String, command: String, timeoutMs: u64)
+        -> HostResult<Box<dyn operit_host_api::TerminalCommand::TerminalCommandExecution>> {
+        #[cfg(all(feature = "arm64-runtime", target_arch = "aarch64"))]
+        if sessionId.starts_with("macos-arm64-") {
+            return Arc::new(self.arm64.clone()).beginInSessionStreaming(sessionId, command, timeoutMs);
+        }
+        let execution = Arc::new(self.hostForSession(&sessionId)?.clone())
+            .beginInSessionStreaming(sessionId, command, timeoutMs)?;
+        Ok(operit_host_api::TerminalCommand::mapTerminalCommandExecution(execution, |mut output| {
+            output.platform = PLATFORM.to_string();
+            output.terminal = TERMINAL.to_string();
+            Ok(output)
+        }))
+    }
+
     fn executeHiddenCommand(
         &self,
         command: &str,
@@ -334,6 +390,14 @@ impl TerminalHost for AppleTerminalHost {
             return self.arm64.closeSession(sessionId);
         }
         self.hostForSession(sessionId)?.closeSession(sessionId)
+    }
+
+    fn closeSessionIfIdle(&self, sessionId: &str, sessionName: &str) -> HostResult<TerminalCloseOutput> {
+        #[cfg(all(feature = "arm64-runtime", target_arch = "aarch64"))]
+        if sessionId.starts_with("macos-arm64-") {
+            return self.arm64.closeSessionIfIdle(sessionId, sessionName);
+        }
+        self.hostForSession(sessionId)?.closeSessionIfIdle(sessionId, sessionName)
     }
 
     fn getSessionScreen(&self, sessionId: &str) -> HostResult<TerminalScreenOutput> {

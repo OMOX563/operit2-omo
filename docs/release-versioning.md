@@ -102,7 +102,6 @@ operit2-cli-macos-aarch64-2.0.0-preview.16.tar.gz
 operit2-app-android-arm64-v8a-2.0.0-preview.16.apk
 operit2-module-android-arm64-v8a-2.0.0-preview.16.zip
 operit2-app-ohos-arm64-2.0.0-preview.16.hap
-operit2-app-windows-x86_64-2.0.0-preview.16.zip
 operit2-app-windows-x86_64-2.0.0-preview.16.msi
 operit2-app-linux-x86_64-2.0.0-preview.16.tar.gz
 operit2-app-macos-universal-2.0.0-preview.16.zip
@@ -115,12 +114,13 @@ Release packages have authenticated `.update.json` manifests and optional
 `.patch.gz` incremental transfer assets. CLI archives
 contain the executable, installer script, uninstaller script, and README.
 
-Windows App builds produce both a portable ZIP and a Chinese MSI installer from
-the same Flutter release directory. The MSI installs for the current user under
+Windows App builds produce a Chinese MSI installer from the Flutter release
+directory. Windows App ZIP distribution and ZIP patches are not supported.
+The MSI installs for the current user under
 `%LOCALAPPDATA%\Programs\Operit2`, creates desktop and Start menu shortcuts, and
 registers repair/uninstall in Windows Settings. Upgrades replace the application
-files and preserve the separate user data directory. The updater selects ZIP for
-portable installations and MSI for registered MSI installations. Both packages include the Visual C++ runtime DLLs from the build
+files and preserve the separate user data directory. Windows App releases and
+incremental updates use MSI exclusively. The installer includes the Visual C++ runtime DLLs from the build
 toolchain so users do not need to install a separate redistributable.
 
 MSI packaging requires the .NET 8 SDK or newer. The build restores the pinned WiX
@@ -317,6 +317,12 @@ Windows Release Build     Windows App and/or CLI
 Linux Release Build       Linux App and/or CLI
 Android Flutter Build     signed Android APK and module installer ZIP
 ```
+
+Packaging and deployment workflows only prepare dependencies, generate required
+assets, build packages, and upload or publish them. They do not run standalone
+environment preflight checks, contract checks, type checks, unit tests, or browser
+and runtime smoke tests. The `cargo check` commands used to generate Dart proxy
+artifacts remain required build steps.
 
 Android Flutter Build requires these repository secrets:
 

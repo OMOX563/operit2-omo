@@ -74,6 +74,8 @@ def write_payload(release_dir: Path, destination: Path) -> None:
     seen = set()
     for path in paths:
         relative = path.relative_to(release_dir)
+        if relative.parts[0].casefold() == "powershell":
+            continue
         if path.is_symlink():
             raise RuntimeError(f"Symbolic links are not supported in MSI payloads: {relative}")
         key = relative.as_posix().casefold()

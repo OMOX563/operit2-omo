@@ -139,7 +139,11 @@ impl OperitApplication {
 
     /// Creates an application around a supplied host manager and installs shared host defaults.
     #[allow(non_snake_case)]
-    pub fn newWithContext(hostManager: HostManager) -> Self {
+    pub fn newWithContext(mut hostManager: HostManager) -> Self {
+        if let (Some(terminal), Some(storage)) = (hostManager.terminalHost.clone(), hostManager.runtimeStorageHost.clone()) {
+            let registry = Arc::new(operit_host_api::ProfileTerminalHost::ProfileTerminalHost::new(terminal, storage));
+            hostManager.terminalHost = Some(Arc::new(crate::services::PublishingTerminalHost::RuntimeSessionPublishingTerminalHost::new(registry)));
+        }
         if let Some(runtimeStorageHost) = hostManager.runtimeStorageHost.clone() {
             let filesystem = Arc::new(hostManager.vfs().expect("Runtime VFS must be configured for logging"));
             AppLogger::configure_log_files(
@@ -207,6 +211,9 @@ impl OperitApplication {
             providerRuntimeContext.clone(),
         );
         runtimeToolSupport
+            .bindChatProcessingState(initializedChatRuntimeHolder.processingState())
+            .expect("tool runtime must bind live chat processing state exactly once");
+        runtimeToolSupport
             .bindChatHistoryManager(
                 initializedChatRuntimeHolder
                     .chatHistoryManager()
@@ -217,6 +224,9 @@ impl OperitApplication {
         *chatRuntimeHolder
             .try_lock()
             .expect("new chat runtime holder must be unlocked") = initializedChatRuntimeHolder;
+        if let Err(error) = runtimeToolSupport.startScheduledChatDelivery() {
+            operit_util::AppLogger::AppLogger::e("ScheduledChatMessages", &error);
+        }
         Self {
             applicationUpdate: super::ApplicationUpdate::ApplicationUpdateManager::new(),
             appStartupTimeMs: 0,
@@ -450,6 +460,9 @@ impl OperitApplication {
         let startup = move || {
             Box::pin(async move {
                 let loadingGeneration = showPluginLoading();
+                AppLogger::trace("PluginStartup", &format!(
+                    "event=registry_start generation={loadingGeneration}",
+                ));
                 let loadOutcome = RuntimePackageManager::reloadRegistry(packageManager).await;
                 if let Err(error) = loadOutcome {
                     taskReadiness.fail(error.clone());
@@ -457,13 +470,22 @@ impl OperitApplication {
                     AppLogger::e("OperitApplication", &error);
                     return;
                 }
+                AppLogger::trace("PluginStartup", &format!(
+                    "event=registry_ready generation={loadingGeneration}",
+                ));
                 let starter = MCPStarter::new(hostManager);
                 let timeoutSeconds = ApiPreferences::getInstance()
                     .getMcpStartupTimeoutSeconds()
                     .expect("api preferences must provide mcp startup timeout seconds");
-                let _ = starter
+                AppLogger::trace("PluginStartup", &format!(
+                    "event=mcp_start generation={loadingGeneration} timeoutSeconds={timeoutSeconds}",
+                ));
+                let (started, total, status) = starter
                     .startAllDeployedPluginsWithTimeout(timeoutSeconds)
                     .await;
+                AppLogger::trace("PluginStartup", &format!(
+                    "event=mcp_complete generation={loadingGeneration} started={started} total={total} status={status:?}",
+                ));
                 completePluginLoadingSession(loadingGeneration);
             }) as std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>
         };
@@ -493,6 +515,11 @@ impl OperitApplication {
     #[allow(non_snake_case)]
     pub fn aiToolHandler(&self) -> AIToolHandler {
         self.toolHandler.clone()
+    }
+
+    /// Creates workspace access using this runtime's existing file-tool routing.
+    pub fn workspaceService(&self) -> crate::services::WorkspaceService::WorkspaceService {
+        crate::services::WorkspaceService::WorkspaceService::new(&self.hostManager, self.toolHandler.clone())
     }
 
     /// Creates an MCP repository with this runtime's host and tool support.
@@ -646,47 +673,10 @@ impl OperitApplication {
         assetId: String,
         fileName: String,
         expectedSha256: String,
-    ) -> Result<String, String> {
-        let fileName = fileName.trim().to_string();
-        if fileName.is_empty()
-            || fileName.contains(['/', '\\'])
-            || std::path::Path::new(&fileName)
-                .file_name()
-                .and_then(|name| name.to_str())
-                != Some(fileName.as_str())
-        {
-            return Err("Market artifact file name is invalid".to_string());
-        }
-        let normalizedSha256 = expectedSha256.trim().to_ascii_lowercase();
-        if normalizedSha256.len() != 64
-            || !normalizedSha256
-                .bytes()
-                .all(|byte| byte.is_ascii_hexdigit())
-        {
-            return Err("Market artifact SHA-256 is invalid".to_string());
-        }
-
-        let packageManager = self.packageManager();
-        let targetPath = packageManager
-            .lock()
-            .map_err(|error| error.to_string())?
-            .prepareMarketArtifactDownload(&fileName)?;
-        let vfs = (&self.hostManager).vfs()?;
-        let directory = std::path::Path::new(&targetPath)
-            .parent()
-            .map(|path| path.to_string_lossy().to_string());
-        let result = (|| {
-            operit_providers::market::MarketStatsApiService::MarketStatsApiService::new()
-                .download_asset_to_file(&assetId, &targetPath, &vfs)?;
-            Ok(packageManager
-                .lock()
-                .map_err(|error| error.to_string())?
-                .addMarketArtifactFile(targetPath.clone(), normalizedSha256))
-        })();
-        if let Some(directory) = directory {
-            let _ = vfs.deleteFile(&directory, true);
-        }
-        result
+    ) -> impl std::future::Future<Output = Result<String, String>> + 'static {
+        let tools = self.toolHandler.clone();
+        let host = self.hostManager.clone();
+        async move { super::MarketInstallSupport::install_artifact(&host, &tools, assetId, fileName, expectedSha256).await }
     }
 
     /// Returns marketplace entry/version markers for plugins that are still installed.
@@ -701,8 +691,10 @@ impl OperitApplication {
         &self,
         entryId: String,
         versionId: Option<String>,
-    ) -> Result<String, String> {
-        super::MarketInstallSupport::install_entry(self, &entryId, versionId.as_deref())
+    ) -> impl std::future::Future<Output = Result<String, String>> + 'static {
+        let tools = self.toolHandler.clone();
+        let host = self.hostManager.clone();
+        async move { super::MarketInstallSupport::install_entry(&host, &tools, &entryId, versionId.as_deref()).await }
     }
 
     /// Returns package names enabled in this application runtime.
@@ -916,19 +908,26 @@ impl OperitApplication {
         }
         let mut blobs = BTreeMap::new();
         let managedFiles = self.runtimeWorkspaceFileSyncStore()?;
-        for reference in managedFiles.deferredBlobs()? { blobs.insert(reference.contentHash.clone(), reference); }
+        for reference in managedFiles.deferredBlobs()? {
+            operit_util::AppLogger::AppLogger::trace("CoreSyncTrace", &format!(
+                "sync_clock.blob hash={} bytes={} source=deferred", syncTraceHashPrefix(&reference.contentHash), reference.size));
+            blobs.insert(reference.contentHash.clone(), reference);
+        }
         for operation in states.into_values() {
             if !store.shouldApplyOperation(operation).map_err(|e|e.to_string())? { continue; }
             if operit_store::WorkspaceFileSyncStore::WorkspaceFileSyncStore::owns(operation) && !managedFiles.wantsBlob(operation)? { continue; }
             match RuntimeFileSyncStore::requiredBlob(operation) {
-                Ok(Some(reference)) => { blobs.insert(reference.contentHash.clone(), reference); }
+                Ok(Some(reference)) => {
+                    operit_util::AppLogger::AppLogger::trace("CoreSyncTrace", &format!(
+                        "sync_clock.blob hash={} bytes={} source=pending-op op={} entity={}",
+                        syncTraceHashPrefix(&reference.contentHash), reference.size, operation.opId, operation.entityId));
+                    blobs.insert(reference.contentHash.clone(), reference);
+                }
                 Ok(None) => {}
                 Err(error) => errors.push(format!("pending blob op={}: {error}", operation.opId)),
             }
         }
         let mut result = serde_json::to_value(receipt).map_err(|error| error.to_string())?;
-        result["protocolVersion"] = serde_json::json!(1);
-        result["consistencyVersion"] = serde_json::json!(7);
         result["stateSummary"] = serde_json::json!(format!("digest:{summary}"));
         result["pending"] = serde_json::json!(pending.len());
         result["pendingOperationIds"] = serde_json::json!(pending.into_iter().map(|op|op.opId).collect::<Vec<_>>());
@@ -974,7 +973,7 @@ impl OperitApplication {
     #[allow(non_snake_case)]
     pub fn syncClockDigest(&self) -> Result<serde_json::Value, String> {
         let digest = self.runtimeSyncOperationStore()?.synchronizationSummary().map_err(|e|e.to_string())?;
-        Ok(serde_json::json!({"protocolVersion":1,"digest":digest}))
+        Ok(serde_json::json!({"digest":digest}))
     }
 
     /// Exports missing operations while reporting independently unavailable storage engines.
@@ -1328,6 +1327,33 @@ fn synchronizedChatId(operation: &SyncOperation) -> Option<String> {
 impl Default for OperitApplication {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Returns a short log prefix without panicking on malformed or multibyte content hashes.
+fn syncTraceHashPrefix(contentHash: &str) -> &str {
+    contentHash.get(..12).unwrap_or(contentHash)
+}
+
+#[cfg(test)]
+mod sync_trace_hash_prefix_tests {
+    use super::syncTraceHashPrefix;
+
+    #[test]
+    fn long_hash_uses_first_twelve_bytes() {
+        assert_eq!(syncTraceHashPrefix("0123456789abcdef0123"), "0123456789ab");
+    }
+
+    #[test]
+    fn short_or_empty_hash_is_returned_whole() {
+        assert_eq!(syncTraceHashPrefix("abc"), "abc");
+        assert_eq!(syncTraceHashPrefix(""), "");
+    }
+
+    #[test]
+    fn multibyte_hash_falls_back_to_whole_value() {
+        let hash = "a".repeat(11) + "中";
+        assert_eq!(syncTraceHashPrefix(&hash), hash);
     }
 }
 

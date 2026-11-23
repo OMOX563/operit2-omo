@@ -2,6 +2,16 @@
 
 This directory contains the Operit2 plugin workspace.
 
+Current packages explicitly declare `"api_version": "2.0.0"`: in `manifest.json`
+for ToolPkg and in the `METADATA` root object for standalone scripts. Packages
+that omit the field use the `1.0.0` compatibility contract. ToolPkg subpackages
+inherit the contract from their container manifest.
+
+The marketplace and local script details display the same API contract for
+scripts and ToolPkg. API `2.0.0` releases carry an API v2 marker. Publishing
+reads the version from the package metadata; unversioned historical releases
+are displayed as API `1.0.0`.
+
 - `types/`: current v2 TypeScript declarations generated from the Rust SDK.
 - `types-v1/`: the independent handwritten v1 declaration snapshot, with source provenance.
 - `sdk/`: language clients, native carrier, and runnable SDK examples under `sdk/examples/`.
@@ -13,7 +23,13 @@ This directory contains the Operit2 plugin workspace.
 - `docs/`: plugin authoring notes.
 - `tools/`: development and sync tools.
 
+`packages/external/proactive_messages/` provides optional AI proactive messages with per-chat intervals, random delays and trigger probability. It uses the uniform typed `Tools.Chat.scheduleMessage`, `cancelScheduledMessage` and `listScheduledMessages` APIs; persistence, delivery, notifications and iOS resume reconciliation are owned by the host.
+
 `packages/external/image_workbench/` provides the optional official Image Workbench, available from "more plugins" and disabled by default. It owns the unified image-generation tools and six internal provider adapters.
+
+`packages/buildin/docs_editor/` provides the built-in Office documents editor for DOCX, PPTX and PDF. It is disabled by default and can be enabled in the current space.
+
+`packages/external/permission_overlay/` provides the optional classic tool approval overlay alongside inline chat approvals. Import it from "more plugins", enable it, and use its toolbox page to grant system overlay access where required. See [tool permission presentation](docs/TOOL_PERMISSIONS.md).
 
 `packages/buildin/`, `packages/external/`, and `packages/examples/` use the same source layout. The difference is packaging: `buildin` is loaded as current built-in plugins, `external` is bundled as optional official plugins, while `examples` is kept for development samples.
 

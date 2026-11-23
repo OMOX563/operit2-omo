@@ -152,6 +152,7 @@ fun PackageToolParameter.toMessagePackValue(): Map<String, Any?> = mapOf(
 
 data class ToolPackage(
     val name: String,
+    val api_version: String,
     val description: LocalizedText,
     val tools: List<PackageTool>,
     val states: List<ToolPackageState>,
@@ -167,6 +168,7 @@ fun decodeToolPackage(value: Any?): ToolPackage {
     val input = value as Map<*, *>
     return ToolPackage(
         name = input["name"] as String as String,
+        api_version = input["api_version"] as String as String,
         description = decodeLocalizedText(input["description"]) as LocalizedText,
         tools = (input["tools"] as List<*>).map { item -> decodePackageTool(item) } as List<PackageTool>,
         states = (input["states"] as List<*>).map { item -> decodeToolPackageState(item) } as List<ToolPackageState>,
@@ -182,6 +184,7 @@ fun decodeToolPackage(value: Any?): ToolPackage {
 /** Encodes a typed SDK model into its Link argument representation. */
 fun ToolPackage.toMessagePackValue(): Map<String, Any?> = mapOf(
     "name" to this.name,
+    "api_version" to this.api_version,
     "description" to this.description.toMessagePackValue(),
     "tools" to this.tools.map { item -> item.toMessagePackValue() },
     "states" to this.states.map { item -> item.toMessagePackValue() },
@@ -592,6 +595,7 @@ data class ToolPkgContainerRuntime(
     val publicApi: String?,
     val publicApis: List<ToolPkgRegisteredFunctionHook>,
     val requires: List<ToolPkgManifestRequirement>,
+    val optionalRequires: List<ToolPkgManifestRequirement>,
     val dependencyIssues: List<ToolPkgDependencyIssue>,
     val manifestExtensions: Map<String, Any?>,
     val author: List<String>,
@@ -625,6 +629,7 @@ data class ToolPkgContainerRuntime(
     val chatResponseHooks: List<ToolPkgFunctionHookRuntime>,
     val hostEventHooks: List<ToolPkgHostEventHookRuntime>,
     val toolLifecycleHooks: List<ToolPkgFunctionHookRuntime>,
+    val toolPermissionHooks: List<ToolPkgFunctionHookRuntime>,
     val promptInputHooks: List<ToolPkgFunctionHookRuntime>,
     val promptHistoryHooks: List<ToolPkgFunctionHookRuntime>,
     val promptEstimateHistoryHooks: List<ToolPkgFunctionHookRuntime>,
@@ -651,6 +656,7 @@ fun decodeToolPkgContainerRuntime(value: Any?): ToolPkgContainerRuntime {
         publicApi = input["publicApi"]?.let { it as String } as String?,
         publicApis = (input["publicApis"] as List<*>).map { item -> decodeToolPkgRegisteredFunctionHook(item) } as List<ToolPkgRegisteredFunctionHook>,
         requires = (input["requires"] as List<*>).map { item -> decodeToolPkgManifestRequirement(item) } as List<ToolPkgManifestRequirement>,
+        optionalRequires = (input["optional_requires"] as List<*>).map { item -> decodeToolPkgManifestRequirement(item) } as List<ToolPkgManifestRequirement>,
         dependencyIssues = (input["dependencyIssues"] as List<*>).map { item -> decodeToolPkgDependencyIssue(item) } as List<ToolPkgDependencyIssue>,
         manifestExtensions = (input["manifestExtensions"] as Map<*, *>).entries.associate { entry -> entry.key as String to entry.value } as Map<String, Any?>,
         author = (input["author"] as List<*>).map { item -> item as String } as List<String>,
@@ -684,6 +690,7 @@ fun decodeToolPkgContainerRuntime(value: Any?): ToolPkgContainerRuntime {
         chatResponseHooks = (input["chatResponseHooks"] as List<*>).map { item -> decodeToolPkgFunctionHookRuntime(item) } as List<ToolPkgFunctionHookRuntime>,
         hostEventHooks = (input["hostEventHooks"] as List<*>).map { item -> decodeToolPkgHostEventHookRuntime(item) } as List<ToolPkgHostEventHookRuntime>,
         toolLifecycleHooks = (input["toolLifecycleHooks"] as List<*>).map { item -> decodeToolPkgFunctionHookRuntime(item) } as List<ToolPkgFunctionHookRuntime>,
+        toolPermissionHooks = (input["toolPermissionHooks"] as List<*>).map { item -> decodeToolPkgFunctionHookRuntime(item) } as List<ToolPkgFunctionHookRuntime>,
         promptInputHooks = (input["promptInputHooks"] as List<*>).map { item -> decodeToolPkgFunctionHookRuntime(item) } as List<ToolPkgFunctionHookRuntime>,
         promptHistoryHooks = (input["promptHistoryHooks"] as List<*>).map { item -> decodeToolPkgFunctionHookRuntime(item) } as List<ToolPkgFunctionHookRuntime>,
         promptEstimateHistoryHooks = (input["promptEstimateHistoryHooks"] as List<*>).map { item -> decodeToolPkgFunctionHookRuntime(item) } as List<ToolPkgFunctionHookRuntime>,
@@ -710,6 +717,7 @@ fun ToolPkgContainerRuntime.toMessagePackValue(): Map<String, Any?> = mapOf(
     "publicApi" to this.publicApi?.let { it },
     "publicApis" to this.publicApis.map { item -> item.toMessagePackValue() },
     "requires" to this.requires.map { item -> item.toMessagePackValue() },
+    "optional_requires" to this.optionalRequires.map { item -> item.toMessagePackValue() },
     "dependencyIssues" to this.dependencyIssues.map { item -> item.toMessagePackValue() },
     "manifestExtensions" to this.manifestExtensions.entries.associate { entry -> entry.key to entry.value },
     "author" to this.author.map { item -> item },
@@ -743,6 +751,7 @@ fun ToolPkgContainerRuntime.toMessagePackValue(): Map<String, Any?> = mapOf(
     "chatResponseHooks" to this.chatResponseHooks.map { item -> item.toMessagePackValue() },
     "hostEventHooks" to this.hostEventHooks.map { item -> item.toMessagePackValue() },
     "toolLifecycleHooks" to this.toolLifecycleHooks.map { item -> item.toMessagePackValue() },
+    "toolPermissionHooks" to this.toolPermissionHooks.map { item -> item.toMessagePackValue() },
     "promptInputHooks" to this.promptInputHooks.map { item -> item.toMessagePackValue() },
     "promptHistoryHooks" to this.promptHistoryHooks.map { item -> item.toMessagePackValue() },
     "promptEstimateHistoryHooks" to this.promptEstimateHistoryHooks.map { item -> item.toMessagePackValue() },

@@ -2,12 +2,67 @@ use std::collections::HashMap;
 
 use crate::core::chat::ChatRuntimeSlot::ChatRuntimeSlot;
 use crate::services::core::ChatHistoryDelegate::ChatSelectionMode;
+use crate::services::core::MessageProcessingDelegate::ChatExecutionState;
 use crate::services::ChatServiceCore::{ChatServiceCore, PendingChatQueueStore};
-use operit_vfs::VisualFileSystem::VisualFileSystem;
 use operit_providers::chat::EnhancedAIService::EnhancedAIService;
 use operit_providers::runtime_support::ProviderRuntimeContext;
+use operit_store::PreferencesDataStore::StateFlow;
 use operit_tools::tools::AIToolHandler::AIToolHandler;
-use std::sync::Arc;
+use operit_vfs::VisualFileSystem::VisualFileSystem;
+use std::sync::{Arc, RwLock};
+
+/// Shares each live core's authoritative execution flow without borrowing its runtime holder.
+#[derive(Clone, Default)]
+pub(crate) struct ChatRuntimeProcessingState {
+    sources: Arc<RwLock<HashMap<ChatRuntimeSlot, StateFlow<HashMap<String, ChatExecutionState>>>>>,
+}
+
+impl ChatRuntimeProcessingState {
+    /// Reads the same authoritative snapshot for occupancy and round reporting.
+    #[allow(non_snake_case)]
+    pub(crate) fn agentStatus(
+        &self,
+        chatId: &str,
+    ) -> Result<operit_plugin_sdk::js_sdk::results::AgentStatusResultData, String> {
+        let sources = self
+            .sources
+            .read()
+            .map_err(|_| "Chat processing state registry lock poisoned".to_string())?;
+        let state = sources
+            .values()
+            .filter_map(|source| source.value().get(chatId).cloned())
+            .max_by_key(|state| (state.isProcessing(), state.currentRound));
+        let isProcessing = state.as_ref().is_some_and(ChatExecutionState::isProcessing);
+        Ok(operit_plugin_sdk::js_sdk::results::AgentStatusResultData {
+            chatId: chatId.to_string(),
+            state: if isProcessing { "processing" } else { "idle" }.to_string(),
+            message: operit_plugin_sdk::js_sdk::JsOptional::Null,
+            isIdle: !isProcessing,
+            isProcessing,
+            currentRound: state.as_ref().map_or(0, |state| state.currentRound),
+            taskTitle: state.and_then(|state| state.taskTitle),
+        })
+    }
+    /// Registers the actual core flow, including runtimes created after tools have been bound.
+    fn register(
+        &self,
+        slot: ChatRuntimeSlot,
+        source: StateFlow<HashMap<String, ChatExecutionState>>,
+    ) {
+        self.sources
+            .write()
+            .expect("Chat processing state registry lock poisoned")
+            .insert(slot, source);
+    }
+
+    /// Removes stopped cores so retained worker clones cannot report obsolete runtime activity.
+    fn clear(&self) {
+        self.sources
+            .write()
+            .expect("Chat processing state registry lock poisoned")
+            .clear();
+    }
+}
 
 #[derive(Clone)]
 struct ChatRuntimeDependencies {
@@ -59,7 +114,9 @@ impl ChatRuntimeCoreFactory {
             },
             match slot {
                 ChatRuntimeSlot::MAIN => Some(operit_plugin_sdk::js_sdk::chat::ChatRuntime::Main),
-                ChatRuntimeSlot::FLOATING => Some(operit_plugin_sdk::js_sdk::chat::ChatRuntime::Floating),
+                ChatRuntimeSlot::FLOATING => {
+                    Some(operit_plugin_sdk::js_sdk::chat::ChatRuntime::Floating)
+                }
                 ChatRuntimeSlot::DETACHED(_) => None,
             },
             self.filesystem.clone(),
@@ -81,6 +138,7 @@ pub struct ChatRuntimeHolder {
     pub activeConversationCount: i32,
     pub currentSessionToolCount: i32,
     coreFactory: ChatRuntimeCoreFactory,
+    processingState: ChatRuntimeProcessingState,
 }
 
 impl ChatRuntimeHolder {
@@ -126,12 +184,28 @@ impl ChatRuntimeHolder {
             activeConversationCount: 0,
             currentSessionToolCount: 0,
             coreFactory,
+            processingState: ChatRuntimeProcessingState::default(),
         };
         for slot in [ChatRuntimeSlot::MAIN, ChatRuntimeSlot::FLOATING] {
             holder.getCore(slot);
         }
         holder.observeStats();
         holder
+    }
+
+    /// Returns a live read handle whose membership follows this holder's core lifecycle.
+    #[allow(non_snake_case)]
+    pub(crate) fn processingState(&self) -> ChatRuntimeProcessingState {
+        self.processingState.clone()
+    }
+
+    /// Stops runtime cores and removes their execution flows from independent status readers.
+    #[allow(non_snake_case)]
+    pub(crate) fn clearCores(&mut self) {
+        self.processingState.clear();
+        self.cores.clear();
+        self.activeConversationCount = 0;
+        self.currentSessionToolCount = 0;
     }
 
     /// Borrows the actual main delegate's canonical manager for initialization-time record and execution-lease sharing.
@@ -150,6 +224,10 @@ impl ChatRuntimeHolder {
     pub fn getCore(&mut self, slot: ChatRuntimeSlot) -> &mut ChatServiceCore {
         if !self.cores.contains_key(&slot) {
             let core = self.coreFactory.createCore(slot.clone());
+            self.processingState.register(
+                slot.clone(),
+                core.messageProcessingDelegate.executionStateByChatIdFlow(),
+            );
             self.cores.insert(slot.clone(), core);
         }
         self.cores

@@ -7,11 +7,31 @@ use std::sync::Arc;
 
 #[path = "incremental_updates/chains.rs"]
 mod chains;
+#[path = "incremental_updates/batching.rs"]
+mod batching;
+#[path = "incremental_updates/progress.rs"]
+mod preparation_progress;
 
 #[path = "../../../../../hosts/android/src/update_apk.rs"]
-mod apk_host;
+mod update_apk;
+#[path = "../../../../../hosts/android/src/update_base.rs"]
+mod update_base;
+#[path = "../../../../../hosts/android/src/system_operation.rs"]
+mod android_system_operation;
+#[path = "../../../../../apps/flutter/native/operit-flutter-bridge/src/FlutterSystemOperationBridge.rs"]
+mod flutter_system_operation;
 #[path = "incremental_updates/apk.rs"]
 mod apk;
+
+#[cfg(windows)]
+#[path = "../../../../../hosts/windows/src/process.rs"]
+mod process;
+#[cfg(windows)]
+#[path = "../../../../../hosts/windows/src/tools/system/update_msi.rs"]
+mod update_msi;
+#[cfg(windows)]
+#[path = "incremental_updates/msi.rs"]
+mod msi;
 
 /// Removes only the retained original while leaving authenticated patch metadata and bytes available.
 fn removeRetainedBase(fixture: &Fixture, release: &ReleaseInfo, current: &str) {
@@ -765,13 +785,13 @@ impl Fixture {
         );
         if retained {
             let versionSuffix = format!("-{}.", self.manifest.version);
-            let family = asset.split_once(&versionSuffix).unwrap().0;
+            let (family, extension) = asset.split_once(&versionSuffix).unwrap();
             self.context
                 .runtimeStorageHost
                 .as_ref()
                 .unwrap()
                 .writeBytes(
-                    &format!("runtime/application_update_bases/{family}.apk/{currentAsset}"),
+                    &format!("runtime/application_update_bases/{family}.{extension}/{currentAsset}"),
                     &self.base.readBytes().unwrap(),
                 )
                 .unwrap();

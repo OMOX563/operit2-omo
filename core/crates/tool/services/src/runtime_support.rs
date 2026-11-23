@@ -277,15 +277,7 @@ pub enum QualifiedVfsResolution<'a> {
 /// prefixes, which reserve the Windows drive syntax (`C:/Users`).
 #[allow(non_snake_case)]
 pub fn splitQualifiedVfsPath(text: &str) -> Option<(&str, &str)> {
-    let text = text.trim();
-    let (prefix, innerPath) = text.split_once(':')?;
-    if prefix.is_empty() || prefix.len() == 1 {
-        return None;
-    }
-    if prefix.chars().any(|c| c == '/' || c == '\\') {
-        return None;
-    }
-    Some((prefix, innerPath))
+    operit_util::FileUtils::FileUtils::splitQualifiedVfsPath(text)
 }
 
 /// Formats every space member as a copyable candidate list.
@@ -387,10 +379,21 @@ pub trait CoreNodeToolRuntime: Send + Sync {
 
 /// Provides runtime-owned services that the tools crate must not own.
 pub trait ToolRuntimeSupport: Send + Sync {
+    /// Handles an approval presentation command after native plugin authentication.
+    fn toolPermissionCommand(&self, _payload: serde_json::Value) -> Result<serde_json::Value, String> {
+        Err("Tool permission presentation is unavailable".into())
+    }
+
+    /// Runs the v1 migrator import with the current runtime's file and chat services.
+    fn importV1MigratorArchive(&self, _path: String) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, String>> + Send + '_>> {
+        Box::pin(async { Err("The v1 chat archive importer is unavailable in this runtime".into()) })
+    }
+
     fn bindDeviceToolRuntime(&self, _runtime: Arc<dyn crate::tools::DeviceTools::DeviceToolRuntime>) -> Result<(), String> {
         Err("Device tool routing is not supported by this runtime".into())
     }
-    fn closeDeviceTransports(&self, _owner: &str) {}
+    /// Closes every device transport held by the specified tool owner.
+    fn closeDeviceTransports(&self, owner: &str);
 
     fn executeDeviceTool(&self, _request: operit_plugin_sdk::javascript::JsToolCallRequest)
         -> operit_plugin_sdk::javascript::JsExecutionCompletion<operit_plugin_sdk::javascript::JsToolCallResult> {
@@ -428,10 +431,17 @@ pub trait ToolRuntimeSupport: Send + Sync {
         -> Result<operit_plugin_sdk::js_sdk::results::TtsSynthesizeResultData, String> {
         Err("Speech synthesis is unavailable on this host".into())
     }
-    /// Starts system speech through this runtime's shared playback host.
+    /// Starts configured speech through this runtime's shared playback host.
     #[allow(non_snake_case)]
-    fn speakSpeech(&self, request: operit_plugin_sdk::js_sdk::tts::TtsSpeakRequest)
-        -> Result<operit_plugin_sdk::js_sdk::results::TtsSpeakResultData, String>;
+    fn speakSpeech(
+        &self,
+        request: operit_plugin_sdk::js_sdk::tts::TtsSpeakRequest,
+        owner: Option<String>,
+    ) -> futures_util::future::BoxFuture<'_, Result<operit_plugin_sdk::js_sdk::results::TtsSpeakResultData, String>>;
+    /// Cancels one utterance belonging to the authenticated plugin.
+    fn cancelSpeech(&self, _owner: &str, _id: &str) -> Result<bool, String> {
+        Err("Speech cancellation is unavailable on this host".into())
+    }
     /// Recognizes supplied audio through the configured provider on this host.
     fn transcribeSpeech(&self, _request: operit_plugin_sdk::js_sdk::stt::SttTranscribeRequest)
         -> Result<operit_plugin_sdk::js_sdk::results::SttTranscribeResultData, String> {
@@ -564,9 +574,9 @@ pub trait ToolRuntimeSupport: Send + Sync {
     #[allow(non_snake_case)]
     fn stopChatServices(&self) -> Result<(), String>;
 
-    /// Returns whether the requested chat is currently processing.
+    /// Reads execution occupancy and the actual model round from one shared snapshot.
     #[allow(non_snake_case)]
-    fn isChatProcessing(&self, chatId: &str) -> Result<bool, String>;
+    fn chatAgentStatus(&self, chatId: &str) -> Result<operit_plugin_sdk::js_sdk::results::AgentStatusResultData, String>;
 
     /// Switches the parent-owned main chat runtime to a chat id.
     #[allow(non_snake_case)]
@@ -584,6 +594,17 @@ pub trait ToolRuntimeSupport: Send + Sync {
         parentChatId: Option<String>,
         input: Option<serde_json::Value>,
     ) -> ToolRuntimeSupportFuture<'a, Result<String, String>>;
+
+    /// Lists only the authenticated plugin's durable scheduled message receipts.
+    fn listScheduledChatMessages<'a>(&'a self, owner: &'a str)
+        -> futures_util::future::BoxFuture<'a, Result<operit_plugin_sdk::js_sdk::results::ChatScheduledMessagesResultData, String>>;
+    fn setScheduledChatForeground(&self, foreground: bool);
+    fn deliverPreparedChatMessage<'a>(&'a self, request: operit_plugin_sdk::js_sdk::chat::ChatPreparedMessageRequest)
+        -> futures_util::future::BoxFuture<'a, Result<operit_plugin_sdk::js_sdk::results::ChatPreparedDeliveryResultData, String>>;
+    fn scheduleChatMessage<'a>(&'a self, owner: &'a str, request: operit_plugin_sdk::js_sdk::chat::ChatScheduledMessageRequest)
+        -> futures_util::future::BoxFuture<'a, Result<operit_plugin_sdk::js_sdk::results::ChatScheduleMessageResultData, String>>;
+    fn cancelScheduledChatMessage<'a>(&'a self, owner: &'a str, id: String)
+        -> futures_util::future::BoxFuture<'a, Result<operit_plugin_sdk::js_sdk::results::ChatCancelScheduledMessageResultData, String>>;
 
     /// Reads one authenticated owner's object extension directly from an existing record.
     fn readChatExtension(
@@ -811,6 +832,7 @@ mod tests {
     #[test]
     fn qualifiedPathSplittingKeepsLocalPathsIntact() {
         assert_eq!(splitQualifiedVfsPath("cas:/virtual/nas/data"), Some(("cas", "/virtual/nas/data")));
+        assert_eq!(splitQualifiedVfsPath("cas://virtual/nas/data"), Some(("cas", "/virtual/nas/data")));
         assert_eq!(splitQualifiedVfsPath("cas:C:/Users/report.docx"), Some(("cas", "C:/Users/report.docx")));
         assert_eq!(splitQualifiedVfsPath("  cas:x/y "), Some(("cas", "x/y")));
         // Display names may contain spaces; the colon split runs first.

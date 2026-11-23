@@ -156,6 +156,9 @@ async fn executeSleep(tool: &AITool, context: &HostManager) -> ToolResult {
 /// Registers the public tools with their explicit execution contracts.
 #[allow(non_snake_case)]
 fn registerPublicTools(handler: &mut AIToolHandler, context: &HostManager) {
+    handler.registerBuiltinTool(BuiltinToolName::PackageWait,
+        RegisteredToolExecutor::Shared(Arc::new(crate::PackageExecution::PackageWaitExecutor)),
+        ToolRegistrationVisibility::PUBLIC);
     for name in [BuiltinToolName::ListWindows, BuiltinToolName::FocusWindow, BuiltinToolName::GetPageInfo, BuiltinToolName::Tap, BuiltinToolName::LongPress,
         BuiltinToolName::ClickElement, BuiltinToolName::SetInputText, BuiltinToolName::PressKey, BuiltinToolName::Swipe] {
         handler.registerBuiltinTool(name, Box::new(
@@ -503,6 +506,26 @@ fn registerChatTools(handler: &mut AIToolHandler, chatTools: StandardChatManager
         ToolRegistrationVisibility::INTERNAL,
     );
     handler.registerBuiltinTool(
+        BuiltinToolName::ChatListScheduledMessages,
+        RegisteredToolExecutor::Shared(Arc::new(PluginChatToolExecutor { operation: PluginChatToolOperation::ListScheduledMessages })),
+        ToolRegistrationVisibility::INTERNAL,
+    );
+    handler.registerBuiltinTool(
+        BuiltinToolName::ChatDeliverPrepared,
+        RegisteredToolExecutor::Shared(Arc::new(PluginChatToolExecutor { operation: PluginChatToolOperation::DeliverPrepared })),
+        ToolRegistrationVisibility::INTERNAL,
+    );
+    handler.registerBuiltinTool(
+        BuiltinToolName::ChatScheduleMessage,
+        RegisteredToolExecutor::Shared(Arc::new(PluginChatToolExecutor { operation: PluginChatToolOperation::ScheduleMessage })),
+        ToolRegistrationVisibility::INTERNAL,
+    );
+    handler.registerBuiltinTool(
+        BuiltinToolName::ChatCancelScheduledMessage,
+        RegisteredToolExecutor::Shared(Arc::new(PluginChatToolExecutor { operation: PluginChatToolOperation::CancelScheduledMessage })),
+        ToolRegistrationVisibility::INTERNAL,
+    );
+    handler.registerBuiltinTool(
         BuiltinToolName::ChatCancel,
         RegisteredToolExecutor::Shared(Arc::new(PluginChatToolExecutor { operation: PluginChatToolOperation::Cancel })),
         ToolRegistrationVisibility::INTERNAL,
@@ -663,13 +686,13 @@ fn registerSystemOperationTool(
 #[allow(non_snake_case)]
 fn registerTerminalTools(handler: &mut AIToolHandler, terminalTools: StandardTerminalTools) {
     use operit_tools::tools::defaultTool::standard::StandardTerminalStreaming::{
-        TerminalExecutionExecutor, TerminalStreamExecutor,
+        TerminalCloseExecutor, TerminalExecutionExecutor, TerminalStreamExecutor,
     };
     use operit_tools::ToolExecutionManager::RegisteredToolExecutor;
-    let streams = Arc::new(TerminalStreamExecutor::new(
+    let streams = TerminalStreamExecutor::shared(
         terminalTools.clone(),
         handler.getContext().hostRuntimeTaskSchedulerHost.clone(),
-    ));
+    );
     handler.registerBuiltinTool(
         BuiltinToolName::TerminalObserve,
         RegisteredToolExecutor::Shared(streams.clone()),
@@ -682,7 +705,7 @@ fn registerTerminalTools(handler: &mut AIToolHandler, terminalTools: StandardTer
     );
     handler.registerBuiltinTool(
         BuiltinToolName::ExecuteInTerminalSessionStreaming,
-        RegisteredToolExecutor::Shared(Arc::new(TerminalExecutionExecutor(streams))),
+        RegisteredToolExecutor::Shared(Arc::new(TerminalExecutionExecutor(streams.clone()))),
         ToolRegistrationVisibility::PUBLIC,
     );
     registerTerminalTool(
@@ -703,11 +726,10 @@ fn registerTerminalTools(handler: &mut AIToolHandler, terminalTools: StandardTer
         BuiltinToolName::ExecuteHiddenTerminalCommand,
         TerminalToolOperation::ExecuteHiddenCommand,
     );
-    registerTerminalTool(
-        handler,
-        &terminalTools,
+    handler.registerBuiltinTool(
         BuiltinToolName::CloseTerminalSession,
-        TerminalToolOperation::CloseSession,
+        RegisteredToolExecutor::Shared(Arc::new(TerminalCloseExecutor(streams))),
+        ToolRegistrationVisibility::PUBLIC,
     );
     registerTerminalTool(
         handler,
@@ -1201,6 +1223,11 @@ fn registerTtsTools(handler: &mut AIToolHandler) {
     handler.registerBuiltinTool(
         BuiltinToolName::TtsSpeak,
         RegisteredToolExecutor::Shared(Arc::new(TtsToolExecutor { operation: TtsToolOperation::Speak })),
+        ToolRegistrationVisibility::INTERNAL,
+    );
+    handler.registerBuiltinTool(
+        BuiltinToolName::TtsCancel,
+        RegisteredToolExecutor::Shared(Arc::new(TtsToolExecutor { operation: TtsToolOperation::Cancel })),
         ToolRegistrationVisibility::INTERNAL,
     );
     handler.registerBuiltinTool(

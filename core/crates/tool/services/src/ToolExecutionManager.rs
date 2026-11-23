@@ -1,13 +1,13 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::future::Future;
 
+use futures_util::FutureExt;
 use serde::{Deserialize, Serialize};
 
 use operit_tools::tools::climode::CliToolModeSupport::{
     CliToolModeSupport, PROXY_TOOL_NAME, SEARCH_TOOL_NAME,
 };
-use operit_tools::tools::packTool::RuntimePackageManager::RuntimePackageManager;
 use operit_tools::tools::AIToolHandler::AIToolHandler;
 use operit_tools::tools::ToolResultDataClasses::stringResultData;
 use operit_tools::ConversationMarkupManager::{ConversationMarkupManager, ToolResult};
@@ -18,14 +18,55 @@ const TAG: &str = "ToolExecutionManager";
 const PACKAGE_PROXY_TOOL_NAME: &str = "package_proxy";
 const CLI_PROXY_TOOL_NAME: &str = PROXY_TOOL_NAME;
 const CLI_SEARCH_TOOL_NAME: &str = SEARCH_TOOL_NAME;
-const PACKAGE_CALLER_NAME_PARAM: &str = "__operit_package_caller_name";
-const PACKAGE_CHAT_ID_PARAM: &str = "__operit_package_chat_id";
-const PACKAGE_CALLER_PARTICIPANT_ID_PARAM: &str = "__operit_package_caller_participant_id";
-const PACKAGE_CALLER_OWNER_PARAM: &str = "__operit_package_caller_owner";
 
 tokio::task_local! {
     static TOOL_RUNTIME_CONTEXT: ToolRuntimeContext;
     static TOOL_INVOCATION_CONTEXT: ToolInvocationContext;
+    static TOOL_BATCH_SEQUENCE: ToolBatchSequence;
+}
+
+type ToolBatchCompletion = futures_util::future::Shared<futures_util::future::BoxFuture<'static, ()>>;
+
+/// Orders actual invocations in one model response without sharing a queue with another batch.
+#[derive(Default)]
+struct ToolBatchSequence {
+    tail: Mutex<Option<ToolBatchCompletion>>,
+}
+
+/// Holds a batch position until the invocation really completes, independently of foreground waits.
+pub(crate) struct ToolBatchTurn {
+    previous: Option<ToolBatchCompletion>,
+    finished: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+impl ToolBatchSequence {
+    /// Links completion to its predecessor even when scheduling or admission of this turn fails.
+    fn reserve(&self) -> ToolBatchTurn {
+        let mut tail = self.tail.lock().expect("Tool batch sequence is poisoned");
+        let previous = tail.take();
+        let dependency = previous.clone();
+        let (finished, completion) = tokio::sync::oneshot::channel();
+        *tail = Some(async move {
+            if let Some(previous) = dependency { previous.await; }
+            // Both completion and cancellation release the position after its predecessor.
+            let _ = completion.await;
+        }.boxed().shared());
+        ToolBatchTurn { previous, finished: Some(finished) }
+    }
+}
+
+impl ToolBatchTurn {
+    /// Suspends this invocation without occupying a worker or locking another batch.
+    pub(crate) async fn wait(&self) {
+        if let Some(previous) = &self.previous { previous.clone().await; }
+    }
+}
+
+impl Drop for ToolBatchTurn {
+    /// Releases later invocations after the actual task or its cancelled admission has ended.
+    fn drop(&mut self) {
+        if let Some(finished) = self.finished.take() { let _ = finished.send(()); }
+    }
 }
 
 /// Selects the tool surface available to a model response.
@@ -40,6 +81,9 @@ pub enum ToolExposureMode {
 /// Context made available while a batch of tool invocations is executing.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolRuntimeContext {
+    /// Keeps the authenticated caller label outside business tool arguments.
+    #[serde(default)]
+    pub callerName: Option<String>,
     pub callerChatId: Option<String>,
     pub callerParticipantId: Option<String>,
     pub workspacePath: Option<String>,
@@ -113,7 +157,7 @@ impl ToolCall {
             return Err(CliToolModeSupport::buildCliModeUnavailableMessage(false));
         }
         for key in self.parameters.keys() {
-            if !matches!(key.as_str(), "tool_name" | "params" | PACKAGE_CALLER_NAME_PARAM | PACKAGE_CHAT_ID_PARAM | PACKAGE_CALLER_PARTICIPANT_ID_PARAM | PACKAGE_CALLER_OWNER_PARAM) {
+            if !matches!(key.as_str(), "tool_name" | "params" | "timeout_ms") {
                 return Err(format!("Unexpected proxy parameter: {key}. Put target tool parameters inside params as a JSON object."));
             }
         }
@@ -133,11 +177,7 @@ impl ToolCall {
             serde_json::Value::Object(object) => object.clone(),
             _ => return Err("Proxy params must be a JSON object or its legacy text encoding".into()),
         };
-        let mut parameters = object.into_iter().collect::<BTreeMap<_, _>>();
-        for key in [PACKAGE_CALLER_NAME_PARAM, PACKAGE_CHAT_ID_PARAM, PACKAGE_CALLER_PARTICIPANT_ID_PARAM, PACKAGE_CALLER_OWNER_PARAM] {
-            parameters.remove(key);
-            if let Some(value) = self.parameters.get(key) { parameters.insert(key.to_string(), value.clone()); }
-        }
+        let parameters = object.into_iter().collect::<BTreeMap<_, _>>();
         Ok(Self { name: name.to_string(), parameters })
     }
 
@@ -292,6 +332,11 @@ pub enum ToolExecutionPolicy {
 }
 
 impl ToolExecutionManager {
+    /// Reserves a position only for an outer AI invocation in the currently scoped batch.
+    pub(crate) fn reserveBatchTurn() -> Option<ToolBatchTurn> {
+        TOOL_BATCH_SEQUENCE.try_with(ToolBatchSequence::reserve).ok()
+    }
+
     /// Returns the native context captured for the current invocation and its awaited hooks.
     pub fn currentToolInvocationContext() -> Option<ToolInvocationContext> {
         TOOL_INVOCATION_CONTEXT.try_with(Clone::clone).ok()
@@ -355,11 +400,10 @@ impl ToolExecutionManager {
         invocations
     }
 
-    /// Executes a serial batch and finalizes one shared display/history result per invocation.
+    /// Owns one asynchronous execution sequence while allowing other model batches to run concurrently.
     pub async fn executeInvocations(
         invocations: &[ToolInvocation],
-        toolHandler: &mut AIToolHandler,
-        packageManager: &RuntimePackageManager,
+        toolHandler: &AIToolHandler,
         callerName: Option<String>,
         callerChatId: Option<String>,
         callerParticipantId: Option<String>,
@@ -370,6 +414,7 @@ impl ToolExecutionManager {
         executionData: serde_json::Map<String, serde_json::Value>,
     ) -> Result<ToolExecutionBatch, String> {
         let runtimeContext = ToolRuntimeContext {
+            callerName: callerName.clone(),
             callerChatId: callerChatId.clone(),
             callerParticipantId: callerParticipantId.clone(),
             workspacePath: workspacePath.clone(),
@@ -379,7 +424,8 @@ impl ToolExecutionManager {
             executionData,
         };
         runtimeContext.validateExecutionContext()?;
-        Self::scopeToolRuntimeContext(runtimeContext, async move {
+        TOOL_BATCH_SEQUENCE.scope(ToolBatchSequence::default(), Self::scopeToolRuntimeContext(runtimeContext, async move {
+        let mut toolHandler = toolHandler.clone();
         let mut results = Vec::new();
         let mut displays = Vec::new();
         let mut routeChangeIntent = None;
@@ -402,25 +448,7 @@ impl ToolExecutionManager {
             operit_util::AppLogger::VERBOSE_LEVEL_3,
         );
         toolHandler.registerDefaultTools();
-        let jsPackageNames = packageManager
-            .getAvailablePackages()
-            .keys()
-            .cloned()
-            .collect::<BTreeSet<_>>();
-        let injectedInvocations = invocations
-            .iter()
-            .map(|invocation| {
-                Self::injectPackageCallContext(
-                    invocation,
-                    &jsPackageNames,
-                    callerName.as_deref(),
-                    callerChatId.as_deref(),
-                    callerParticipantId.as_deref(),
-                )
-            })
-            .collect::<Vec<_>>();
-
-        for invocation in injectedInvocations.iter().cloned() {
+        for invocation in invocations.iter().cloned() {
             let displayToolName = Self::resolveDisplayToolName(&invocation.tool);
             AppLogger::trace_detail(
                 TAG,
@@ -510,7 +538,7 @@ impl ToolExecutionManager {
             operit_util::AppLogger::VERBOSE_LEVEL_3,
         );
         Ok(batch)
-        }).await
+        })).await
     }
 
     /// Builds a route-change intent from the successful switch_core tool result.
@@ -537,65 +565,6 @@ impl ToolExecutionManager {
                 }
             },
             _ => tool.name.clone(),
-        }
-    }
-
-    fn isJsPackageTool(toolName: &str, jsPackageNames: &BTreeSet<String>) -> bool {
-        let parts = toolName.splitn(2, ':').collect::<Vec<_>>();
-        parts.len() == 2 && jsPackageNames.contains(parts[0])
-    }
-
-    /// Replaces every untrusted reserved value with the authenticated host context, including its absence.
-    fn setPackageContextParameter(
-        params: &mut Vec<ToolParameter>,
-        name: &str,
-        value: Option<&str>,
-    ) {
-        params.retain(|parameter| parameter.name != name);
-        if let Some(value) = value {
-            params.push(ToolParameter {
-                name: name.to_string(),
-                value: value.to_string(),
-            });
-        }
-    }
-
-    /// Injects canonical context into a selected JavaScript tool or its proxy wrapper.
-    fn injectPackageCallContext(
-        invocation: &ToolInvocation,
-        jsPackageNames: &BTreeSet<String>,
-        callerName: Option<&str>,
-        callerChatId: Option<&str>,
-        callerParticipantId: Option<&str>,
-    ) -> ToolInvocation {
-        let targetName = Self::resolveDisplayToolName(&invocation.tool);
-        if !Self::isJsPackageTool(&targetName, jsPackageNames) {
-            return invocation.clone();
-        }
-
-        let mut updatedParams = invocation.tool.parameters.clone();
-        Self::setPackageContextParameter(&mut updatedParams, PACKAGE_CALLER_NAME_PARAM, callerName);
-        Self::setPackageContextParameter(&mut updatedParams, PACKAGE_CHAT_ID_PARAM, callerChatId);
-        Self::setPackageContextParameter(
-            &mut updatedParams,
-            PACKAGE_CALLER_PARTICIPANT_ID_PARAM,
-            callerParticipantId,
-        );
-
-        let context = Self::currentToolRuntimeContext();
-        Self::setPackageContextParameter(
-            &mut updatedParams,
-            PACKAGE_CALLER_OWNER_PARAM,
-            context.as_ref().map(|context| context.extensionOwner.as_str()),
-        );
-
-        ToolInvocation {
-            tool: AITool {
-                name: invocation.tool.name.clone(),
-                parameters: updatedParams,
-            },
-            rawText: invocation.rawText.clone(),
-            responseLocation: invocation.responseLocation,
         }
     }
 
@@ -810,6 +779,20 @@ pub struct ToolValidationResult {
 mod tests {
     use super::*;
 
+    /// A rejected later turn must not allow another invocation to bypass unfinished earlier work.
+    #[tokio::test]
+    async fn dropped_batch_turn_preserves_its_predecessor_dependency() {
+        let sequence = ToolBatchSequence::default();
+        let first = sequence.reserve();
+        let rejected = sequence.reserve();
+        let third = sequence.reserve();
+        drop(rejected);
+        let mut waiting = Box::pin(third.wait());
+        assert!(futures_util::poll!(&mut waiting).is_pending());
+        drop(first);
+        waiting.await;
+    }
+
     /// Keeps same-name invocation results ordered and shares their finalized markup with history.
     #[test]
     fn finalized_batch_retains_all_same_name_results_and_route_intent() {
@@ -833,6 +816,7 @@ mod tests {
     /// Creates an explicit opaque turn snapshot for task-local tests without a package-manager fixture.
     fn turn_snapshot(owner: &str) -> ToolRuntimeContext {
         ToolRuntimeContext {
+            callerName: None,
             callerChatId: Some(format!("chat:{owner}")),
             callerParticipantId: Some(format!("participant:{owner}")),
             workspacePath: None,

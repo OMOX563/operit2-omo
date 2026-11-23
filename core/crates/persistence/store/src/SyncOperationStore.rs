@@ -541,6 +541,26 @@ impl SyncOperationStore {
         }
     }
 
+    /// Captures mutable files before compression, under the same locks used by
+    /// their writers. The SQLite database and its durable sidecars are one set.
+    pub fn captureSnapshotFiles(&self, mut capture: impl FnMut(&str) -> Result<(), String>) -> Result<(), String> {
+        {
+            let _journal = lockSyncState(&self.sharedState.journal, "transaction journal").map_err(|e| e.to_string())?;
+            for name in ["transactions.sqlite", "transactions.sqlite-wal", "transactions.sqlite-journal"] {
+                capture(&format!("{}/{name}", self.rootPath))?;
+            }
+        }
+        {
+            let _versions = lockSyncState(&self.sharedState.entityVersions, "entity versions").map_err(|e| e.to_string())?;
+            capture(&self.entityVersionsPath())?;
+        }
+        {
+            let _clock = lockSyncState(&self.sharedState.clock, "clock").map_err(|e| e.to_string())?;
+            capture(&self.clockPath())?;
+        }
+        Ok(())
+    }
+
     /// Loads authority once for this host/root. Normal queries use the resulting
     /// state, and every control mutation below maintains it before returning.
     pub(crate) fn networkControlReadModel(
@@ -1869,7 +1889,11 @@ impl SyncOperationStore {
                 opId: format!("{originDeviceId}:{sequence}"), originDeviceId: originDeviceId.into(), sequence,
                 domain: operation.domain, entityType: operation.entityType, entityId: operation.entityId,
                 operation: operation.operation, semantics: operation.semantics, payload: operation.payload,
-                createdAt: currentTimeMillis()?, schemaVersion: 1,
+                // Hybrid logical clock: never stamp a local edit below a business time
+                // this journal already holds (received peer work included), so a device
+                // with a fast wall clock cannot win LWW forever. A normal local clock
+                // still wins whenever it is ahead of everything seen.
+                createdAt: currentTimeMillis()?.max(journal.highest_business_time()?.saturating_add(1)), schemaVersion: 1,
             };
             let stored = self.encodeOperationPayload(&op)?;
             journal.transaction(|tx| {
@@ -1886,8 +1910,6 @@ impl SyncOperationStore {
         cached.value = clock;
         drop(cached);
         self.recordAppliedOperation(&op)?;
-        #[cfg(feature = "full")]
-        self.collectBlobs(None);
         drop(control);
         publishSyncMutation();
         Ok(op)
@@ -2040,8 +2062,6 @@ impl SyncOperationStore {
         let control = beginControlWrite(&self.storageHost, &self.rootPath, operations.iter().any(|op| op.domain == NETWORK_CONTROL_SYNC_DOMAIN))?;
         self.withJournal(|journal| journal.complete(operations))?;
         if let Some(control) = &control { control.update(|model| model.complete(operations))?; }
-        #[cfg(feature = "full")]
-        if operations.iter().any(crate::RuntimeFileSyncStore::RuntimeFileSyncStore::isCompleteState) { self.collectBlobs(None); }
         Ok(())
     }
 

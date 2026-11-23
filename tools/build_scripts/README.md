@@ -50,9 +50,25 @@ To build only the module release using the current version sources:
 The same Android signing material and build prerequisites as the ordinary APK
 are required. This command builds packages without installing them on a phone.
 
+## Windows PowerShell 7 runtime
+
+The Windows App downloads the pinned PowerShell 7 ZIP from GitHub Releases on
+first use of the `powershell` terminal. The Windows host verifies SHA-256 before
+extracting it into `cache/powershell` under the runtime storage root. Subsequent
+sessions use the installed copy offline. Opening the terminal again after a
+network failure resumes the partial download. Connection, read-idle, and total
+download deadlines are 15 seconds, 30 seconds, and 10 minutes, respectively.
+
+The CLI ZIP includes the same self-contained distribution under `powershell/`
+for offline use. Windows PowerShell 5.1 remains in use for internal Windows
+system integration scripts. For standalone development binaries (including
+Rust terminal tests), run
+`.venv/Scripts/python.exe tools/build_scripts/windows_powershell.py --destination <binary-directory>`.
+Rust test executables run from `target/debug/deps`, so stage their runtime there.
+
 ## Windows Bash runtime
 
-Windows App ZIP/MSI and CLI ZIP packages include Bash and common Unix commands
+Windows App MSI and CLI ZIP packages include Bash and common Unix commands
 selected from checksum-pinned PortableGit under `bash/`, including their transitive
 DLL dependencies, terminal descriptions, and upstream licenses. Git, Git GUI,
 Perl, Vim aliases, and development files are excluded. The Windows host starts

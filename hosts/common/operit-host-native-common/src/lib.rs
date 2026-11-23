@@ -3,6 +3,9 @@
 #[cfg(feature = "app-install")]
 pub mod AppInstaller;
 
+#[cfg(feature = "terminal-rootfs")]
+pub mod TerminalRootfs;
+
 pub mod DartPort;
 pub mod SharedBuffer;
 
@@ -56,5 +59,8 @@ pub use Tcp::NativeTcpHost;
 #[cfg(not(any(target_os = "espidf", target_arch = "wasm32")))]
 pub use operit_host_native_scheduler::{
     scheduleNativeBlockingTask, scheduleNativeServiceTask, scheduleNativeServiceTasks,
+    runTerminalCommandSynchronously, waitForTerminalPrompt,
     NativeHostRuntimeTaskSchedulerHost, NativeTaskHandle,
 };
+#[cfg(all(unix, not(target_os = "espidf")))]
+pub use operit_host_native_scheduler::{scheduleNativeFdReader, NativeFdReader, NativeFdWriter};

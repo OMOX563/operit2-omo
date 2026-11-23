@@ -1,11 +1,13 @@
+use operit_host_api::terminalSessionKey as sessionKey;
+use operit_host_api::TerminalControl::{controlToSequence, normalizeControl};
+use operit_host_api::TerminalText::{appendPtyOutput as appendAndroidPtyOutput, dropCommandEcho, nonBlank, renderTerminalText, rfindBytes, stripPtyDeviceStatusReports, stripPtyPromptMarkers, scanPtyOutput, updatePtyCursor as updateAndroidPtyCursor, PtyCursor as AndroidPtyCursor};
 use std::collections::{BTreeMap, VecDeque};
 use std::env;
 use std::ffi::CString;
 use std::io::Write;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
-use std::thread;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
@@ -26,7 +28,6 @@ static NEXT_TERMINAL_ID: AtomicU64 = AtomicU64::new(1);
 const PTY_OUTPUT_LIMIT: usize = 16 * 1024 * 1024;
 const PTY_PROMPT_MARKER_PREFIX: &[u8] = b"\x1b]133;OperitPrompt=";
 const PTY_PROMPT_MARKER_END: u8 = 7;
-const COMMAND_CANCEL_SETTLE_TIMEOUT_MS: u64 = 3000;
 const PLATFORM: &str = "android";
 const PROOT_TERMINAL: &str = "proot";
 const ANDROID_SYSTEM_TERMINAL: &str = "android-system";
@@ -68,6 +69,7 @@ extern "C" {
 #[derive(Clone, Default)]
 pub struct AndroidTerminalHost {
     state: Arc<Mutex<AndroidTerminalState>>,
+    profile: Option<operit_host_api::TerminalProfile>,
 }
 
 #[derive(Default)]
@@ -84,7 +86,7 @@ struct AndroidPtySession {
     pid: AndroidPtyProcess,
     masterFd: RawFd,
     writer: Arc<Mutex<RawFd>>,
-    readerStop: Arc<AtomicBool>,
+    reader: Option<Box<dyn FnOnce() + Send>>,
     output: Arc<Mutex<VecDeque<u8>>>,
     commandOutput: AndroidPtyCommandOutput,
     screenOutput: Arc<Mutex<VecDeque<u8>>>,
@@ -92,7 +94,7 @@ struct AndroidPtySession {
     exitCode: Option<i32>,
 }
 
-type AndroidPtyCommandOutput = Arc<(Mutex<VecDeque<u8>>, Condvar)>;
+type AndroidPtyCommandOutput = Arc<operit_host_api::TerminalCommand::TerminalCommandBuffer>;
 
 /// Keeps remote process ownership distinct from local child PIDs.
 #[derive(Clone, Copy, Debug)]
@@ -101,18 +103,13 @@ enum AndroidPtyProcess {
     Shizuku(i32),
 }
 
-#[derive(Debug)]
-struct AndroidPtyCursor {
-    row: usize,
-    col: usize,
-}
-
 type AndroidPtyCursorState = Arc<Mutex<AndroidPtyCursor>>;
 
 impl Drop for AndroidPtySession {
     /// Stops the reader before releasing its separately owned write handle.
     fn drop(&mut self) {
-        self.readerStop.store(true, Ordering::Release);
+        self.commandOutput.fail(HostError::new("Terminal session was closed"));
+        if let Some(close) = self.reader.take() { close(); }
         #[cfg(target_os = "android")]
         unsafe {
             terminateAndroidPtyProcess(self.pid);
@@ -148,6 +145,7 @@ impl AndroidTerminalHost {
         let normalizedTerminalType = requireAndroidTerminal(terminal, terminalType)?;
         let workDir = nonBlank(workingDir, "working_directory")?;
         let session = createAndroidPtySession(
+            self.profile.as_ref(),
             normalizedSessionName,
             normalizedTerminalType,
             workDir,
@@ -203,16 +201,18 @@ impl AndroidTerminalHost {
         Ok(exitCode)
     }
 
+    /// Removes session mappings before tearing down its process outside the registry lock.
     pub fn closePtySession(&self, sessionId: &str) -> HostResult<()> {
-        let mut state = self.lockState()?;
-        let removed = state.ptySessions.remove(sessionId);
-        if removed.is_none() {
-            androidLogError(&format!("closePtySession missing sessionId={sessionId}"));
-            return Err(HostError::new(format!(
-                "Android PTY session does not exist: {sessionId}"
-            )));
-        }
-        removeAndroidSessionMappings(&mut state, sessionId);
+        let removed = {
+            let mut state = self.lockState()?;
+            let removed = state.ptySessions.remove(sessionId).ok_or_else(|| {
+                HostError::new(format!("Android PTY session does not exist: {sessionId}"))
+            })?;
+            removeAndroidSessionMappings(&mut state, sessionId);
+            removed
+        };
+        // Process teardown may block and must not hold the terminal registry lock.
+        drop(removed);
         Ok(())
     }
 
@@ -228,6 +228,97 @@ impl AndroidTerminalHost {
 }
 
 impl TerminalHost for AndroidTerminalHost {
+    /// Offers ARM64 rootfs archives only on Android devices executing that architecture.
+    fn terminalDistributions(&self) -> HostResult<Vec<operit_host_api::TerminalDistribution>> {
+        if std::env::consts::ARCH != "aarch64" {
+            return Ok(Vec::new());
+        }
+        Ok(operit_host_native_common::TerminalRootfs::distributions())
+    }
+
+    /// Installs each downloaded distribution into its own device-local rootfs directory.
+    fn installTerminalDistribution(
+        &self,
+        distributionId: &str,
+        instanceId: &str,
+        name: &str,
+        control: operit_host_api::HttpDownloadControl,
+        progress: operit_host_api::TerminalInstallProgressCallback,
+    ) -> HostResult<operit_host_api::TerminalProfile> {
+        if std::env::consts::ARCH != "aarch64" {
+            return Err(HostError::new(
+                "Downloadable rootfs images require an ARM64 Android host",
+            ));
+        }
+        let runtime = requiredAndroidRuntimePath("OPERIT_ANDROID_RUNTIME_ROOT")?;
+        let relative = operit_host_api::RuntimeStorageLayout::TERMINAL_ROOTFS_DIR_PATH
+            .strip_prefix("runtime/")
+            .ok_or_else(|| HostError::new("Invalid terminal storage definition"))?;
+        operit_host_native_common::TerminalRootfs::install(
+            &runtime.join(relative),
+            distributionId,
+            instanceId,
+            name,
+            PROOT_TERMINAL,
+            "bash",
+            control,
+            progress,
+        )
+    }
+
+    /// Removes only a fresh host-owned instance when durable profile registration fails.
+    fn discardTerminalDistribution(&self, instanceId: &str) -> HostResult<()> {
+        let runtime = requiredAndroidRuntimePath("OPERIT_ANDROID_RUNTIME_ROOT")?;
+        let relative = operit_host_api::RuntimeStorageLayout::TERMINAL_ROOTFS_DIR_PATH
+            .strip_prefix("runtime/")
+            .ok_or_else(|| HostError::new("Invalid terminal storage definition"))?;
+        operit_host_native_common::TerminalRootfs::discard(&runtime.join(relative), instanceId)
+    }
+
+    /// Registers user-supplied Linux root filesystems without modifying the bundled runtime.
+    fn terminalProfileSupport(&self) -> HostResult<Vec<operit_host_api::TerminalProfileSupport>> {
+        Ok(self
+            .terminalInfo()?
+            .types
+            .into_iter()
+            .map(|entry| operit_host_api::TerminalProfileSupport {
+                fields: if entry.terminal == PROOT_TERMINAL {
+                    vec!["rootfs".into()]
+                } else {
+                    Vec::new()
+                },
+                terminal: entry.terminal,
+                terminalType: entry.terminalType,
+            })
+            .collect())
+    }
+
+    /// Creates a separate PTY registry for an explicitly supplied proot root filesystem.
+    fn configuredTerminal(
+        &self,
+        profile: &operit_host_api::TerminalProfile,
+    ) -> HostResult<Arc<dyn TerminalHost>> {
+        requireAndroidTerminal(&profile.terminal, &profile.terminalType)?;
+        let rootfs = profile
+            .options
+            .get("rootfs")
+            .ok_or_else(|| HostError::new("Custom proot terminal requires rootfs"))?;
+        if profile.terminal != PROOT_TERMINAL
+            || profile.options.len() != 1
+            || !Path::new(rootfs).is_absolute()
+            || !Path::new(rootfs).is_dir()
+            || !Path::new(rootfs).join("bin/bash").is_file()
+        {
+            return Err(HostError::new(
+                "Proot rootfs must be an accessible absolute directory containing /bin/bash",
+            ));
+        }
+        Ok(Arc::new(Self {
+            state: Arc::default(),
+            profile: Some(profile.clone()),
+        }))
+    }
+
     fn resolveNativeWorkingDirectory(&self, path: &str) -> HostResult<String> {
         resolveAndroidNativeWorkingDirectory(path, &crate::document_filesystem::call)
     }
@@ -272,12 +363,14 @@ impl TerminalHost for AndroidTerminalHost {
                     terminalType: PRIMARY_TERMINAL_TYPE.to_string(),
                     available: true,
                     description: "Android proot Linux bash terminal".to_string(),
+                    nameKey: Some("terminalBuiltinAndroidLinux".into()),
                 },
                 TerminalTypeInfo {
                     terminal: ANDROID_SYSTEM_TERMINAL.to_string(),
                     terminalType: "shell".to_string(),
                     available: true,
                     description: "Android system shell terminal".to_string(),
+                    nameKey: Some("terminalBuiltinAndroidSystem".into()),
                 },
             ],
         })
@@ -383,6 +476,7 @@ impl TerminalHost for AndroidTerminalHost {
 
         let workingDir = initialAndroidWorkingDir(&normalizedTerminalType)?;
         let session = createAndroidPtySession(
+            self.profile.as_ref(),
             normalizedSessionName.clone(),
             normalizedTerminalType.clone(),
             workingDir,
@@ -412,85 +506,23 @@ impl TerminalHost for AndroidTerminalHost {
         self.executeInSessionStreaming(sessionId, command, timeoutMs, &mut |_| Ok(()))
     }
 
+    /// Runs explicit synchronous callers through the same event-driven command state.
     fn executeInSessionStreaming(
-        &self,
-        sessionId: &str,
-        command: &str,
-        timeoutMs: u64,
+        &self, sessionId: &str, command: &str, timeoutMs: u64,
         onOutput: &mut dyn FnMut(&[u8]) -> HostResult<()>,
     ) -> HostResult<TerminalCommandOutput> {
-        let normalizedSessionId = nonBlank(sessionId, "session_id")?;
-        let normalizedCommand = nonBlank(command, "command")?;
-        let commandLine = crate::terminal_command::posixCommandLine(&normalizedCommand);
-        let (terminalType, commandOutput, writer) = {
-            let mut state = self.lockState()?;
-            let session = state
-                .ptySessions
-                .get_mut(&normalizedSessionId)
-                .ok_or_else(|| {
-                    HostError::new(format!("Terminal session does not exist: {sessionId}"))
-                })?;
-            if session.commandRunning {
-                return Err(HostError::new(
-                    "Terminal session already has a command in progress",
-                ));
-            }
-            clearAndroidPtyCommandOutput(&session.commandOutput)?;
-            let commandInput = format!("{commandLine}\r");
-            writeAndroidPtyBytes(&session.writer, commandInput.as_bytes())?;
-            session.commandRunning = true;
-            (
-                session.terminalType.clone(),
-                session.commandOutput.clone(),
-                session.writer.clone(),
-            )
-        };
-        let result = executeAndroidPtyCommandInSession(
-            commandOutput.clone(),
-            &commandLine,
-            timeoutMs,
-            onOutput,
-        );
-        // Keep the session busy until the shell has acknowledged the interrupt.
-        // Waiting outside the registry lock leaves input and close available.
-        let settledDirectory = if result.as_ref().map_or(true, |receipt| receipt.timedOut) {
-            cancelTimedOutAndroidPtyCommand(&writer, &commandOutput).map(Some)
-        } else {
-            Ok(result.as_ref().ok().and_then(|receipt| receipt.workingDir.clone()))
-        };
-        if let Err(error) = settledDirectory {
-            let removed = {
-                let mut state = self.lockState()?;
-                removeAndroidSessionMappings(&mut state, &normalizedSessionId);
-                state.ptySessions.remove(&normalizedSessionId)
-            };
-            drop(removed);
-            return Err(HostError::new(format!(
-                "Terminal session {normalizedSessionId} closed because its command could not be interrupted: {}",
-                error.message,
-            )));
-        }
-        {
-            let mut state = self.lockState()?;
-            if let Some(session) = state.ptySessions.get_mut(&normalizedSessionId) {
-                session.commandRunning = false;
-                if let Some(workingDir) = settledDirectory? {
-                    session.workingDir = workingDir;
-                }
-            }
-        }
-        let result = result?;
-        Ok(TerminalCommandOutput {
-            command: normalizedCommand,
-            output: result.output,
-            exitCode: result.exitCode,
-            sessionId: normalizedSessionId,
-            platform: PLATFORM.to_string(),
-            terminal: androidTerminalName(&terminalType)?.to_string(),
-            terminalType,
-            timedOut: result.timedOut,
-        })
+        operit_host_native_common::runTerminalCommandSynchronously(
+            Box::new(self.beginCommand(sessionId, command, timeoutMs)?), onOutput,
+        )
     }
+
+    /// Returns command state whose output waits never occupy a host worker.
+    fn beginInSessionStreaming(self: Arc<Self>, sessionId: String, command: String, timeoutMs: u64)
+        -> HostResult<Box<dyn operit_host_api::TerminalCommand::TerminalCommandExecution>> {
+        Ok(Box::new(self.beginCommand(&sessionId, &command, timeoutMs)?))
+    }
+
+
 
     fn executeHiddenCommand(
         &self,
@@ -549,24 +581,32 @@ impl TerminalHost for AndroidTerminalHost {
 
     fn closeSession(&self, sessionId: &str) -> HostResult<TerminalCloseOutput> {
         let normalizedSessionId = nonBlank(sessionId, "session_id")?;
-        let mut state = self.lockState()?;
-        state
-            .ptySessions
-            .remove(&normalizedSessionId)
-            .ok_or_else(|| {
-                HostError::new(format!("Terminal session does not exist: {sessionId}"))
-            })?;
-        state
-            .sessionNameToId
-            .retain(|_, value| value != &normalizedSessionId);
-        state
-            .hiddenExecutorKeyToSessionId
-            .retain(|_, value| value != &normalizedSessionId);
+        self.closePtySession(&normalizedSessionId)?;
         Ok(TerminalCloseOutput {
             sessionId: normalizedSessionId.clone(),
             success: true,
             message: format!("Terminal session closed: {normalizedSessionId}"),
         })
+    }
+
+    fn closeSessionIfIdle(&self, sessionId: &str, sessionName: &str) -> HostResult<TerminalCloseOutput> {
+        let id = nonBlank(sessionId, "session_id")?;
+        let name = nonBlank(sessionName, "session_name")?;
+        let mut state = self.lockState()?;
+        let session = state.ptySessions.get(&id)
+            .ok_or_else(|| HostError::new(format!("Terminal session does not exist: {id}")))?;
+        if !operit_host_api::terminalSessionNameMatches(&session.sessionName, &name) {
+            return Err(HostError::new("Terminal session name does not match"));
+        }
+        if session.commandRunning {
+            return Err(HostError::new("Terminal session has a command in progress"));
+        }
+        let removed = state.ptySessions.remove(&id);
+        state.sessionNameToId.retain(|_, value| value != &id);
+        state.hiddenExecutorKeyToSessionId.retain(|_, value| value != &id);
+        drop(state);
+        drop(removed);
+        Ok(TerminalCloseOutput { sessionId: id.clone(), success: true, message: format!("Idle terminal session closed: {id}") })
     }
 
     fn getSessionScreen(&self, sessionId: &str) -> HostResult<TerminalScreenOutput> {
@@ -598,12 +638,197 @@ impl TerminalHost for AndroidTerminalHost {
     }
 }
 
-struct AndroidSessionCommandResult {
-    output: String,
-    exitCode: i32,
-    timedOut: bool,
+
+/// Owns command parsing independently of the executor thread awaiting terminal events.
+struct CooperativeCommand {
+    host: AndroidTerminalHost,
+    sessionId: String,
+    command: String,
+    terminalType: String,
+    commandEcho: String,
+    commandOutput: AndroidPtyCommandOutput,
+    timeoutMs: u64,
+    collected: Vec<u8>,
     workingDir: Option<String>,
+    writer: Arc<Mutex<RawFd>>,
 }
+
+impl AndroidTerminalHost {
+    /// Submits one command and reserves its session before asynchronous observation begins.
+    fn beginCommand(
+        &self,
+        sessionId: &str,
+        command: &str,
+        timeoutMs: u64,
+    ) -> HostResult<CooperativeCommand> {
+        let normalizedSessionId = nonBlank(sessionId, "session_id")?;
+        let normalizedCommand = nonBlank(command, "command")?;
+        let commandLine = crate::terminal_command::posixCommandLine(&normalizedCommand);
+        let (terminalType, commandOutput, writer) = {
+            let mut state = self.lockState()?;
+            let session = state
+                .ptySessions
+                .get_mut(&normalizedSessionId)
+                .ok_or_else(|| {
+                    HostError::new(format!("Terminal session does not exist: {sessionId}"))
+                })?;
+            if session.commandRunning {
+                return Err(HostError::new(
+                    "Terminal session already has a command in progress",
+                ));
+            }
+            clearAndroidPtyCommandOutput(&session.commandOutput)?;
+            let commandInput = format!("{commandLine}\r");
+            writeAndroidPtyBytes(&session.writer, commandInput.as_bytes())?;
+            session.commandRunning = true;
+            (
+                session.terminalType.clone(),
+                session.commandOutput.clone(),
+                session.writer.clone(),
+            )
+        };
+        Ok(CooperativeCommand {
+            host: self.clone(),
+            commandEcho: commandLine,
+            sessionId: normalizedSessionId,
+            command: normalizedCommand,
+            terminalType,
+            commandOutput,
+            timeoutMs,
+            collected: Vec::new(),
+            workingDir: None,
+            writer,
+        })
+    }
+}
+
+impl operit_host_api::TerminalCommand::TerminalCommandExecution for CooperativeCommand {
+    /// Registers a wakeup and parses available protocol records without waiting.
+    fn pollOutput(
+        &mut self,
+        context: &mut std::task::Context<'_>,
+        expired: bool,
+        onOutput: &mut dyn FnMut(&[u8]) -> HostResult<()>,
+    ) -> std::task::Poll<HostResult<TerminalCommandOutput>> {
+        let result = (|| -> HostResult<Option<TerminalCommandOutput>> {
+            let previousLength = self.collected.len();
+            let readerError = self.commandOutput.pollDrain(context, &mut self.collected)?;
+            if self.collected.len() > previousLength {
+                onOutput(&self.collected[previousLength..])?;
+            }
+            if self.timeoutMs == 0 && self.collected.len() > PTY_OUTPUT_LIMIT {
+                self.collected
+                    .drain(..self.collected.len() - PTY_OUTPUT_LIMIT);
+            }
+            let (output, exitCode, timedOut) =
+                if let Some(marker) = findLastAndroidPtyPromptMarker(&self.collected)? {
+                    let output = androidPtyCompletedCommandOutputText(
+                        &self.collected,
+                        &self.commandEcho,
+                        marker.start,
+                    );
+                    self.workingDir = Some(marker.workingDir);
+                    (output, marker.exitCode, false)
+                } else {
+                    if let Some(error) = readerError {
+                        return Err(error);
+                    }
+                    if !expired {
+                        return Ok(None);
+                    }
+                    (
+                        androidPtyTimedOutCommandOutputText(&self.collected, &self.commandEcho),
+                        -1,
+                        true,
+                    )
+                };
+            Ok(Some(TerminalCommandOutput {
+                command: self.command.clone(),
+                output,
+                exitCode,
+                sessionId: self.sessionId.clone(),
+                platform: PLATFORM.to_string(),
+                terminal: androidTerminalName(&self.terminalType)?.to_string(),
+                terminalType: self.terminalType.clone(),
+                timedOut,
+            }))
+        })();
+        match result {
+            Ok(Some(receipt)) => std::task::Poll::Ready(Ok(receipt)),
+            Ok(None) => std::task::Poll::Pending,
+            Err(error) => std::task::Poll::Ready(Err(error)),
+        }
+    }
+
+    /// Keeps execution lifetime independent from the foreground observation deadline.
+    fn timeoutMs(&self) -> u64 {
+        self.timeoutMs
+    }
+
+    /// Sends Ctrl+C on the finite OS boundary without retaining the session registry lock.
+    fn beginInterrupt(&mut self) -> HostResult<()> {
+        self.commandOutput.clear()?;
+        self.collected.clear();
+        writeAndroidPtyBytes(&self.writer, b"\x03")?;
+        Ok(())
+    }
+
+    /// Awaits the shell readiness marker through output notifications, including silent close.
+    fn pollInterrupt(
+        &mut self,
+        context: &mut std::task::Context<'_>,
+        expired: bool,
+    ) -> std::task::Poll<HostResult<()>> {
+        let result = (|| -> HostResult<Option<()>> {
+            let readerError = self.commandOutput.pollDrain(context, &mut self.collected)?;
+            if let Some(marker) = findLastAndroidPtyPromptMarker(&self.collected)? {
+                self.workingDir = Some(marker.workingDir);
+                return Ok(Some(()));
+            }
+            if let Some(error) = readerError {
+                return Err(error);
+            }
+            if expired {
+                return Err(HostError::new(
+                    "Timed out waiting for the interrupted terminal to become ready",
+                ));
+            }
+            Ok(None)
+        })();
+        match result {
+            Ok(Some(())) => std::task::Poll::Ready(Ok(())),
+            Ok(None) => std::task::Poll::Pending,
+            Err(error) => std::task::Poll::Ready(Err(error)),
+        }
+    }
+
+    /// Releases the busy flag only after completion, or closes an unresponsive session.
+    fn finish(
+        self: Box<Self>,
+        result: HostResult<TerminalCommandOutput>,
+        settled: HostResult<()>,
+    ) -> HostResult<TerminalCommandOutput> {
+        let mut state = self.host.lockState()?;
+        if let Err(error) = settled {
+            removeAndroidSessionMappings(&mut state, &self.sessionId);
+            let removed = state.ptySessions.remove(&self.sessionId);
+            drop(state);
+            drop(removed);
+            return Err(HostError::new(format!(
+                "Terminal session {} closed because its command could not be interrupted: {}",
+                self.sessionId, error.message
+            )));
+        }
+        if let Some(session) = state.ptySessions.get_mut(&self.sessionId) {
+            session.commandRunning = false;
+            if let Some(workingDir) = &self.workingDir {
+                session.workingDir = workingDir.clone();
+            }
+        }
+        result
+    }
+}
+
 
 fn hiddenAndroidPtySessionId(
     host: &AndroidTerminalHost,
@@ -623,6 +848,7 @@ fn hiddenAndroidPtySessionId(
     }
 
     let session = createAndroidPtySession(
+        host.profile.as_ref(),
         format!("hidden:{executorLabel}"),
         terminalType.to_string(),
         initialAndroidWorkingDir(terminalType)?,
@@ -639,6 +865,7 @@ fn hiddenAndroidPtySessionId(
 }
 
 fn createAndroidPtySession(
+    profile: Option<&operit_host_api::TerminalProfile>,
     sessionName: String,
     terminalType: String,
     workingDir: String,
@@ -648,47 +875,53 @@ fn createAndroidPtySession(
     androidLogInfo(&format!(
         "createAndroidPtySession start name={sessionName} type={terminalType} workingDir={workingDir} size={rows}x{cols}"
     ));
-    let command = buildAndroidPtyCommand(&terminalType, &workingDir)?;
+    let command = match profile {
+        Some(profile) => buildAndroidProfileCommand(profile, &workingDir)?,
+        None => buildAndroidPtyCommand(&terminalType, &workingDir)?,
+    };
     let (pid, readerFd, masterFd) = startAndroidPtyProcess(&command, rows, cols)?;
     androidLogInfo(&format!(
         "createAndroidPtySession forked pid={pid:?} masterFd={masterFd} name={sessionName}"
     ));
     let writer = Arc::new(Mutex::new(masterFd));
-    let readerStop = Arc::new(AtomicBool::new(false));
     let output = Arc::new(Mutex::new(VecDeque::new()));
     let commandOutput: AndroidPtyCommandOutput =
-        Arc::new((Mutex::new(VecDeque::new()), Condvar::new()));
+        Arc::new(operit_host_api::TerminalCommand::TerminalCommandBuffer::new(PTY_OUTPUT_LIMIT));
     let screenOutput = Arc::new(Mutex::new(VecDeque::new()));
     let cursorState: AndroidPtyCursorState =
         Arc::new(Mutex::new(AndroidPtyCursor { row: 1, col: 1 }));
-    let session = AndroidPtySession {
+    let mut session = AndroidPtySession {
         sessionName,
         terminalType,
         workingDir: command.workingDir.unwrap_or(workingDir),
         pid,
         masterFd,
         writer: writer.clone(),
-        readerStop: readerStop.clone(),
+        reader: None,
         output: output.clone(),
         commandOutput: commandOutput.clone(),
         screenOutput: screenOutput.clone(),
         commandRunning: false,
         exitCode: None,
     };
-    scheduleAndroidPtyReader(
+    session.reader = Some(scheduleAndroidPtyReader(
         readerFd,
-        readerStop,
         writer.clone(),
         output.clone(),
         commandOutput.clone(),
         screenOutput.clone(),
         cursorState,
-    )?;
+    )?);
     if let Some(input) = command.startupInput {
         writeAndroidPtyBytes(&writer, input.as_bytes())?;
     }
     if let Err(error) =
-        waitForInitialAndroidPtyPrompt(commandOutput.clone(), Duration::from_millis(10000))
+        operit_host_native_common::waitForTerminalPrompt(
+        &commandOutput,
+        10000,
+        |bytes| findLastAndroidPtyPromptMarker(bytes).map(|marker| marker.is_some()),
+        androidPtyStartupError,
+    )
     {
         androidLogError(&format!(
             "createAndroidPtySession initial prompt failed pid={pid:?} masterFd={masterFd} name={}: {error}", session.sessionName
@@ -703,203 +936,77 @@ fn createAndroidPtySession(
     Ok(session)
 }
 
-/// Gives the reader task exclusive descriptor ownership even if scheduling fails.
-struct AndroidPtyReaderFd(RawFd);
-
-impl Drop for AndroidPtyReaderFd {
-    /// Releases the read handle only after the reader has stopped using it.
-    fn drop(&mut self) {
-        #[cfg(target_os = "android")]
-        unsafe {
-            libc::close(self.0);
-        }
-    }
-}
-
-/// Schedules the PTY reader on bounded Host service capacity.
+/// Registers terminal read readiness without holding a service worker or polling a timer.
 fn scheduleAndroidPtyReader(
-    masterFd: RawFd,
-    stopped: Arc<AtomicBool>,
-    writer: Arc<Mutex<RawFd>>,
-    output: Arc<Mutex<VecDeque<u8>>>,
-    commandOutput: AndroidPtyCommandOutput,
-    screenOutput: Arc<Mutex<VecDeque<u8>>>,
+    readerFd: RawFd, writer: Arc<Mutex<RawFd>>, output: Arc<Mutex<VecDeque<u8>>>,
+    commandOutput: AndroidPtyCommandOutput, screenOutput: Arc<Mutex<VecDeque<u8>>>,
     cursorState: AndroidPtyCursorState,
-) -> HostResult<()> {
-    androidLogInfo(&format!("Android PTY reader thread start fd={masterFd}"));
-    let descriptor = AndroidPtyReaderFd(masterFd);
-    operit_host_native_common::scheduleNativeServiceTask("android-pty-reader", move || {
-        let descriptor = descriptor;
-        while !stopped.load(Ordering::Acquire) {
-            match readPtyFd(descriptor.0) {
-                Ok(data) if data.is_empty() => thread::sleep(Duration::from_millis(20)),
-                Ok(data) => {
-                    processAndroidPtyTerminalQueries(&writer, &cursorState, &data);
-                    let commandChunk = stripAndroidPtyDeviceStatusReports(&data);
-                    let visibleChunk = stripAndroidPtyPromptMarkers(&commandChunk);
-                    appendAndroidPtyOutput(&output, &visibleChunk);
-                    appendAndroidPtyOutput(&screenOutput, &visibleChunk);
-                    appendAndroidPtyCommandOutput(&commandOutput, &commandChunk);
-                }
-                Err(error) => {
-                    androidLogError(&format!(
-                        "Android PTY reader thread exit fd={masterFd}: {error}"
-                    ));
-                    break;
-                }
+) -> HostResult<Box<dyn FnOnce() + Send>> {
+    #[cfg(target_os = "android")]
+    {
+        use std::os::fd::{FromRawFd, OwnedFd};
+        let descriptor = unsafe { OwnedFd::from_raw_fd(readerFd) };
+        {
+            // Shizuku transports use separate read/write pipes, so configure the writer explicitly.
+            let fd = writer.lock().map_err(|_| HostError::new("Android PTY writer state poisoned"))?;
+            let flags = unsafe { libc::fcntl(*fd, libc::F_GETFL) };
+            if flags < 0 || unsafe { libc::fcntl(*fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+                return Err(std::io::Error::last_os_error().into());
             }
         }
-    })
-    .map(|_| ())
-}
-
-fn appendAndroidPtyOutput(output: &Arc<Mutex<VecDeque<u8>>>, data: &[u8]) {
-    if let Ok(mut buffer) = output.lock() {
-        buffer.extend(data.iter().copied());
-        while buffer.len() > PTY_OUTPUT_LIMIT {
-            buffer.pop_front();
-        }
+        let closed = commandOutput.clone();
+        let reader = operit_host_native_common::scheduleNativeFdReader("android-pty-reader", descriptor,
+            move |data| {
+                processAndroidPtyTerminalQueries(&writer, &cursorState, data)?;
+                let commandChunk = stripPtyDeviceStatusReports(data);
+                let visibleChunk = stripPtyPromptMarkers(&commandChunk);
+                appendAndroidPtyOutput(&output, &visibleChunk, PTY_OUTPUT_LIMIT);
+                appendAndroidPtyOutput(&screenOutput, &visibleChunk, PTY_OUTPUT_LIMIT);
+                appendAndroidPtyCommandOutput(&commandOutput, &commandChunk);
+                Ok(())
+            },
+            move |error| closed.fail(HostError::new(format!("Android PTY reached EOF or stopped: {}", error.message))),
+        )?;
+        Ok(Box::new(move || {
+            if let Err(error) = reader.close() { androidLogError(&error.message); }
+        }))
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = (readerFd, writer, output, commandOutput, screenOutput, cursorState);
+        Err(HostError::new("Android PTY is only available on Android target"))
     }
 }
 
-fn appendAndroidPtyCommandOutput(output: &AndroidPtyCommandOutput, data: &[u8]) {
-    let (lock, condvar) = &**output;
-    if let Ok(mut buffer) = lock.lock() {
-        buffer.extend(data.iter().copied());
-        while buffer.len() > PTY_OUTPUT_LIMIT {
-            buffer.pop_front();
-        }
-        condvar.notify_all();
-    }
-}
+/// Uses the session-owned event buffer for command output.
+fn appendAndroidPtyCommandOutput(output: &AndroidPtyCommandOutput, data: &[u8]) { output.append(data); }
 
+/// Answers terminal cursor queries on the finite OS boundary without blocking output observation.
 fn processAndroidPtyTerminalQueries(
     writer: &Arc<Mutex<RawFd>>,
     cursorState: &AndroidPtyCursorState,
     data: &[u8],
-) {
-    let mut index = 0usize;
-    while index < data.len() {
-        if data[index..].starts_with(b"\x1b[6n") {
-            if let Ok(cursor) = cursorState.lock() {
-                let response = format!("\x1b[{};{}R", cursor.row, cursor.col);
-                let _ = writeAndroidPtyBytes(writer, response.as_bytes());
-            }
-            index += 4;
-            continue;
-        }
-        if data[index..].starts_with(PTY_PROMPT_MARKER_PREFIX) {
-            let payloadStart = index + PTY_PROMPT_MARKER_PREFIX.len();
-            if let Some(relativeEnd) = data[payloadStart..]
-                .iter()
-                .position(|value| *value == PTY_PROMPT_MARKER_END)
-            {
-                index = payloadStart + relativeEnd + 1;
-                continue;
-            }
-        }
-        if data[index] == b'\x1b' {
-            if index + 1 < data.len() && data[index + 1] == b'[' {
-                index += 2;
-                while index < data.len() {
-                    let value = data[index];
-                    index += 1;
-                    if value >= b'@' && value <= b'~' {
-                        break;
-                    }
-                }
-                continue;
-            }
-            if index + 1 < data.len() && data[index + 1] == b']' {
-                index += 2;
-                while index < data.len() {
-                    let value = data[index];
-                    index += 1;
-                    if value == PTY_PROMPT_MARKER_END {
-                        break;
-                    }
-                }
-                continue;
-            }
-        }
-        updateAndroidPtyCursor(cursorState, data[index]);
-        index += 1;
-    }
-}
-
-fn updateAndroidPtyCursor(cursorState: &AndroidPtyCursorState, value: u8) {
-    if let Ok(mut cursor) = cursorState.lock() {
-        match value {
-            b'\r' => cursor.col = 1,
-            b'\n' => {
-                cursor.row += 1;
-                cursor.col = 1;
-            }
-            8 => {
-                if cursor.col > 1 {
-                    cursor.col -= 1;
-                }
-            }
-            0x20..=0x7e => cursor.col += 1,
-            _ => {}
-        }
-    }
-}
-
-fn clearAndroidPtyCommandOutput(output: &AndroidPtyCommandOutput) -> HostResult<()> {
-    let (lock, _) = &**output;
-    let mut buffer = lock
-        .lock()
-        .map_err(|_| HostError::new("android pty command output mutex poisoned"))?;
-    buffer.clear();
-    Ok(())
-}
-
-fn waitForInitialAndroidPtyPrompt(
-    output: AndroidPtyCommandOutput,
-    timeout: Duration,
 ) -> HostResult<()> {
-    androidLogInfo(&format!(
-        "waitForInitialAndroidPtyPrompt start timeoutMs={}",
-        timeout.as_millis()
-    ));
-    let deadline = Instant::now() + timeout;
-    let mut collected = Vec::new();
-    let mut promptSeenAt = None;
-    let quietPeriod = Duration::from_millis(150);
-    loop {
-        let drained = drainAndroidPtyCommandOutput(&output, &mut collected, deadline)?;
-        if drained > 0 {
-            promptSeenAt = None;
-        }
-        if findLastAndroidPtyPromptMarker(&collected)?.is_some() && promptSeenAt.is_none() {
-            androidLogInfo(&format!(
-                "waitForInitialAndroidPtyPrompt marker seen bytes={}",
-                collected.len()
-            ));
-            promptSeenAt = Some(Instant::now());
-        }
-        if promptSeenAt.is_some_and(|seenAt| seenAt.elapsed() >= quietPeriod) {
-            androidLogInfo(&format!(
-                "waitForInitialAndroidPtyPrompt ready bytes={}",
-                collected.len()
-            ));
-            return Ok(());
-        }
-        if Instant::now() >= deadline {
-            androidLogError(&format!(
-                "Timed out waiting for Android terminal prompt bytes={} output={}",
-                collected.len(),
-                androidPtyLogSnippet(&collected)
-            ));
-            return Err(androidPtyStartupError(&collected));
-        }
-    }
+    scanPtyOutput(data, || {
+        let response = {
+            let cursor = cursorState.lock().map_err(|_| HostError::new("PTY cursor state poisoned"))?;
+            format!("\x1b[{};{}R", cursor.row, cursor.col)
+        };
+        let writer = writer.clone();
+        operit_host_native_common::scheduleNativeBlockingTask("terminal-cursor-response", move || {
+            writeAndroidPtyBytes(&writer, response.as_bytes()).map(|_| ())
+        })?;
+        Ok(())
+    }, |value| updateAndroidPtyCursor(cursorState, value))
 }
+
+/// Uses the session-owned event buffer for command output.
+fn clearAndroidPtyCommandOutput(output: &AndroidPtyCommandOutput) -> HostResult<()> { output.clear() }
+
 
 /// Preserves startup diagnostics in the error returned to terminal callers and tools.
 fn androidPtyStartupError(data: &[u8]) -> HostError {
-    let visibleBytes = stripAndroidPtyPromptMarkers(data);
+    let visibleBytes = stripPtyPromptMarkers(data);
     let visibleOutput = renderTerminalText(&String::from_utf8_lossy(&visibleBytes));
     HostError::new(format!(
         "Timed out waiting for Android terminal prompt\nStartup output:\n{}",
@@ -907,114 +1014,6 @@ fn androidPtyStartupError(data: &[u8]) -> HostError {
     ))
 }
 
-/// Produces a compact terminal-output snippet for Android diagnostic logs.
-fn androidPtyLogSnippet(data: &[u8]) -> String {
-    const MAX_LOG_BYTES: usize = 4096;
-    let start = data.len().saturating_sub(MAX_LOG_BYTES);
-    String::from_utf8_lossy(&data[start..])
-        .replace('\x1b', "\\x1b")
-        .replace('\r', "\\r")
-        .replace('\n', "\\n")
-}
-
-fn executeAndroidPtyCommandInSession(
-    output: AndroidPtyCommandOutput,
-    command: &str,
-    timeoutMs: u64,
-    onOutput: &mut dyn FnMut(&[u8]) -> HostResult<()>,
-) -> HostResult<AndroidSessionCommandResult> {
-    let deadline = (timeoutMs != 0).then(|| Instant::now() + Duration::from_millis(timeoutMs));
-    let mut collected = Vec::new();
-    let mut promptSeenAt = None;
-    let quietPeriod = Duration::from_millis(150);
-    loop {
-        let previousLength = collected.len();
-        let waitDeadline = deadline.unwrap_or_else(|| Instant::now() + Duration::from_millis(100));
-        let drained = drainAndroidPtyCommandOutput(&output, &mut collected, waitDeadline)?;
-        onOutput(&collected[previousLength..])?;
-        if timeoutMs == 0 && collected.len() > PTY_OUTPUT_LIMIT {
-            collected.drain(..collected.len() - PTY_OUTPUT_LIMIT);
-        }
-        if drained > 0 {
-            promptSeenAt = None;
-        }
-        if let Some(marker) = findLastAndroidPtyPromptMarker(&collected)? {
-            if promptSeenAt.is_none() {
-                promptSeenAt = Some(Instant::now());
-            }
-            if !promptSeenAt.is_some_and(|seenAt| seenAt.elapsed() >= quietPeriod) {
-                if deadline.map_or(true, |deadline| Instant::now() < deadline) {
-                    continue;
-                }
-            }
-            let output = androidPtyCompletedCommandOutputText(&collected, command, marker.start);
-            return Ok(AndroidSessionCommandResult {
-                output,
-                exitCode: marker.exitCode,
-                timedOut: false,
-                workingDir: Some(marker.workingDir),
-            });
-        }
-        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-            let output = androidPtyTimedOutCommandOutputText(&collected, command);
-            return Ok(AndroidSessionCommandResult {
-                output,
-                exitCode: -1,
-                timedOut: true,
-                workingDir: None,
-            });
-        }
-    }
-}
-
-/// Interrupts the foreground job and requires the interactive shell to acknowledge readiness.
-fn cancelTimedOutAndroidPtyCommand(
-    writer: &Arc<Mutex<RawFd>>,
-    output: &AndroidPtyCommandOutput,
-) -> HostResult<String> {
-    writeAndroidPtyBytes(writer, b"\x03")?;
-
-    let deadline = Instant::now() + Duration::from_millis(COMMAND_CANCEL_SETTLE_TIMEOUT_MS);
-    let mut collected = Vec::new();
-    while Instant::now() < deadline {
-        let drained =
-            drainAndroidPtyCommandOutput(output, &mut collected, deadline)?;
-        if drained == 0 {
-            continue;
-        }
-        if let Some(marker) = findLastAndroidPtyPromptMarker(&collected)? {
-            return Ok(marker.workingDir);
-        }
-    }
-    Err(HostError::new("Timed out waiting for the interrupted Android terminal to become ready"))
-}
-
-fn drainAndroidPtyCommandOutput(
-    output: &AndroidPtyCommandOutput,
-    collected: &mut Vec<u8>,
-    deadline: Instant,
-) -> HostResult<usize> {
-    let (lock, condvar) = &**output;
-    let mut buffer = lock
-        .lock()
-        .map_err(|_| HostError::new("android pty command output mutex poisoned"))?;
-    if buffer.is_empty() {
-        let now = Instant::now();
-        if now < deadline {
-            let wait = (deadline - now).min(Duration::from_millis(100));
-            let result = condvar
-                .wait_timeout(buffer, wait)
-                .map_err(|_| HostError::new("android pty command output mutex poisoned"))?;
-            buffer = result.0;
-        }
-    }
-    let mut drained = 0usize;
-    while let Some(value) = buffer.pop_front() {
-        collected.push(value);
-        drained += 1;
-    }
-    Ok(drained)
-}
 
 #[derive(Clone, Debug)]
 struct AndroidPtyPromptMarker {
@@ -1057,24 +1056,15 @@ fn findLastAndroidPtyPromptMarker(data: &[u8]) -> HostResult<Option<AndroidPtyPr
     }))
 }
 
-fn rfindBytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() || haystack.len() < needle.len() {
-        return None;
-    }
-    haystack
-        .windows(needle.len())
-        .rposition(|window| window == needle)
-}
-
 fn androidPtyCompletedCommandOutputText(raw: &[u8], command: &str, promptStart: usize) -> String {
-    let visibleBytes = stripAndroidPtyPromptMarkers(&raw[..promptStart]);
+    let visibleBytes = stripPtyPromptMarkers(&raw[..promptStart]);
     let text = String::from_utf8_lossy(&visibleBytes);
     let clean = renderTerminalText(&text);
     dropCommandEcho(clean, command)
 }
 
 fn androidPtyTimedOutCommandOutputText(raw: &[u8], command: &str) -> String {
-    let visibleBytes = stripAndroidPtyPromptMarkers(raw);
+    let visibleBytes = stripPtyPromptMarkers(raw);
     let text = String::from_utf8_lossy(&visibleBytes);
     let clean = renderTerminalText(&text);
     dropCommandEcho(clean, command)
@@ -1086,314 +1076,9 @@ fn androidPtyScreenContent(session: &AndroidPtySession) -> HostResult<String> {
         .lock()
         .map_err(|_| HostError::new("android pty screen output mutex poisoned"))?;
     let bytes = buffer.iter().copied().collect::<Vec<_>>();
-    let visibleBytes = stripAndroidPtyPromptMarkers(&bytes);
+    let visibleBytes = stripPtyPromptMarkers(&bytes);
     let text = String::from_utf8_lossy(&visibleBytes);
     Ok(renderTerminalText(&text))
-}
-
-fn stripAndroidPtyPromptMarkers(raw: &[u8]) -> Vec<u8> {
-    let mut output = Vec::with_capacity(raw.len());
-    let mut index = 0usize;
-    while index < raw.len() {
-        if raw[index..].starts_with(PTY_PROMPT_MARKER_PREFIX) {
-            let payloadStart = index + PTY_PROMPT_MARKER_PREFIX.len();
-            if let Some(relativeEnd) = raw[payloadStart..]
-                .iter()
-                .position(|value| *value == PTY_PROMPT_MARKER_END)
-            {
-                index = payloadStart + relativeEnd + 1;
-                continue;
-            }
-        }
-        output.push(raw[index]);
-        index += 1;
-    }
-    output
-}
-
-fn stripAndroidPtyDeviceStatusReports(raw: &[u8]) -> Vec<u8> {
-    let mut output = Vec::with_capacity(raw.len());
-    let mut index = 0usize;
-    while index < raw.len() {
-        if raw[index..].starts_with(b"\x1b[6n") {
-            index += 4;
-            continue;
-        }
-        output.push(raw[index]);
-        index += 1;
-    }
-    output
-}
-
-#[derive(Default)]
-struct TerminalTextRenderer {
-    lines: Vec<Vec<char>>,
-    row: usize,
-    col: usize,
-    savedRow: usize,
-    savedCol: usize,
-}
-
-impl TerminalTextRenderer {
-    fn new() -> Self {
-        Self {
-            lines: vec![Vec::new()],
-            row: 0,
-            col: 0,
-            savedRow: 0,
-            savedCol: 0,
-        }
-    }
-
-    fn write(&mut self, value: &str) {
-        let chars = value.chars().collect::<Vec<_>>();
-        let mut index = 0usize;
-        while index < chars.len() {
-            let ch = chars[index];
-            if ch == '\x1b' {
-                index = self.consumeEscape(&chars, index);
-                continue;
-            }
-            self.writeChar(ch);
-            index += 1;
-        }
-    }
-
-    fn text(&self) -> String {
-        self.lines
-            .iter()
-            .map(|line| line.iter().collect::<String>())
-            .collect::<Vec<_>>()
-            .join("\n")
-    }
-
-    fn consumeEscape(&mut self, chars: &[char], index: usize) -> usize {
-        if index + 1 >= chars.len() {
-            return index + 1;
-        }
-        match chars[index + 1] {
-            '[' => self.consumeCsi(chars, index + 2),
-            ']' => self.consumeOsc(chars, index + 2),
-            '7' => {
-                self.savedRow = self.row;
-                self.savedCol = self.col;
-                index + 2
-            }
-            '8' => {
-                self.row = self.savedRow;
-                self.col = self.savedCol;
-                self.ensureCursorLine();
-                index + 2
-            }
-            _ => index + 2,
-        }
-    }
-
-    fn consumeOsc(&mut self, chars: &[char], mut index: usize) -> usize {
-        while index < chars.len() {
-            let ch = chars[index];
-            index += 1;
-            if ch == '\x07' {
-                break;
-            }
-            if ch == '\x1b' && index < chars.len() && chars[index] == '\\' {
-                index += 1;
-                break;
-            }
-        }
-        index
-    }
-
-    fn consumeCsi(&mut self, chars: &[char], mut index: usize) -> usize {
-        let start = index;
-        while index < chars.len() {
-            let ch = chars[index];
-            index += 1;
-            if ch >= '@' && ch <= '~' {
-                let params = chars[start..index - 1].iter().collect::<String>();
-                self.applyCsi(&params, ch);
-                break;
-            }
-        }
-        index
-    }
-
-    fn applyCsi(&mut self, params: &str, command: char) {
-        let values = csiParams(params);
-        match command {
-            'A' => self.moveRowUp(csiValue(&values, 0, 1)),
-            'B' => self.moveRowDown(csiValue(&values, 0, 1)),
-            'C' => self.col += csiValue(&values, 0, 1),
-            'D' => self.col = self.col.saturating_sub(csiValue(&values, 0, 1)),
-            'G' => self.col = csiValue(&values, 0, 1).saturating_sub(1),
-            'H' | 'f' => {
-                self.row = csiValue(&values, 0, 1).saturating_sub(1);
-                self.col = csiValue(&values, 1, 1).saturating_sub(1);
-                self.ensureCursorLine();
-            }
-            'J' => self.eraseDisplay(csiValue(&values, 0, 0)),
-            'K' => self.eraseLine(csiValue(&values, 0, 0)),
-            'X' => self.eraseChars(csiValue(&values, 0, 1)),
-            's' => {
-                self.savedRow = self.row;
-                self.savedCol = self.col;
-            }
-            'u' => {
-                self.row = self.savedRow;
-                self.col = self.savedCol;
-                self.ensureCursorLine();
-            }
-            _ => {}
-        }
-    }
-
-    fn writeChar(&mut self, ch: char) {
-        match ch {
-            '\r' => self.col = 0,
-            '\n' => {
-                self.row += 1;
-                self.col = 0;
-                self.ensureCursorLine();
-            }
-            '\x08' => {
-                self.col = self.col.saturating_sub(1);
-            }
-            '\t' => {
-                let nextStop = ((self.col / 8) + 1) * 8;
-                while self.col < nextStop {
-                    self.putChar(' ');
-                }
-            }
-            _ if ch.is_control() => {}
-            _ => self.putChar(ch),
-        }
-    }
-
-    fn putChar(&mut self, ch: char) {
-        self.ensureCursorLine();
-        let line = &mut self.lines[self.row];
-        while line.len() < self.col {
-            line.push(' ');
-        }
-        if line.len() == self.col {
-            line.push(ch);
-        } else {
-            line[self.col] = ch;
-        }
-        self.col += 1;
-    }
-
-    fn moveRowUp(&mut self, count: usize) {
-        self.row = self.row.saturating_sub(count);
-        self.ensureCursorLine();
-    }
-
-    fn moveRowDown(&mut self, count: usize) {
-        self.row += count;
-        self.ensureCursorLine();
-    }
-
-    fn eraseDisplay(&mut self, mode: usize) {
-        match mode {
-            0 => {
-                self.eraseLine(0);
-                self.lines.truncate(self.row + 1);
-            }
-            1 => {
-                for row in 0..self.row {
-                    self.lines[row].clear();
-                }
-                self.eraseLine(1);
-            }
-            2 | 3 => {
-                self.lines.clear();
-                self.lines.push(Vec::new());
-                self.row = 0;
-                self.col = 0;
-            }
-            _ => {}
-        }
-    }
-
-    fn eraseLine(&mut self, mode: usize) {
-        self.ensureCursorLine();
-        let line = &mut self.lines[self.row];
-        match mode {
-            0 => {
-                if self.col < line.len() {
-                    line.truncate(self.col);
-                }
-            }
-            1 => {
-                let end = self.col.min(line.len());
-                for cell in &mut line[..end] {
-                    *cell = ' ';
-                }
-            }
-            2 => line.clear(),
-            _ => {}
-        }
-    }
-
-    fn eraseChars(&mut self, count: usize) {
-        self.ensureCursorLine();
-        let line = &mut self.lines[self.row];
-        let end = (self.col + count).min(line.len());
-        for cell in &mut line[self.col..end] {
-            *cell = ' ';
-        }
-    }
-
-    fn ensureCursorLine(&mut self) {
-        while self.lines.len() <= self.row {
-            self.lines.push(Vec::new());
-        }
-    }
-}
-
-fn renderTerminalText(value: &str) -> String {
-    let mut renderer = TerminalTextRenderer::new();
-    renderer.write(value);
-    renderer.text()
-}
-
-fn csiParams(params: &str) -> Vec<Option<usize>> {
-    let params = params
-        .trim_start_matches('?')
-        .trim_start_matches('>')
-        .trim_start_matches('!');
-    params
-        .split(';')
-        .map(|value| {
-            if value.is_empty() {
-                None
-            } else {
-                value.parse::<usize>().ok()
-            }
-        })
-        .collect()
-}
-
-fn csiValue(values: &[Option<usize>], index: usize, defaultValue: usize) -> usize {
-    values
-        .get(index)
-        .and_then(|value| *value)
-        .unwrap_or(defaultValue)
-}
-
-fn dropCommandEcho(value: String, command: &str) -> String {
-    let mut lines = value.lines().map(str::to_string).collect::<Vec<_>>();
-    while lines.first().is_some_and(|line| line.trim().is_empty()) {
-        lines.remove(0);
-    }
-    if lines.first().is_some_and(|line| {
-        let line = line.trim_end();
-        let command = command.trim();
-        line == command || line.ends_with(command)
-    }) {
-        lines.remove(0);
-    }
-    lines.join("\n").trim().to_string()
 }
 
 fn parseAndroidExitCode(exitCodeText: &str) -> HostResult<i32> {
@@ -1430,92 +1115,6 @@ fn applyAndroidPtyTerminalInput(
         acceptedChars += sequence.chars().count();
     }
     Ok(acceptedChars)
-}
-
-fn controlToSequence(control: &str, input: Option<&str>) -> HostResult<String> {
-    match control {
-        "enter" => Ok("\n".to_string()),
-        "tab" => Ok("\t".to_string()),
-        "esc" => Ok("\x1b".to_string()),
-        "up" => Ok("\x1b[A".to_string()),
-        "down" => Ok("\x1b[B".to_string()),
-        "right" => Ok("\x1b[C".to_string()),
-        "left" => Ok("\x1b[D".to_string()),
-        "home" => Ok("\x1b[H".to_string()),
-        "end" => Ok("\x1b[F".to_string()),
-        "pageup" => Ok("\x1b[5~".to_string()),
-        "pagedown" => Ok("\x1b[6~".to_string()),
-        "delete" => Ok("\x1b[3~".to_string()),
-        "backspace" => Ok("\x7f".to_string()),
-        "ctrl" | "control" => ctrlSequence(input),
-        "alt" | "meta" | "cmd" => Ok(format!("\x1b{}", input.unwrap_or(""))),
-        "shift" => Ok(input.unwrap_or("").to_uppercase()),
-        other => Err(HostError::new(format!(
-            "Unsupported terminal control: {other}"
-        ))),
-    }
-}
-
-fn ctrlSequence(input: Option<&str>) -> HostResult<String> {
-    let input = input.ok_or_else(|| HostError::new("ctrl control requires input"))?;
-    let mut chars = input.chars();
-    let value = chars
-        .next()
-        .ok_or_else(|| HostError::new("ctrl control requires input"))?;
-    if chars.next().is_some() {
-        return Err(HostError::new(
-            "ctrl control input must be a single character",
-        ));
-    }
-    let code = match value.to_ascii_uppercase() {
-        'A'..='Z' => value.to_ascii_uppercase() as u8 - b'A' + 1,
-        '[' => 27,
-        '\\' => 28,
-        ']' => 29,
-        '^' => 30,
-        '_' => 31,
-        '?' => 127,
-        other => {
-            return Err(HostError::new(format!(
-                "Unsupported ctrl control input: {other}"
-            )))
-        }
-    };
-    Ok((code as char).to_string())
-}
-
-fn normalizeControl(rawControl: &str) -> Option<&'static str> {
-    match rawControl.trim().to_ascii_lowercase().as_str() {
-        "" => None,
-        "return" => Some("enter"),
-        "escape" => Some("esc"),
-        "arrowup" => Some("up"),
-        "arrowdown" => Some("down"),
-        "arrowleft" => Some("left"),
-        "arrowright" => Some("right"),
-        "pgup" | "page_up" => Some("pageup"),
-        "pgdn" | "page_down" => Some("pagedown"),
-        "del" => Some("delete"),
-        "enter" => Some("enter"),
-        "tab" => Some("tab"),
-        "esc" => Some("esc"),
-        "up" => Some("up"),
-        "down" => Some("down"),
-        "left" => Some("left"),
-        "right" => Some("right"),
-        "home" => Some("home"),
-        "end" => Some("end"),
-        "pageup" => Some("pageup"),
-        "pagedown" => Some("pagedown"),
-        "delete" => Some("delete"),
-        "backspace" => Some("backspace"),
-        "ctrl" | "control" => Some("ctrl"),
-        "alt" => Some("alt"),
-        "shift" => Some("shift"),
-        "meta" => Some("meta"),
-        "cmd" => Some("cmd"),
-        _ => None,
-    }
 }
 
 /// Normalizes Android terminal type names accepted by the host.
@@ -1563,14 +1162,6 @@ fn initialAndroidWorkingDir(terminalType: &str) -> HostResult<String> {
     }
 }
 
-fn nonBlank(value: &str, paramName: &str) -> HostResult<String> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        return Err(HostError::new(format!("{paramName} parameter is required")));
-    }
-    Ok(trimmed.to_string())
-}
-
 #[cfg(target_os = "android")]
 fn androidLogInfo(message: &str) {
     androidLogWrite(4, message);
@@ -1596,10 +1187,6 @@ fn androidLogWrite(priority: libc::c_int, message: &str) {
     }
 }
 
-fn sessionKey(terminalType: &str, name: &str) -> String {
-    format!("{terminalType}:{name}")
-}
-
 fn removeAndroidSessionMappings(state: &mut AndroidTerminalState, sessionId: &str) {
     state.sessionNameToId.retain(|_, value| value != sessionId);
     state
@@ -1620,6 +1207,67 @@ struct AndroidPtyCommand {
     dropRootToShell: bool,
     workingDir: Option<String>,
     startupInput: Option<String>,
+}
+
+/// Starts bash inside the user-selected proot filesystem with the managed workspace binds.
+fn buildAndroidProfileCommand(
+    profile: &operit_host_api::TerminalProfile,
+    workingDir: &str,
+) -> HostResult<AndroidPtyCommand> {
+    let rootfs = profile
+        .options
+        .get("rootfs")
+        .ok_or_else(|| HostError::new("Proot rootfs is required"))?;
+    let mut command = crate::runtime_common::buildAndroidProotCommandWithRootfs(
+        "/bin/bash",
+        Some(workingDir),
+        Path::new(rootfs),
+    )?;
+    command.env("TERM", "xterm-256color");
+    command.env("PS1", "$PWD $ ");
+    command.env("PROMPT_COMMAND", androidPtyPromptCommand());
+    command.args(["--noprofile", "--norc", "-i"]);
+    let executable = cstring(&command.get_program().to_string_lossy())?;
+    let mut argv = vec![executable.clone()];
+    for argument in command.get_args() {
+        argv.push(cstring(&argument.to_string_lossy())?);
+    }
+    let mut environment: BTreeMap<std::ffi::OsString, std::ffi::OsString> =
+        env::vars_os().collect();
+    for (key, value) in command.get_envs() {
+        match value {
+            Some(value) => {
+                environment.insert(key.into(), value.into());
+            }
+            None => {
+                environment.remove(key);
+            }
+        }
+    }
+    let envp = environment
+        .into_iter()
+        .map(|(key, value)| {
+            cstring(&format!(
+                "{}={}",
+                key.to_string_lossy(),
+                value.to_string_lossy()
+            ))
+        })
+        .collect::<HostResult<Vec<_>>>()?;
+    Ok(AndroidPtyCommand {
+        executable,
+        argv,
+        envp,
+        cwd: cstringPath(
+            command
+                .get_current_dir()
+                .ok_or_else(|| HostError::new("Proot process directory is required"))?,
+        )?,
+        shizuku: false,
+        dropRootToShell: false,
+        workingDir: None,
+        startupInput: None,
+    })
 }
 
 /// Builds the PTY startup command for an Android terminal type.
@@ -2051,6 +1699,36 @@ unsafe fn dropRootToShellIdentity() {
     }
 }
 
+/// Re-execs a standalone Android Host after applying the terminal's shell identity.
+#[cfg(target_os = "android")]
+pub fn androidExecShellProcess(arguments: &[String]) -> HostResult<()> {
+    let arguments = arguments
+        .iter()
+        .map(|argument| cstring(argument))
+        .collect::<HostResult<Vec<_>>>()?;
+    let executable = arguments
+        .first()
+        .ok_or_else(|| HostError::new("Missing Android shell executable"))?;
+    let mut pointers = arguments
+        .iter()
+        .map(|argument| argument.as_ptr())
+        .collect::<Vec<_>>();
+    pointers.push(std::ptr::null());
+    unsafe {
+        if libc::geteuid() == 0 {
+            dropRootToShellIdentity();
+        }
+        if libc::getuid() != 2000 || libc::getgid() != 2000 {
+            return Err(HostError::new("Android UI server requires shell uid/gid 2000"));
+        }
+        libc::execv(executable.as_ptr(), pointers.as_ptr());
+    }
+    Err(HostError::new(format!(
+        "Android shell exec failed: {}",
+        std::io::Error::last_os_error()
+    )))
+}
+
 /// Forks the PTY child in the current process's Android security context.
 fn forkPtyExecve(
     command: &AndroidPtyCommand,
@@ -2235,48 +1913,31 @@ fn operitTermios() -> libc::termios {
     termios
 }
 
-fn readPtyFd(fd: RawFd) -> HostResult<Vec<u8>> {
-    #[cfg(not(target_os = "android"))]
-    {
-        let _ = fd;
-        return Err(HostError::new(
-            "Android PTY is only available on Android target",
-        ));
-    }
 
-    #[cfg(target_os = "android")]
-    {
-        let mut descriptor = libc::pollfd {
-            fd,
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        let ready = unsafe { libc::poll(&mut descriptor, 1, 20) };
-        if ready < 0 {
-            if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
-                return Ok(Vec::new());
+/// Completes partial writes and retries interrupts so PTY input is never truncated.
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+fn writePtyBytesWith(
+    mut write: impl FnMut(&[u8]) -> std::io::Result<usize>,
+    data: &[u8],
+) -> std::io::Result<usize> {
+    let mut written = 0;
+    while written < data.len() {
+        match write(&data[written..]) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "PTY write accepted no bytes",
+                ));
             }
-            return Err(HostError::new("poll failed for Android PTY"));
+            Ok(count) => written += count,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
         }
-        if ready == 0 {
-            return Ok(Vec::new());
-        }
-        let mut output = vec![0u8; 64 * 1024];
-        let count = unsafe { libc::read(fd, output.as_mut_ptr().cast(), output.len()) };
-        if count < 0 {
-            if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
-                return Ok(Vec::new());
-            }
-            return Err(HostError::new("read failed for Android PTY"));
-        }
-        if count == 0 {
-            return Err(HostError::new("Android PTY reached EOF"));
-        }
-        output.truncate(count as usize);
-        Ok(output)
     }
+    Ok(written)
 }
 
+/// Writes complete PTY input with bounded waits for nonblocking backpressure.
 fn writePtyFd(fd: RawFd, data: &[u8]) -> HostResult<usize> {
     #[cfg(not(target_os = "android"))]
     {
@@ -2288,12 +1949,43 @@ fn writePtyFd(fd: RawFd, data: &[u8]) -> HostResult<usize> {
 
     #[cfg(target_os = "android")]
     {
-        let count = unsafe { libc::write(fd, data.as_ptr().cast(), data.len()) };
-        if count < 0 {
-            androidLogError(&format!("write failed fd={fd} bytes={}", data.len()));
-            return Err(HostError::new("write failed for Android PTY"));
-        }
-        Ok(count as usize)
+        let deadline = Instant::now() + Duration::from_secs(10);
+        writePtyBytesWith(
+            |remaining| loop {
+                let count =
+                    unsafe { libc::write(fd, remaining.as_ptr().cast(), remaining.len()) };
+                if count >= 0 {
+                    return Ok(count as usize);
+                }
+                let error = std::io::Error::last_os_error();
+                if error.kind() != std::io::ErrorKind::WouldBlock {
+                    return Err(error);
+                }
+                let remainingTime = deadline.saturating_duration_since(Instant::now());
+                if remainingTime.is_zero() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "Android PTY input submission timed out",
+                    ));
+                }
+                let mut descriptor = libc::pollfd { fd, events: libc::POLLOUT, revents: 0 };
+                let ready = unsafe {
+                    libc::poll(
+                        &mut descriptor,
+                        1,
+                        remainingTime.as_millis().min(i32::MAX as u128) as i32,
+                    )
+                };
+                if ready < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            },
+            data,
+        )
+        .map_err(|error| {
+            androidLogError(&format!("write failed fd={fd} bytes={}: {error}", data.len()));
+            HostError::new(format!("Android PTY input failed: {error}"))
+        })
     }
 }
 
@@ -2680,5 +2372,63 @@ mod tests {
         let error = host.createOrGetTypedSession("chat", " ").unwrap_err();
         assert_eq!(error.message, "type parameter is required");
         assert!(host.lockState().unwrap().ptySessions.is_empty());
+    }
+
+    /// A short write must not truncate the command: the remainder is submitted in order.
+    #[test]
+    fn pty_write_completes_partial_writes() {
+        let data = b"printf '%s\\n' '327429f1'\r";
+        let mut submitted = Vec::new();
+        let written = writePtyBytesWith(
+            |remaining| {
+                let count = remaining.len().min(3);
+                submitted.extend_from_slice(&remaining[..count]);
+                Ok(count)
+            },
+            data,
+        )
+        .unwrap();
+        assert_eq!(written, data.len());
+        assert_eq!(submitted, data);
+    }
+
+    /// An interrupted write is retried instead of failing or dropping the command.
+    #[test]
+    fn pty_write_retries_interrupted_writes() {
+        let data = b"echo '5c8a733d'\r";
+        let mut calls = 0;
+        let mut submitted = Vec::new();
+        let written = writePtyBytesWith(
+            |remaining| {
+                calls += 1;
+                if calls <= 2 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Interrupted,
+                        "EINTR",
+                    ));
+                }
+                let count = remaining.len().min(4);
+                submitted.extend_from_slice(&remaining[..count]);
+                Ok(count)
+            },
+            data,
+        )
+        .unwrap();
+        assert_eq!(written, data.len());
+        assert_eq!(submitted, data);
+    }
+
+    /// Zero progress and hard failures surface as errors; empty input never writes.
+    #[test]
+    fn pty_write_rejects_zero_progress_and_hard_errors() {
+        let zero = writePtyBytesWith(|_| Ok(0), b"x").unwrap_err();
+        assert_eq!(zero.kind(), std::io::ErrorKind::WriteZero);
+        let broken = writePtyBytesWith(
+            |_| Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "EPIPE")),
+            b"x",
+        )
+        .unwrap_err();
+        assert_eq!(broken.kind(), std::io::ErrorKind::BrokenPipe);
+        assert_eq!(writePtyBytesWith(|_| panic!("empty input must not write"), b"").unwrap(), 0);
     }
 }

@@ -24,6 +24,8 @@ import type {
 import { RepositorySession } from "../repository";
 import { createMemorySpace, normalizeMemoryRecallSettings } from "./state";
 import { initializeCharacterStorage } from "./initialization";
+import { readNextAutoSaveRun } from "./device-schedule";
+import { migrateCharacterAvatars } from "./avatars";
 import {
   clone,
   equal,
@@ -43,11 +45,12 @@ import {
   assertObject,
   assertString,
   assertTag,
-  assertMemorySettings,
+  normalizeMemorySettings,
   assertSearchConfig,
   requireId,
 } from "../validation";
 import { userDocumentPath } from "./state";
+import { traceCharacterLoad } from "../diagnostics";
 
 /** Requires the original Files operation result for actual user document writes. */
 function completed(result: { successful: boolean; details: string }): void {
@@ -112,11 +115,12 @@ export class DatabaseCharacterRepository implements CharacterRepositoryOwner {
     const storage = await CharacterStorage.open();
     const repository = new DatabaseCharacterRepository(storage, directory, directories);
     try {
-      await initializeCharacterStorage(storage, directory);
-      await repository.readMetadata();
+      await traceCharacterLoad(1, "storage.initialize", () => initializeCharacterStorage(storage, directory));
+      await traceCharacterLoad(1, "storage.avatars.migrate", () => migrateCharacterAvatars(storage));
+      await traceCharacterLoad(1, "storage.metadata.read", () => repository.readMetadata());
       return repository;
     } catch (error) {
-      try { await storage.close(); }
+      try { await traceCharacterLoad(1, "storage.close", () => storage.close()); }
       catch (cleanupError) { throw Object.assign(new Error("Character initialization and handle cleanup failed"), { cause: error, cleanupError }); }
       throw error;
     }
@@ -300,10 +304,10 @@ export class DatabaseCharacterRepository implements CharacterRepositoryOwner {
 
   /** Reads memory settings without loading bodies, vectors or job objects. */
   readMemorySettings(ownerKey: string): Promise<MemorySettings> {
-    return this.readOwnerMetadata(ownerKey, (row) => {
-      const settings = row.settings;
-      assertMemorySettings(settings);
-      return settings;
+    return this.readOwnerMetadata(ownerKey, async row => {
+      const settings = normalizeMemorySettings(row.settings);
+      // The synchronized record carries a zero placeholder; this device reads its own cursor.
+      return { ...settings, nextAutoSaveRunAtMs: await readNextAutoSaveRun(ownerKey) };
     });
   }
 

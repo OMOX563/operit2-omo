@@ -550,6 +550,54 @@ fn sqlite_sync_is_atomic_and_validates_declared_rows() {
     b.dispose();
 }
 
+/// Copied metadata cannot claim storage ownership or make ordinary files unreadable.
+#[test]
+fn copied_markers_do_not_register_files_outside_the_live_storage_namespace() {
+    let f = Fixture::new("first");
+    for root in [
+        "workspaces/project",
+        "runtime/data/chat_outputs/chat",
+        "runtime/data/chat_attachments/chat",
+        "runtime/plugin_data/space-copy/demo",
+        "runtime/plugin_data/device-copy/demo",
+    ] {
+        let database = format!("{root}/identities/old/runtime/plugin_data/space/demo/records.sqlite");
+        let marker = format!("{database}.operit-storage.json");
+        for stored_path in ["runtime/plugin_data/space/demo/records.sqlite", &database] {
+            let metadata = serde_json::to_vec(&json!({
+                "path": stored_path, "owner": "demo", "kind": "sqlite", "sync": true,
+            })).unwrap();
+            f.host.writeBytes(&marker, &metadata).unwrap();
+            for suffix in ["", ".operit-storage.json", "-wal", "-shm", "-journal"] {
+                let path = format!("{database}{suffix}");
+                assert!(!PluginStorage::ownsFile(f.host.clone(), &path).unwrap(), "{path}");
+            }
+            assert_eq!(f.host.readBytes(&marker).unwrap(), metadata);
+        }
+        f.host.writeBytes(&marker, b"invalid copied metadata").unwrap();
+        assert!(!PluginStorage::ownsFile(f.host.clone(), &database).unwrap());
+        assert!(!PluginStorage::ownsFile(f.host.clone(), &marker).unwrap());
+        assert_eq!(f.host.readBytes(&marker).unwrap(), b"invalid copied metadata");
+    }
+    f.dispose();
+}
+
+/// A malformed live registration still fails closed with actionable paths.
+#[test]
+fn active_marker_mismatch_remains_an_error_with_the_storage_paths() {
+    let f = Fixture::new("first");
+    f.open("objects");
+    let marker = format!("{}.operit-storage.json", f.path);
+    let old_path = "runtime/plugin_data/space/other/old.sqlite";
+    let mut metadata: serde_json::Value = serde_json::from_slice(&f.host.readBytes(&marker).unwrap()).unwrap();
+    metadata["path"] = json!(old_path);
+    f.host.writeBytes(&marker, &serde_json::to_vec(&metadata).unwrap()).unwrap();
+    let error = PluginStorage::ownsFile(f.host.clone(), &f.path).unwrap_err().to_string();
+    assert!(error.contains("Storage marker identity mismatch"));
+    for path in [&marker, &f.path, old_path] { assert!(error.contains(path), "{error}"); }
+    f.dispose();
+}
+
 /// Ensures database bytes and sidecars never enter automatic whole-file change capture.
 #[test]
 fn file_sync_excludes_database_and_sidecars_but_keeps_ordinary_files() {
@@ -1829,6 +1877,7 @@ fn snapshot_correction_preserves_plugin_scope_versions_and_uncovered_late_rows()
     source.replay(&late);
     assert_eq!(PluginStorage::syncSnapshot(reopened, &target.path, target.device).unwrap().data,
         PluginStorage::syncSnapshot(source.host.clone(), &source.path, source.device).unwrap().data);
+    drop((authoritative, capture));
     author.dispose();source.dispose();target.dispose();delayed.dispose();
 }
 
@@ -1905,6 +1954,7 @@ fn complete_file_correction_restores_plugin_schema_and_history() {
             let offline = Fixture::new("offline"); offline.replay(&history); offline.replay(&initialized);
             offline.replay(&source.export()); target.replay(&source.export());
             assert_eq!(PluginStorage::syncSnapshot(offline.host.clone(), &offline.path, offline.device).unwrap().data, file.data);
+            drop(file);
             source.dispose(); target.dispose(); offline.dispose();
         }
     }
@@ -1935,7 +1985,7 @@ fn damaged_plugin_structures_accept_complete_correction_and_forward_the_baseline
             _ => unreachable!(),
         }).unwrap();
         let capture = PluginStorage::syncSnapshot(target.host.clone(), &target.path, target.device).unwrap();
-        assert_eq!(PluginStorage::snapshotContentDigest(&capture).is_err(), !matches!(damage,"missing-internal"|"invalid-initialization"), "{damage}");
+        assert_eq!(PluginStorage::snapshotContentSummary(&capture).is_err(), !matches!(damage,"missing-internal"|"invalid-initialization"), "{damage}");
         assert_eq!(capture.manifest().unwrap().damaged, damage == "invalid-initialization");
         let file = PluginStorage::syncSnapshot(source.host.clone(), &source.path, source.device).unwrap();
         assert!(!target.repair(&source, "stale", &file).unwrap(), "{damage}");
@@ -1948,10 +1998,10 @@ fn damaged_plugin_structures_accept_complete_correction_and_forward_the_baseline
         assert!(target.repair(&source, &capture.token().unwrap(), &file).unwrap(), "{damage}");
         let restored = PluginStorage::syncSnapshot(target.host.clone(), &target.path, target.device).unwrap();
         assert_eq!(restored.data, file.data, "{damage}");
-        assert!(PluginStorage::snapshotContentDigest(&restored).is_ok());
+        assert!(PluginStorage::snapshotContentSummary(&restored).is_ok());
         let offline = Fixture::new("offline"); offline.replay(&target.export());
         assert_eq!(PluginStorage::syncSnapshot(offline.host.clone(), &offline.path, offline.device).unwrap().data, file.data);
-        drop(store); source.dispose(); target.dispose(); offline.dispose();
+        drop((store, capture, file, restored)); source.dispose(); target.dispose(); offline.dispose();
     }
 }
 
@@ -1970,6 +2020,7 @@ fn covered_character_history_cannot_rekey_the_copied_file_through_merge_rules() 
     assert!(target.repair(&source, "", &file).unwrap());
     target.replay(&covered);
     assert_eq!(PluginStorage::syncSnapshot(target.host.clone(), &target.path, target.device).unwrap().data, file.data);
+    drop(file);
     old.dispose(); source.dispose(); target.dispose();
 }
 
@@ -1987,23 +2038,97 @@ fn incremental_object_merge_bookkeeping_does_not_require_a_full_snapshot() {
     b.data=serde_json::from_slice(&serde_json::to_vec(&b.data).unwrap()).unwrap();
     assert_eq!(a.data.revision, b.data.revision);
     assert_ne!(a.data.values["_operit_merge_map"], b.data.values["_operit_merge_map"]);
-    assert_eq!(PluginStorage::snapshotContentDigest(&a).unwrap(), PluginStorage::snapshotContentDigest(&b).unwrap());
+    assert_eq!(PluginStorage::snapshotContentSummary(&a).unwrap(), PluginStorage::snapshotContentSummary(&b).unwrap());
     let mut local_cas = b.clone();
     let values = local_cas.data.values.get_mut("_operit_values").unwrap();
     let version = values["columns"].as_array().unwrap().iter().position(|column| column == "version").unwrap();
     values["rows"][0][version] = json!({"Text":"another-local-cas-token"});
-    assert_eq!(PluginStorage::snapshotContentDigest(&a).unwrap(), PluginStorage::snapshotContentDigest(&local_cas).unwrap());
+    assert_eq!(PluginStorage::snapshotContentSummary(&a).unwrap(), PluginStorage::snapshotContentSummary(&local_cas).unwrap());
     assert_ne!(b.token().unwrap(), local_cas.token().unwrap());
+    // Two peers holding identical records still record different last writers; that is not content drift.
+    let mut last_writer = b.clone();
+    let versions = last_writer.data.values.get_mut("_operit_versions").unwrap();
+    let columns = versions["columns"].as_array().unwrap().clone();
+    let created = columns.iter().position(|column| column == "created_at").unwrap();
+    let origin = columns.iter().position(|column| column == "origin").unwrap();
+    let sequence = columns.iter().position(|column| column == "sequence").unwrap();
+    assert!(!versions["rows"].as_array().unwrap().is_empty());
+    for row in versions["rows"].as_array_mut().unwrap() {
+        row[created] = json!({"Integer": 1795317000000i64});
+        row[origin] = json!({"Text": "another-device-storage-origin"});
+        row[sequence] = json!({"Integer": 424242i64});
+    }
+    assert_eq!(PluginStorage::snapshotContentSummary(&a).unwrap(), PluginStorage::snapshotContentSummary(&last_writer).unwrap());
+    assert_ne!(b.token().unwrap(), last_writer.token().unwrap());
+    // The covered identities themselves remain comparable: a differing record set is real drift.
+    let mut fewer = b.clone();
+    let versions = fewer.data.values.get_mut("_operit_versions").unwrap();
+    versions["rows"].as_array_mut().unwrap().pop();
+    assert_ne!(PluginStorage::snapshotContentSummary(&a).unwrap(), PluginStorage::snapshotContentSummary(&fewer).unwrap());
     let map = local_cas.data.values.get_mut("_operit_merge_map").unwrap();
     let canonical = map["columns"].as_array().unwrap().iter().position(|column| column == "canonical_key").unwrap();
     map["rows"][0][canonical] = json!({"Text":"different-canonical-card"});
-    assert_ne!(PluginStorage::snapshotContentDigest(&a).unwrap(), PluginStorage::snapshotContentDigest(&local_cas).unwrap());
+    assert_ne!(PluginStorage::snapshotContentSummary(&a).unwrap(), PluginStorage::snapshotContentSummary(&local_cas).unwrap());
     let mut changed = b.clone();
     let values = changed.data.values.get_mut("_operit_values").unwrap();
     let value = values["columns"].as_array().unwrap().iter().position(|column| column == "value").unwrap();
     values["rows"][0][value] = json!({"Text":"changed business content"});
-    assert_ne!(PluginStorage::snapshotContentDigest(&a).unwrap(), PluginStorage::snapshotContentDigest(&changed).unwrap());
+    assert_ne!(PluginStorage::snapshotContentSummary(&a).unwrap(), PluginStorage::snapshotContentSummary(&changed).unwrap());
     source.dispose(); target.dispose();
+}
+
+/// Merge aliases describe one equivalence graph; spelling it at a different depth is not content drift.
+#[test]
+fn merge_alias_chain_depth_is_not_business_content() {
+    let fixture = Fixture::new("alias-closure");
+    let _handle = open_object_merge_fixture(&fixture);
+    let store = SqliteStore::openWithHost(fixture.host.clone(), &fixture.path).unwrap();
+    let text = |value: &str| operit_host_api::SqliteValue::Text(value.to_owned());
+    // Returns both summary paths: the stored one streams from disk, the decoded one compares values,
+    // so a rule that only holds in one of them cannot pass unnoticed.
+    let summary = |rows: &[(&str, &str, &str)]| {
+        store.executeBatch("DELETE FROM _operit_merge_map").unwrap();
+        for (origin, (collection, remote, canonical)) in rows.iter().enumerate() {
+            store.execute("INSERT INTO _operit_merge_map VALUES(?1,?2,?3,?4)",
+                vec![text(collection), text(&origin.to_string()), text(remote), text(canonical)]).unwrap();
+        }
+        let snapshot = PluginStorage::syncSnapshot(fixture.host.clone(), &fixture.path, fixture.device).unwrap();
+        let mut decoded = snapshot.clone();
+        decoded.data = serde_json::from_slice(&serde_json::to_vec(&decoded.data).unwrap()).unwrap();
+        let content = PluginStorage::snapshotContentSummary(&snapshot).unwrap();
+        assert_eq!(content, PluginStorage::snapshotContentSummary(&decoded).unwrap());
+        content
+    };
+    // One peer rewrites `x -> b -> z` into `x -> z`; another re-declares `x -> b`. Both mean the same.
+    assert_eq!(summary(&[("cards", "x", "b"), ("cards", "b", "z")]),
+        summary(&[("cards", "x", "z"), ("cards", "b", "z")]));
+    // A preference alias qualifies its source with the declaring file; the chain still follows.
+    assert_eq!(
+        summary(&[("_preference_aliases", "cards.preferences.json\u{1f}x", "b"),
+            ("_preference_aliases", "cards.preferences.json\u{1f}b", "z")]),
+        summary(&[("_preference_aliases", "cards.preferences.json\u{1f}x", "z"),
+            ("_preference_aliases", "cards.preferences.json\u{1f}b", "z")]));
+    // Names from different files are not one equivalence space, so their chains never join.
+    assert_ne!(
+        summary(&[("_preference_aliases", "cards.preferences.json\u{1f}x", "b"),
+            ("_preference_aliases", "chats.preferences.json\u{1f}b", "z")]),
+        summary(&[("_preference_aliases", "cards.preferences.json\u{1f}x", "z"),
+            ("_preference_aliases", "cards.preferences.json\u{1f}b", "z")]));
+    // The same depth with a different surviving identity is still an identity disagreement.
+    assert_ne!(summary(&[("cards", "x", "z"), ("cards", "b", "z")]),
+        summary(&[("cards", "x", "y"), ("cards", "b", "z")]));
+    // An unresolvable chain keeps its recorded targets instead of inventing a closure.
+    assert_ne!(summary(&[("cards", "x", "z"), ("cards", "b", "z")]),
+        summary(&[("cards", "x", "b"), ("cards", "b", "x")]));
+    // Ambiguity preserves every original edge, including predecessors, in both namespaces.
+    for (collection, prefix) in [("cards", ""), ("_preference_aliases", "cards.preferences.json\u{1f}")] {
+        let keys = ["u", "v", "w", "x"].map(|key| format!("{prefix}{key}"));
+        let ambiguous = |parent, left, right| summary(&[(collection, &keys[0], parent), (collection, &keys[1], "x"),
+            (collection, &keys[2], "x"), (collection, &keys[3], left), (collection, &keys[3], right)]);
+        assert_ne!(ambiguous("v", "a", "b"), ambiguous("v", "c", "d"));
+        assert_ne!(ambiguous("v", "a", "b"), ambiguous("w", "a", "b"));
+    }
+    drop(store); fixture.dispose();
 }
 
 #[test]
@@ -2042,6 +2167,7 @@ fn corrected_plugin_logs_collapse_on_both_peers_and_initialize_an_offline_peer()
     assert_eq!(PluginStorage::syncSnapshot(empty.host.clone(),&empty.path,empty.device).unwrap().data,authority.data);
     let (receipt,errors) = PluginStorage::receipt(source.host.clone()).unwrap(); assert!(errors.is_empty());
     assert!(PluginStorage::operationsSince(source.host.clone(),&receipt,&[],100).unwrap().is_empty());
+    drop((a, b, authority));
     source.dispose(); target.dispose(); offline.dispose(); empty.dispose();
 }
 
@@ -2074,4 +2200,57 @@ fn opening_a_legacy_plugin_log_backfills_the_index_and_physically_compacts_old_p
     assert!(f.export()[0].sequence > 20);
     drop(store);
     f.dispose();
+}
+
+/// A re-sealed checkpoint only ships when the receiver cannot rebuild it from records.
+#[test]
+fn initialization_export_waits_for_history_the_peer_cannot_rebuild() {
+    use operit_store::SyncOperationStore::SyncReceipt;
+    let source = Fixture::new("init-source");
+    let handle = source.open("objects");
+    source.call(json!({"op":"commit","handle":handle,"mutations":[put("a",json!(1))]})).unwrap();
+    source.call(json!({"op":"commit","handle":handle,"mutations":[put("b",json!(2))]})).unwrap();
+    let records = source.export();
+    assert_eq!(records.len(),2);
+
+    // Sealing replaces the record history with a checkpoint whose identity is
+    // the digest of its complete payload, so every future seal rotates it.
+    let seal = |fixture:&Fixture| {
+        let snapshot = PluginStorage::syncSnapshot(fixture.host.clone(), &fixture.path, fixture.device).unwrap();
+        let definition = PluginStorage::snapshotDefinition(fixture.host.clone(), &fixture.path).unwrap();
+        let token = snapshot.token().unwrap();
+        assert!(PluginStorage::repairSyncedSnapshot(fixture.host.clone(), &token, &snapshot, fixture.device, &definition).unwrap());
+    };
+    seal(&source);
+    let checkpoint = |export:&[SyncOperation]| export.iter().find(|op|op.originDeviceId.starts_with("~init:"))
+        .expect("missing checkpoint").clone();
+
+    // A peer that already covered the whole sealed history rebuilds every seal
+    // from records; re-shipping the checkpoint would repeat the full database.
+    let covering = Fixture::new("init-covering");
+    covering.replay(&records);
+    let clock = PluginStorage::receipt(covering.host.clone()).unwrap().0;
+    let (operations,errors) = PluginStorage::exportWithBudget(source.host.clone(), &clock, &[], 100, 1_000_000).unwrap();
+    assert!(errors.is_empty(), "{errors:?}");
+    assert!(operations.is_empty(), "re-exported to a covering peer: {}", operations.len());
+
+    // Rotating the checkpoint identity without new history stays suppressed.
+    seal(&source);
+    let (operations,errors) = PluginStorage::exportWithBudget(source.host.clone(), &clock, &[], 100, 1_000_000).unwrap();
+    assert!(errors.is_empty(), "{errors:?}");
+    assert!(operations.is_empty(), "identity rotation re-shipped the checkpoint");
+
+    // A receiver missing a sealed original cannot rebuild it and needs the checkpoint.
+    let mut gapped = SyncReceipt::default();
+    gapped.observe(&records[0].originDeviceId, records[0].sequence);
+    let (operations,errors) = PluginStorage::exportWithBudget(source.host.clone(), &gapped, &[], 100, 1_000_000).unwrap();
+    assert!(errors.is_empty(), "{errors:?}");
+    checkpoint(&operations);
+
+    // Bootstrap receivers still receive the checkpoint.
+    let (operations,errors) = PluginStorage::exportWithBudget(source.host.clone(), &SyncReceipt::default(), &[], 100, 1_000_000).unwrap();
+    assert!(errors.is_empty(), "{errors:?}");
+    checkpoint(&operations);
+    source.dispose();
+    covering.dispose();
 }

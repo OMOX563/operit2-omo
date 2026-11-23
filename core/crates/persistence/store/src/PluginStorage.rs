@@ -11,7 +11,7 @@ use crate::SyncOperationStore::{
 };
 use operit_host_api::PluginStorage::*;
 use operit_host_api::{RuntimeSqliteHost, RuntimeStorageHost, SqliteValue};
-use operit_util::RuntimeStorageLayout::{runtimeStorageOwnership, RuntimeStorageOwnership, PLUGIN_DATA_SPACE_DIR_PATH, PLUGIN_DATA_DEVICE_DIR_PATH};
+use operit_util::RuntimeStorageLayout::{runtimeStorageOwnership, RuntimeStorageOwnership};
 pub use operit_util::PluginStoragePaths::resolveStoragePath;
 use operit_util::PluginStoragePaths::storageNamespace;
 use serde_json::Value;
@@ -1308,7 +1308,13 @@ pub fn ownsFile(host: Arc<dyn RuntimeStorageHost>, path: &str) -> Result<bool, S
         .iter()
         .find_map(|suffix| path.strip_suffix(suffix))
         .unwrap_or(path);
-    if database.ends_with(".preferences.json") && [PLUGIN_DATA_SPACE_DIR_PATH, PLUGIN_DATA_DEVICE_DIR_PATH].iter().any(|root| database.strip_prefix(root).is_some_and(|relative| relative.starts_with('/'))) {
+    // Ownership comes from the database's live namespace, not from a copied
+    // marker. Workspace/output copies (even with stale or invalid markers)
+    // remain ordinary files on both the sending and receiving nodes.
+    if storageNamespace(database).is_err() {
+        return Ok(false);
+    }
+    if database.ends_with(".preferences.json") {
         resolveStoragePath(database).map_err(failure)?;
         return Ok(true);
     }
@@ -1316,12 +1322,19 @@ pub fn ownsFile(host: Arc<dyn RuntimeStorageHost>, path: &str) -> Result<bool, S
     if !host.exists(&marker)? {
         return Ok(false);
     }
-    let manifest: Manifest =
-        decodeManifest(serde_json::from_slice(&host.readBytes(&marker)?).map_err(|error| failure(error.to_string()))?)?;
+    let manifest = readStorageMarker(host.as_ref(), &marker)?;
     if manifest.path != database {
-        return Err(failure("Storage marker identity mismatch"));
+        return Err(failure(format!("Storage marker identity mismatch at {marker}: expected path {database:?}, found {:?}", manifest.path)));
     }
     Ok(true)
+}
+
+fn readStorageMarker(host: &dyn RuntimeStorageHost, marker: &str) -> Result<Manifest, SqliteStoreError> {
+    let bytes = host.readBytes(marker)?;
+    serde_json::from_slice(&bytes)
+        .map_err(|error| failure(error.to_string()))
+        .and_then(decodeManifest)
+        .map_err(|error| failure(format!("Invalid storage marker at {marker}: {error}")))
 }
 
 /// Removes discovery metadata before an explicitly authorized plugin uninstall deletes its files.
@@ -1344,11 +1357,15 @@ fn registerFile(
     let marker = format!("{}.operit-storage.json", manifest.path);
     let mut current = manifest.clone();
     if host.exists(&marker)? {
-        let stored = decodeManifest(serde_json::from_slice(&host.readBytes(&marker)?).map_err(|error| failure(error.to_string()))?)?;
+        let stored = readStorageMarker(host.as_ref(), &marker)?;
         if stored.path != manifest.path || stored.owner != manifest.owner
             || stored.kind != manifest.kind || stored.sync != manifest.sync
         {
-            return Err(failure("Storage marker conflicts with database identity"));
+            return Err(failure(format!(
+                "Storage marker conflicts with database identity at {marker}: expected path={:?} owner={:?} kind={} sync={}, found path={:?} owner={:?} kind={} sync={}",
+                manifest.path, manifest.owner, kindName(&manifest.kind), manifest.sync,
+                stored.path, stored.owner, kindName(&stored.kind), stored.sync,
+            )));
         }
         current.merge = mergeDescriptorForOpen(stored.merge.clone(), manifest.merge.clone())?;
         if current.merge == stored.merge {
@@ -1356,7 +1373,7 @@ fn registerFile(
         }
     }
     let content = serde_json::to_vec(&current).map_err(|error| failure(error.to_string()))?;
-    host.writeBytes(&marker, &content)?;
+    host.writeBytesAtomically(&marker, &content)?;
     Ok(())
 }
 
@@ -1525,8 +1542,8 @@ pub fn syncCoverage(host: Arc<dyn RuntimeSqliteHost>, path: &str) -> Result<BTre
     withSyncDataset(host, path, "", |dataset| dataset.coverage())
 }
 
-/// Compares synchronized plugin records independently of local materialization bookkeeping.
-pub fn snapshotContentDigest(snapshot: &crate::Transaction::Snapshot) -> Result<String, String> {
+/// Hashes and counts synchronized plugin contents independently of local bookkeeping.
+pub fn snapshotContentSummary(snapshot: &crate::Transaction::Snapshot) -> Result<(String, u64), String> {
     let mut values=snapshot.data.values.clone();
     if let Some(sql)=&snapshot.data.sql {
         for (name,columns) in &sql.columns { values.insert(name.clone(),serde_json::json!({"columns":columns})); }
@@ -1557,13 +1574,18 @@ pub fn snapshotContentDigest(snapshot: &crate::Transaction::Snapshot) -> Result<
     if values.keys().filter(|name|!name.starts_with("_operit_")).cloned().collect::<BTreeSet<_>>() != declared {
         return Err("Synchronized SQL declarations are incomplete".into());
     }
-    if let Some(sql)=&snapshot.data.sql { return sql.content_digest(&snapshot.data.owner); }
-    snapshot.projected_content_digest(|table, value| match table {
+    if let Some(sql)=&snapshot.data.sql { return sql.content_summary(&snapshot.data.owner); }
+    snapshot.projected_content_summary(|table, value| match table {
         // Derived reference/name projection may allocate a device-local CAS token.
-        "_operit_values" => crate::Transaction::project_sql_table(value, &["version"], None).map(Some),
-        // A receipt's self mapping and the origin recording an equivalent alias do not change its meaning.
-        // Real aliases remain in the comparison so an identity disagreement still requires correction.
-        "_operit_merge_map" => crate::Transaction::project_sql_table(value, &["origin"], Some(("remote_key", "canonical_key"))).map(Some),
+        "_operit_values" => crate::Transaction::project_sql_table(value, &["version"]).map(Some),
+        // Last writer per synchronized record: two peers that hold identical records still
+        // differ here, so it cannot participate in content equality.
+        "_operit_versions" => crate::Transaction::project_sql_table(value, &["created_at", "origin", "sequence"]).map(Some),
+        // A receipt's self mapping and the origin recording an equivalent alias do not change its meaning,
+        // and neither does the chain depth peers use to spell the same equivalence: one rewrites
+        // `a -> b -> c` into `a -> c`, another re-declares `a -> b`. Aliases are compared as resolved
+        // identities, so a genuine identity disagreement still requires correction.
+        "_operit_merge_map" => crate::Transaction::project_sql_alias_closure(value, &["origin"], "remote_key", "canonical_key").map(Some),
         _ => Ok(None),
     })
 }
@@ -1660,9 +1682,20 @@ pub fn exportWithBudget<K: SyncOperationKnowledge>(
             crate::Transaction::compaction::prepare(&store)?;
             let mut entries = Vec::new();
             if let Some((_,origin,sequence)) = crate::Transaction::compaction::initialization_identity(&store)? {
+                // Every seal rotates the checkpoint identity; peers that already
+                // cover the sealed history rebuild it from ordinary records.
                 if !clock.containsSequence(&origin,sequence) {
-                    let size: i64 = store.queryOne("SELECT length(CAST(original AS BLOB)) FROM _operit_transaction_initialization WHERE id=1", vec![])?.ok_or_else(||failure("Missing initialization"))?.get(0)?;
-                    entries.push((0,origin,sequence,stores.len(),usize::try_from(size).map_err(|_|failure("Invalid initialization size"))?));
+                    if let Some(reason) = crate::Transaction::compaction::initialization_transfer_reason(&store,clock)? {
+                        let size: i64 = store.queryOne("SELECT length(CAST(original AS BLOB)) FROM _operit_transaction_initialization WHERE id=1", vec![])?.ok_or_else(||failure("Missing initialization"))?.get(0)?;
+                        let shortOrigin = origin.trim_start_matches("~init:").get(..12).unwrap_or(origin.trim_start_matches("~init:"));
+                        operit_util::AppLogger::AppLogger::i("CoreSyncTrace", &format!(
+                            "sync_checkpoint.export path={path} origin={shortOrigin} sequence={sequence} bytes={size} reason={}",
+                            reason.as_str()));
+                        entries.push((0,origin,sequence,stores.len(),usize::try_from(size).map_err(|_|failure("Invalid initialization size"))?));
+                    } else {
+                        operit_util::AppLogger::AppLogger::trace("CoreSyncTrace", &format!(
+                            "sync_checkpoint.covered path={path} origin={}", origin.trim_start_matches("~init:")));
+                    }
                 }
             }
             for row in store.queryRows(

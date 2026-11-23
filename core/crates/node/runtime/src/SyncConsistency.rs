@@ -16,18 +16,6 @@ struct Report {
     skipped: BTreeMap<String, BTreeSet<String>>,
 }
 
-/// Exchanging every known original does not prove equal contents on an older peer.
-pub(super) fn requireConsistencySupport(local: &Value, remote: &Value) -> Result<(), String> {
-    for (side, clock) in [("Local", local), ("Remote", remote)] {
-        if clock.get("consistencyVersion").and_then(Value::as_u64) != Some(7) {
-            return Err(format!(
-                "{side} peer cannot verify synchronized contents; a compatible version is required"
-            ));
-        }
-    }
-    Ok(())
-}
-
 impl SpacePersistenceSyncService {
     async fn consistencyReports(&self, target: &str) -> Result<(Report, Report), String> {
         let (remote, local) = tokio::join!(
@@ -58,9 +46,21 @@ impl SpacePersistenceSyncService {
         let correctionCount = plans.len();
         for (a, b, choice) in plans {
             let source = if choice == Source::Local { a } else { b }.expect("source exists");
+            let reason = match (a, b) {
+                (None, Some(_)) => "local-missing",
+                (Some(_), None) => "remote-missing",
+                _ if a.is_some_and(|m|m.damaged) || b.is_some_and(|m|m.damaged) => "damaged",
+                _ if a.map(|m| &m.restoration) != b.map(|m| &m.restoration) => "restored-baseline",
+                _ if a.map(|m|m.contentBytes) != b.map(|m|m.contentBytes) => "content-size",
+                _ if a.and_then(|m|m.revision.as_ref()) == b.and_then(|m|m.revision.as_ref()) => "equal-revision-drift",
+                _ => "revision-drift",
+            };
+            let digest = |m: Option<&operit_store::Transaction::Manifest>| m.map(|m|
+                format!("{}{}", m.digest.get(..12).unwrap_or(&m.digest), if m.damaged {":damaged"} else {""}))
+                .unwrap_or_else(|| "missing".to_string());
             operit_util::AppLogger::AppLogger::i("CoreSyncTrace", &format!(
-                "sync_consistency.correct target={target} mode=full_snapshot owner={} source={choice:?} damaged={} localRevision={:?} remoteRevision={:?}",
-                source.owner.path, a.is_some_and(|m|m.damaged) || b.is_some_and(|m|m.damaged), a.and_then(|m|m.revision.as_ref()), b.and_then(|m|m.revision.as_ref())));
+                "sync_consistency.correct target={target} mode=full_snapshot owner={} reason={reason} source={choice:?} localDigest={} remoteDigest={} localContentBytes={:?} remoteContentBytes={:?} damaged={} localRevision={:?} remoteRevision={:?}",
+                source.owner.path, digest(a), digest(b), a.map(|m|m.contentBytes), b.map(|m|m.contentBytes), a.is_some_and(|m|m.damaged) || b.is_some_and(|m|m.damaged), a.and_then(|m|m.revision.as_ref()), b.and_then(|m|m.revision.as_ref())));
             let correction: Result<bool, String> = async {
                 let other = if choice == Source::Local { b } else { a };
                 let superseded = match other {
@@ -113,7 +113,7 @@ impl SpacePersistenceSyncService {
         operit_util::AppLogger::AppLogger::i("CoreSyncTrace", &format!(
             "sync_consistency.snapshot target={target} owner={} source={} coverageOnly={coverage_only} bytes={} hash={}",
             source.owner.path, if local { "local" } else { "remote" }, reference.size, reference.contentHash));
-        self.synchronizeBlobReferences(target, vec![reference.clone()]).await?;
+        self.synchronizeBlobReferences(target, vec![reference.clone()], &BTreeMap::new()).await?;
         Ok(reference)
     }
 
@@ -149,7 +149,7 @@ fn correctionPlans<'a>(local: &'a Report, remote: &'a Report, failed: &BTreeMap<
         };
         let choice = if choice == Source::Equal && (failed.contains_key(path) || local.pendingOwners.contains(path) || remote.pendingOwners.contains(path) || local.skipped.contains_key(path) || remote.skipped.contains_key(path)) {
             let (a,b) = (a.expect("equal files exist"),b.expect("equal files exist"));
-            if (&a.revision,&a.node) >= (&b.revision,&b.node) { Source::Local } else { Source::Remote }
+            if (a.contentBytes,&a.revision,&a.node) >= (b.contentBytes,&b.revision,&b.node) { Source::Local } else { Source::Remote }
         } else { choice };
         if choice != Source::Equal { plans.push((a,b,choice)); }
     }
@@ -184,6 +184,7 @@ mod tests {
         let healthy = report("a", "database", 1);
         let mut damaged = report("z", "database", 2);
         damaged.manifests[0].damaged = true;
+        damaged.manifests[0].contentBytes = u64::MAX;
         damaged.manifests[0].revision = Some(operit_store::Transaction::Revision {
             createdAt: 999, originDeviceId: "z".into(), sequence: 1 });
         for (a,b,choice) in [(&healthy,&damaged,Source::Local),(&damaged,&healthy,Source::Remote)] {
@@ -194,6 +195,29 @@ mod tests {
         }
         assert!(verifyReports(&damaged,&damaged).is_err());
         assert!(verifyReports(&healthy,&healthy).unwrap());
+    }
+
+    /// The fuller older file wins in either coordinator direction, independently for each owner.
+    #[test]
+    fn correction_prefers_more_content_before_business_revision() {
+        let mut phone = report("a", "models", 123456);
+        let mut desktop = report("z", "models", 1);
+        desktop.manifests[0].revision = Some(operit_store::Transaction::Revision {
+            createdAt: 999, originDeviceId: "z".into(), sequence: 1 });
+        assert!(phone.manifests[0].contentBytes > desktop.manifests[0].contentBytes);
+        phone.manifests.push(report("a", "chats", 1).manifests.remove(0));
+        desktop.manifests.push(report("z", "chats", 123456).manifests.remove(0));
+        for (local, remote, choices) in [(&phone, &desktop, [Source::Remote, Source::Local]),
+            (&desktop, &phone, [Source::Local, Source::Remote])] {
+            let plans = correctionPlans(local, remote, &BTreeMap::new()).unwrap();
+            assert_eq!(plans.iter().map(|(_,_,choice)| *choice).collect::<Vec<_>>(), choices);
+        }
+        let manifest = &phone.manifests[0];
+        let wire = serde_json::to_value(manifest).unwrap();
+        assert_eq!(serde_json::from_value::<Manifest>(wire.clone()).unwrap(), *manifest);
+        let mut obsolete = wire;
+        obsolete.as_object_mut().unwrap().remove("contentBytes");
+        assert!(serde_json::from_value::<Manifest>(obsolete).is_err());
     }
 
     /// Missing files, unequal contents and skipped originals all require complete-file correction.
@@ -247,14 +271,4 @@ mod tests {
         }
     }
 
-    /// Old peers cannot interpret damaged-file inventories or the complete synchronized schema.
-    #[test]
-    fn consistency_requires_the_current_protocol() {
-        let current = json!({"consistencyVersion":7});
-        assert!(requireConsistencySupport(&current,&current).is_ok());
-        for previous in (0..7).map(|version|json!({"consistencyVersion":version})).chain([Value::Null,json!({})]) {
-            assert!(requireConsistencySupport(&previous,&current).is_err());
-            assert!(requireConsistencySupport(&current,&previous).is_err());
-        }
-    }
 }

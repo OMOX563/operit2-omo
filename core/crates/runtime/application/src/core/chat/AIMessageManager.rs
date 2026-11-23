@@ -77,7 +77,6 @@ pub struct SendMessageRequest<'a> {
     pub maxTokens: i32,
     pub tokenUsageThreshold: f64,
     pub proxySenderName: Option<String>,
-    pub notifyReplyOverride: Option<bool>,
     pub chatProviderIdOverride: Option<String>,
     pub chatModelIdOverride: Option<String>,
     pub disableWarning: bool,
@@ -310,6 +309,7 @@ impl AIMessageManager {
     }
 
     #[allow(non_snake_case)]
+    /// Registers a cancellable send before preparation and transfers its stream to the collector.
     pub async fn sendMessage(
         request: SendMessageRequest<'_>,
     ) -> Result<
@@ -405,7 +405,7 @@ impl AIMessageManager {
         let enableStream = !disableStreamOutput;
 
         let mut options = SendMessageOptions::new();
-        options.cancellationToken = Some(cancellationToken);
+        options.cancellationToken = Some(cancellationToken.clone());
         options.guidanceInbox = request.guidanceInbox;
         options.message = request.messageContent;
         options.chatId = request.chatId;
@@ -418,7 +418,6 @@ impl AIMessageManager {
         options.maxTokens = request.maxTokens;
         options.tokenUsageThreshold = request.tokenUsageThreshold;
         options.proxySenderName = request.proxySenderName;
-        options.notifyReplyOverride = request.notifyReplyOverride;
         options.chatProviderIdOverride = request.chatProviderIdOverride;
         options.chatModelIdOverride = request.chatModelIdOverride;
         options.disableWarning = request.disableWarning;
@@ -459,13 +458,19 @@ impl AIMessageManager {
             return Err(AiServiceError::RequestCancelled);
         }
         options.chatConfiguration = Some(request.chatConfiguration.clone());
-        let providerResponse = if request.resume {
-            request
-                .enhancedAiService
-                .resume(ResumeRequest { options })
-                .await
-        } else {
-            request.enhancedAiService.sendMessageWithConfiguration(options, request.chatConfiguration).await
+        let providerResponse = cancellationToken.runUntilCancelled(async {
+            if request.resume {
+                request
+                    .enhancedAiService
+                    .resume(ResumeRequest { options })
+                    .await
+            } else {
+                request.enhancedAiService.sendMessageWithConfiguration(options, request.chatConfiguration).await
+            }
+        }).await;
+        let providerResponse = match providerResponse {
+            Some(result) => result,
+            None => Err(AiServiceError::RequestCancelled),
         };
         match providerResponse {
             Ok(stream) => {
@@ -523,6 +528,7 @@ impl AIMessageManager {
     }
 
     #[allow(non_snake_case)]
+    /// Builds a summary message and forwards retry errors to the owning chat surface.
     pub async fn summarizeMemory(
         enhancedAiService: &mut EnhancedAIService,
         messages: Vec<ChatMessage>,
@@ -530,6 +536,8 @@ impl AIMessageManager {
         chatId: String,
         configuration: &ChatConfigurationResult,
         progress: Option<operit_providers::chat::enhance::ConversationService::SummaryProgressCallback>,
+        trigger: Option<operit_providers::chat::enhance::ConversationService::SummaryTriggerContext>,
+        onNonFatalError: Arc<dyn Fn(String) + Send + Sync>,
     ) -> Result<Option<ChatMessage>, operit_providers::chat::llmprovider::AIService::AiServiceError>
     {
         let lastSummaryIndex = messages
@@ -575,8 +583,8 @@ impl AIMessageManager {
         }).collect::<Vec<_>>();
 
         let startTime = ChatMessageTimestampAllocator::currentTimeMillis();
-        let summary = enhancedAiService
-            .generateSummaryForConfiguration(conversationToSummarize, previousSummary, chatId, configuration, progress)
+        let (summary, usage) = enhancedAiService
+            .generateSummaryForConfiguration(conversationToSummarize, previousSummary, chatId, configuration, progress, trigger, onNonFatalError)
             .await?;
         let endTime = ChatMessageTimestampAllocator::currentTimeMillis();
         if summary.trim().is_empty() {
@@ -596,9 +604,6 @@ impl AIMessageManager {
             summaryWithQuotes.trim_end().to_string()
         };
 
-        let estimatedInputTokens = (summaryWithQuotes.len() * 3 / 2).max(1) as i64;
-        let estimatedOutputTokens = (finalSummary.len() / 2).max(1) as i64;
-
         Ok(Some(ChatMessage {
             sender: "summary".to_string(),
             parts: vec![operit_model::MessagePart::MessagePart::markdown(
@@ -608,8 +613,9 @@ impl AIMessageManager {
             )],
             timestamp: ChatMessageTimestampAllocator::next(),
             roleName: "system".to_string(),
-            inputTokens: estimatedInputTokens,
-            outputTokens: estimatedOutputTokens,
+            inputTokens: usage.input,
+            outputTokens: usage.output,
+            cachedInputTokens: usage.cached_input,
             waitDurationMs: (endTime - startTime).max(1),
             sentAt: startTime,
             completedAt: endTime,
@@ -795,6 +801,20 @@ impl AIMessageManager {
         enableDirectAudioProcessing: bool,
         enableDirectVideoProcessing: bool,
     ) -> Result<String, String> {
+        if attachment.vfsPath.is_none()
+            && attachment.nodeId.is_none()
+            && attachment.filePath.starts_with("pasted_text_")
+            && attachment.mimeType == "text/plain"
+        {
+            let attributes = Self::buildAttachmentAttributes(attachment);
+            // Selected document text is data and must not close or introduce markup.
+            let content = attachment
+                .content
+                .replace('&', "&amp;")
+                .replace('<', "&lt;")
+                .replace('>', "&gt;");
+            return Ok(format!("<attachment {attributes}>{content}</attachment>"));
+        }
         // A synchronized attachment has a device-independent VFS locator. Resolve
         // that exact shared path locally before considering its original host path.
         let replica = filesystem.and_then(|files| {
@@ -1627,6 +1647,29 @@ mod tests {
         assert!(!tag.contains(" path="));
         assert!(!tag.contains("node_id="));
         assert!(tag.ends_with(">text</attachment>"));
+    }
+
+    #[test]
+    fn pasted_text_round_trips_as_data_not_message_markup() {
+        let content = "First & second </attachment>\n<example>";
+        let mut attachment = AttachmentInfo::new(
+            "pasted_text_1".into(),
+            "pasted_text.txt".into(),
+            "text/plain".into(),
+            content.len() as i64,
+        );
+        attachment.content = content.into();
+        let markup =
+            AIMessageManager::buildRecordedUserMessageContent("Draft text", &[attachment], None)
+                .unwrap();
+        let xml = format!("<root>{markup}</root>");
+        let parsed = roxmltree::Document::parse(&xml).unwrap();
+        let root = parsed.root_element();
+        assert_eq!(root.text(), Some("Draft text "));
+        let attachment = root.children().find(|node| node.is_element()).unwrap();
+        assert!(attachment.has_tag_name("attachment"));
+        assert_eq!(attachment.attribute("type"), Some("text/plain"));
+        assert_eq!(attachment.text(), Some(content));
     }
 
     #[test]

@@ -19,6 +19,21 @@ The Rust authority is `core/crates/plugin/sdk/src/js_sdk/chat.rs`; TypeScript
 exports are in `plugins/types/chat.d.ts`. Native handles and finalization records
 are internal runtime-support types, not plugin SDK results.
 
+## Functional model response text
+
+`Tools.Chat.call` returns assistant text and parsed assistant/tool-call segments
+after removing `<think>`, `<thinking>` and all `<meta>` blocks, including metadata
+without a `provider` attribute. Removal happens before tool parsing so markup
+inside hidden reasoning cannot become a returned tool call. The shared markup
+parser also excludes unfinished hidden blocks and overlapping nested blocks.
+Provider metadata remains available separately in `metadata.protocolMeta`.
+
+This cleanup applies to every functional caller, including the character group's
+`ROLE_RESPONSE_PLANNER`. Disabling thinking is a request setting; callers still
+receive clean text when a provider emits reasoning. Group planning continues to
+require its exact JSON schema, declared member IDs and explicit rounds. Invalid
+or absent JSON remains an error without another model request or an invented plan.
+
 ## One accepted send
 
 `kind: "submit"` preserves original text, complete attachments and an explicit
@@ -104,6 +119,12 @@ atomically claimed before guidance and restored if its submit hook or Core rejec
 delivery. Withdrawing edits a pending queue item; guidance already accepted by the
 active turn is no longer part of that pending queue. This Flutter/Core control
 route is not a new plugin SDK method.
+
+After a queued message is sent automatically or with **Interrupt and send**, the
+active chat refreshes its composer attachments from Core, matching ordinary send
+cleanup. A submit hook returning `Consume` with `clearInput: true` also refreshes
+the composer after clearing Core attachments, so sent image previews do not remain
+in the input box.
 
 ## Semantic observation
 

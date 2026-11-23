@@ -28,6 +28,8 @@ pub const CHAT_SYNC_DOMAIN: &str = "chat";
 
 const CHAT_SYNC_OPERATION_SCHEMA_VERSION: i32 = 8;
 
+const EXPORT_OPERATIONS_SQL: &str = "SELECT opId, originDeviceId, sequence, domain, entityType, entityId, operation, semantics, createdAt, schemaVersion FROM sync_sql_operations AS original WHERE domain=?1 AND originDeviceId=?2 AND sequence>=?3 AND (semantics!='entity_state' OR NOT EXISTS (SELECT 1 FROM sync_sql_operations AS newer WHERE newer.originDeviceId=original.originDeviceId AND newer.domain=original.domain AND newer.entityType=original.entityType AND newer.entityId=original.entityId AND newer.semantics='entity_state' AND newer.sequence>original.sequence)) ORDER BY sequence LIMIT ?4";
+
 const DELETE_CHAT: &str = "chats";
 const DELETE_MESSAGE: &str = "messages";
 const DELETE_MESSAGES_FROM: &str = "messages_from";
@@ -135,12 +137,12 @@ impl SqlChatSyncStore {
     /// Returns exact applied identities independently of the chat table contents.
     pub fn syncCoverage(&self) -> Result<BTreeSet<String>, String> { self.dataset().coverage() }
 
-    /// Compares synchronized chat contents independently of local storage identities.
-    pub fn snapshotContentDigest(snapshot: &crate::Transaction::Snapshot) -> Result<String, String> {
-        if let Some(sql)=&snapshot.data.sql { return sql.content_digest(&snapshot.data.owner); }
-        snapshot.projected_content_digest(|table, value| match table {
-            "messages" => crate::Transaction::project_sql_table(value, &["messageId"], None).map(Some),
-            "message_variants" => crate::Transaction::project_sql_table(value, &["variantId"], None).map(Some),
+    /// Hashes and counts synchronized chat contents independently of local row identities.
+    pub fn snapshotContentSummary(snapshot: &crate::Transaction::Snapshot) -> Result<(String, u64), String> {
+        if let Some(sql)=&snapshot.data.sql { return sql.content_summary(&snapshot.data.owner); }
+        snapshot.projected_content_summary(|table, value| match table {
+            "messages" => crate::Transaction::project_sql_table(value, &["messageId"]).map(Some),
+            "message_variants" => crate::Transaction::project_sql_table(value, &["variantId"]).map(Some),
             _ => Ok(None),
         })
     }
@@ -150,13 +152,33 @@ impl SqlChatSyncStore {
             .map_err(SqlChatSyncStoreError::Message)
     }
 
+    /// Reads the current restore lineage without reading any conversation records.
+    pub fn restoration(&self) -> Result<Option<crate::Transaction::Revision>, SqlChatSyncStoreError> {
+        Ok(self.store.transaction(restorationIn)?)
+    }
+
+    /// Starts a new authoritative lineage after the database file has been restored.
+    pub fn establishRestoreBaseline(&self, previous: Option<crate::Transaction::Revision>) -> Result<(), SqlChatSyncStoreError> {
+        let createdAt = currentTimeMillis()?.max(previous.map_or(0, |revision| revision.createdAt.saturating_add(1)));
+        let restoration = crate::Transaction::Revision {
+            createdAt, originDeviceId: uuid::Uuid::new_v4().to_string(), sequence: 1,
+        };
+        self.dataset().rebase(restoration, &["sync_sql_versions", "_operit_compaction_scopes"], |tx| {
+            tx.execute("DELETE FROM sync_sql_operations", vec![])?;
+            Ok(())
+        }).map_err(SqlChatSyncStoreError::Message)?;
+        publishSyncMutation();
+        Ok(())
+    }
+
     fn reconcileInitialization(&self, tx: &mut SqliteTransaction<'_>, snapshot: &crate::Transaction::Snapshot, replay: bool) -> Result<(), SqliteStoreError> {
         let originals = tx.queryRows("SELECT * FROM sync_sql_operations",vec![])?.iter()
             .map(mapOperationMetadata).collect::<Result<Vec<_>,_>>()?;
         let originals = crate::Transaction::ordered(originals, |op| &op.opId, crate::Transaction::Revision::fromOperation)
             .map_err(SqliteStoreError::Message)?;
         for operation in originals {
-            if snapshot.covered.contains(&operation.opId) {
+            if snapshot.covered.contains(&operation.opId)
+                || operationRestoration(&operation.originDeviceId)? != snapshot.data.restoration {
                 crate::Transaction::compaction::seal_identity(tx.raw(),&operation.opId,&operation.originDeviceId,operation.sequence,operation.createdAt,"")?;
                 tx.execute("DELETE FROM sync_sql_operations WHERE opId=?1",sqliteParams![operation.opId])?;
             } else if replay {
@@ -304,10 +326,11 @@ impl SqlChatSyncStore {
             }
             replacePartRows(transaction, &payload.partRows)?;
 
-            let sequence = sequenceFor(transaction, &self.originDeviceId)? + 1;
+            let origin = localOrigin(transaction, &self.originDeviceId)?;
+            let sequence = sequenceFor(transaction, &origin)? + 1;
             let operation = SyncOperation {
-                opId: format!("{}:{sequence}", self.originDeviceId),
-                originDeviceId: self.originDeviceId.clone(),
+                opId: format!("{origin}:{sequence}"),
+                originDeviceId: origin,
                 sequence,
                 domain: CHAT_SYNC_DOMAIN.to_string(),
                 entityType: "message".to_string(),
@@ -357,10 +380,11 @@ impl SqlChatSyncStore {
             }
             if chat.is_none() { return Ok(false); }
             applyDeletion(transaction, &payload.deletions[0])?;
-            let sequence = sequenceFor(transaction, &self.originDeviceId)? + 1;
+            let origin = localOrigin(transaction, &self.originDeviceId)?;
+            let sequence = sequenceFor(transaction, &origin)? + 1;
             let operation = SyncOperation {
-                opId: format!("{}:{sequence}", self.originDeviceId),
-                originDeviceId: self.originDeviceId.clone(), sequence,
+                opId: format!("{origin}:{sequence}"),
+                originDeviceId: origin, sequence,
                 domain: CHAT_SYNC_DOMAIN.into(), entityType: "chat".into(), entityId: chatId.into(),
                 operation: "delete".into(), semantics: SyncOperationSemantics::Transaction,
                 payload: serde_json::to_value(&payload).map_err(|error| SqliteStoreError::Message(error.to_string()))?,
@@ -490,6 +514,7 @@ impl SqlChatSyncStore {
         if !domains.is_empty() && !domains.iter().any(|domain| domain == CHAT_SYNC_DOMAIN) {
             return Ok(BTreeSet::new());
         }
+        self.dataset().publishRestoration().map_err(SqlChatSyncStoreError::Message)?;
         let mut floors = BTreeMap::new();
         let mut ids = BTreeSet::new();
         for row in self.store.queryRows(
@@ -509,7 +534,8 @@ impl SqlChatSyncStore {
             if sequence > floor && !clock.containsSequence(&origin, sequence) { ids.insert(row.get(0)?); }
         }
         if let Some((id,origin,sequence)) = crate::Transaction::compaction::initialization_identity(&self.store)? {
-            if !clock.containsSequence(&origin,sequence) { ids.insert(id); }
+            if !clock.containsSequence(&origin,sequence)
+                && crate::Transaction::compaction::initialization_transfer_required(&self.store,clock)? { ids.insert(id); }
         }
         Ok(ids)
     }
@@ -533,6 +559,7 @@ impl SqlChatSyncStore {
         if !domainSet.is_empty() && !domainSet.contains(CHAT_SYNC_DOMAIN) {
             return Ok(Vec::new());
         }
+        self.dataset().publishRestoration().map_err(SqlChatSyncStoreError::Message)?;
         let mut operations = Vec::new();
         for originRow in self.store.queryRows(
             "SELECT DISTINCT originDeviceId FROM sync_sql_operations WHERE domain=?1",
@@ -548,7 +575,7 @@ impl SqlChatSyncStore {
                     break;
                 };
                 let rows = self.store.queryRows(
-                    "SELECT opId, originDeviceId, sequence, domain, entityType, entityId, operation, semantics, createdAt, schemaVersion FROM sync_sql_operations AS original WHERE domain=?1 AND originDeviceId=?2 AND sequence>=?3 AND (semantics!='entity_state' OR NOT EXISTS (SELECT 1 FROM sync_sql_operations AS newer WHERE newer.originDeviceId=original.originDeviceId AND newer.domain=original.domain AND newer.entityType=original.entityType AND newer.entityId=original.entityId AND newer.semantics='entity_state' AND newer.sequence>original.sequence)) ORDER BY sequence LIMIT ?4",
+                    EXPORT_OPERATIONS_SQL,
                     sqliteParams![CHAT_SYNC_DOMAIN, origin, next, limit.min(256) as i64],
                 )?;
                 if rows.is_empty() {
@@ -592,10 +619,29 @@ impl SqlChatSyncStore {
         let mut operations = page;
         if limit > 0 {
             if let Some((_,origin,sequence)) = crate::Transaction::compaction::initialization_identity(&self.store)? {
+                // Every seal rotates the checkpoint identity; peers that already
+                // cover the sealed history rebuild it from ordinary records.
                 if !clock.containsSequence(&origin,sequence) {
-                    if let Some(initialization) = self.dataset().initialization().map_err(SqlChatSyncStoreError::Message)? {
-                        operations.insert(0,initialization);
-                        operations.truncate(limit);
+                    match crate::Transaction::compaction::initialization_transfer_reason(&self.store,clock)
+                        .map_err(SqlChatSyncStoreError::Store)?
+                    {
+                        Some(reason) => {
+                            if let Some(initialization) = self.dataset().initialization().map_err(SqlChatSyncStoreError::Message)? {
+                                let bytes = self.store.queryOne("SELECT length(CAST(original AS BLOB)) FROM _operit_transaction_initialization WHERE id=1", vec![])
+                                    .map_err(SqlChatSyncStoreError::Store)?.and_then(|row| row.get::<_,i64>(0).ok()).unwrap_or_default();
+                                operit_util::AppLogger::AppLogger::i("CoreSyncTrace", &format!(
+                                    "sync_checkpoint.export path={} origin={} sequence={sequence} bytes={bytes} reason={}",
+                                    operit_util::RuntimeStorageLayout::SQLITE_DATABASE_PATH,
+                                    origin.trim_start_matches("~init:").get(..12).unwrap_or(origin.trim_start_matches("~init:")),
+                                    reason.as_str()));
+                                operations.insert(0,initialization);
+                                operations.truncate(limit);
+                            }
+                        },
+                        None => { operit_util::AppLogger::AppLogger::trace("CoreSyncTrace", &format!(
+                            "sync_checkpoint.covered path={} origin={}",
+                            operit_util::RuntimeStorageLayout::SQLITE_DATABASE_PATH,
+                            origin.trim_start_matches("~init:"))); },
                     }
                 }
             }
@@ -663,6 +709,16 @@ impl SqlChatSyncStore {
         }
         let payload = decodePayload(operation)
             .map_err(|error| SqliteStoreError::Message(error.to_string()))?;
+        let restoration = restorationIn(transaction)?;
+        let incoming = operationRestoration(&operation.originDeviceId)?;
+        if incoming > restoration {
+            return Err(SqliteStoreError::Message("Receive the restored database baseline before its edits".into()));
+        }
+        if incoming != restoration {
+            crate::Transaction::compaction::seal(transaction.raw(), operation)?;
+            observeOperation(transaction, operation)?;
+            return Ok(false);
+        }
         if crate::Transaction::covered_by_initialization(transaction, operation)? {
             crate::Transaction::compaction::seal(transaction.raw(),operation)?;
             observeOperation(transaction, operation)?;
@@ -677,9 +733,10 @@ impl SqlChatSyncStore {
     /// Marks local SQL operations before the Space join as unexportable.
     #[allow(non_snake_case)]
     pub fn markLocalOperationsUnexportable(&self) -> Result<(), SqlChatSyncStoreError> {
-        let sequence = self.localClock()?.sequenceFor(&self.originDeviceId);
+        let origin = self.store.transaction(|tx| localOrigin(tx, &self.originDeviceId))?;
+        let sequence = self.localClock()?.sequenceFor(&origin);
         self.syncOperationStore
-            .setExportFloor(&self.originDeviceId, sequence)?;
+            .setExportFloor(&origin, sequence)?;
         Ok(())
     }
 
@@ -715,10 +772,11 @@ impl SqlChatSyncStore {
         let result = self.store.transaction(|transaction| {
             let (result, payload) = action(transaction)?;
             for chatId in payloadChatIds(&payload) { requireLiveChatId(transaction, chatId)?; }
-            let sequence = sequenceFor(transaction, &self.originDeviceId)? + 1;
+            let origin = localOrigin(transaction, &self.originDeviceId)?;
+            let sequence = sequenceFor(transaction, &origin)? + 1;
             let operation = SyncOperation {
-                opId: format!("{}:{sequence}", self.originDeviceId),
-                originDeviceId: self.originDeviceId.clone(),
+                opId: format!("{origin}:{sequence}"),
+                originDeviceId: origin,
                 sequence,
                 domain: CHAT_SYNC_DOMAIN.to_string(),
                 entityType: entityType.to_string(),
@@ -1029,6 +1087,33 @@ fn readPartRows(
             })
         })
         .collect()
+}
+
+/// Reads restore lineage from the existing initializer metadata.
+fn restorationIn(tx: &mut SqliteTransaction<'_>) -> Result<Option<crate::Transaction::Revision>, SqliteStoreError> {
+    let row = tx.queryOne("SELECT data FROM _operit_initialization_metadata WHERE id=1", vec![])?;
+    let Some(row) = row else { return Ok(None); };
+    let metadata: serde_json::Value = serde_json::from_str(&row.get::<_, String>(0)?)
+        .map_err(|e| SqliteStoreError::Message(e.to_string()))?;
+    serde_json::from_value(metadata["restoration"].clone()).map_err(|e| SqliteStoreError::Message(e.to_string()))
+}
+
+/// Names a fresh operation origin per restore so rolled-back sequence numbers cannot collide.
+fn localOrigin(tx: &mut SqliteTransaction<'_>, device: &str) -> Result<String, SqliteStoreError> {
+    Ok(match restorationIn(tx)? {
+        Some(restoration) => format!("{device}:restore:{}:{}", restoration.createdAt, restoration.originDeviceId),
+        None => device.to_string(),
+    })
+}
+
+/// Decodes the restore lineage carried by the operation's immutable origin identifier.
+fn operationRestoration(origin: &str) -> Result<Option<crate::Transaction::Revision>, SqliteStoreError> {
+    let Some((_, lineage)) = origin.split_once(":restore:") else { return Ok(None); };
+    let (time, id) = lineage.split_once(':').ok_or_else(|| SqliteStoreError::Message("Invalid restore operation origin".into()))?;
+    Ok(Some(crate::Transaction::Revision {
+        createdAt: time.parse::<i64>().map_err(|e| SqliteStoreError::Message(e.to_string()))?,
+        originDeviceId: id.to_string(), sequence: 1,
+    }))
 }
 
 /// Reads the ordered deletion effects from the selected SQL operation.

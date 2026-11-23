@@ -523,6 +523,21 @@ exports.onInputMenuToggle = onInputMenuToggle;
 - `activity_on_stop`
 - `activity_on_destroy`
 
+应用级前后台由宿主统一判断，插件只使用上面的 `registerAppLifecycleHook`：
+
+| 事件 | 产品含义 |
+| --- | --- |
+| `application_on_create` | 当前 runtime 初始化；插件后启用时回放 |
+| `application_on_foreground` | 主界面显示：桌面窗口显示且未最小化，移动端场景可见，Web 标签页可见 |
+| `application_on_background` | 主界面收起：桌面最小化／隐藏／关闭后进程继续运行，移动端退后台，Web 标签页隐藏 |
+| `application_on_terminate` | runtime 有机会报告的正常终止；系统强杀时不保证收到 |
+
+失焦、输入法、系统弹窗、被其他窗口遮挡和插件辅助窗口都不改变应用级前后台。
+注册激活时按创建、当前前台或后台的顺序回放，不回放过期的前台状态；重复状态不重复通知。
+宿主尚未报告可见状态时不猜测前后台。`detached` 只代表 Flutter 视图分离，不代表 runtime 终止。
+Android 的 `activity_*` 仍表达 Activity 事实；跨平台产品行为应使用 `application_*`。
+普通插件不需要同时订阅 `registerHostEventHook` 的原始生命周期广播，也不需要按系统分别判断。
+
 **Compose DSL 运行时**：
 - 使用 JavaScript 编写声明式 UI
 - 提供丰富的 UI 组件（Column, Row, Button, TextField 等）
@@ -839,6 +854,7 @@ python plugins/tools/sync_plugin_packages.py --source runtime --no-hot-reload
 /* METADATA
 {
     "name": "windows_control",
+    "api_version": "2.0.0",
     "description": {
         "zh": "通过 HTTP 调用 Operit PC Agent 控制 Windows 电脑",
         "en": "Control a Windows PC through Operit PC Agent over HTTP"
@@ -1411,3 +1427,11 @@ ToolPkg 涉及 main、子包、UI、hook 与 provider 等上下文，单次执�
 ## 桌面小部件与通用悬浮窗
 
 `ToolPkg.registerDesktopWidget` 是桌面小部件注册接口。桌宠和其他实时悬浮工具使用独立的 `ToolPkg.ui.floatingWindows` 窗口控制接口，内容复用已注册的 Compose UI 路由。方法、平台能力、权限与生命周期见 [通用悬浮窗](../FLOATING_WINDOWS.md)。
+
+工具审批界面可用 `ToolPkg.registerToolPermissionHook({ id, function })` 监听
+`requests_changed`，直接读取 `event.eventPayload.requests`；也可用独立于 UI 的
+`ToolPkg.toolPermissions.list()` 查询当前待审批请求。
+在用户点击时调用 `ToolPkg.toolPermissions.respond(chatId, requestId, result)`，
+`result` 为 `allow`、`deny` 或 `allow_session`；持续批准按当前 runtime 运行范围生效。
+审批插件必须已启用且注册该 hook。聊天内卡片和插件共用请求，首次成功处理后同步移除，
+取消和超时同样通知。完整契约见 [工具审批呈现接口](../TOOL_PERMISSIONS.md)。

@@ -76,6 +76,74 @@ impl Drop for Node {
     }
 }
 
+/// Extracted database trees are ordinary files through capture, delivery and later edits.
+#[test]
+fn copied_database_trees_sync_without_policy_or_repeated_inventory_changes() {
+    let a = Node::new();
+    let b = Node::new();
+    let mut copied_files = Vec::new();
+    for root in [
+        "workspaces/project",
+        "runtime/data/chat_outputs/chat",
+        "runtime/data/chat_attachments/chat",
+    ] {
+        let database = format!("{root}/identities/old/runtime/plugin_data/space/demo/records.sqlite");
+        let marker = format!("{database}.operit-storage.json");
+        let metadata = br#"{"path":"runtime/plugin_data/space/demo/records.sqlite","owner":"demo","kind":"sqlite","sync":true}"#;
+        for (path, bytes) in [
+            (database, b"copied database".as_slice()),
+            (marker, metadata.as_slice()),
+            (format!("{root}/broken.sqlite"), b"another copied file".as_slice()),
+            (format!("{root}/broken.sqlite.operit-storage.json"), b"invalid copied metadata".as_slice()),
+        ] {
+            a.write(&path, bytes);
+            copied_files.push((path, bytes.to_vec()));
+        }
+        assert!(!a.host.exists(&format!("{root}/.operit/sync.json")).unwrap());
+    }
+    a.write("workspaces/healthy/note.txt", b"independent user file");
+    assert_eq!(a.workspace().scan().unwrap(), copied_files.len() + 1);
+    a.send(&b);
+    for (path, bytes) in &copied_files {
+        assert_eq!(b.host.readBytes(path).unwrap(), *bytes, "{path}");
+    }
+    assert_eq!(b.host.readBytes("workspaces/healthy/note.txt").unwrap(), b"independent user file");
+    for node in [&a, &b] {
+        let history = node.ops();
+        let versions = node.host.readBytes("runtime/sync/entity_versions.jsonl").unwrap();
+        for _ in 0..5 {
+            // Each call creates a fresh store, including reloading its durable inventory.
+            assert_eq!(node.workspace().scan().unwrap(), 0);
+        }
+        assert_eq!(node.ops(), history);
+        assert_eq!(node.host.readBytes("runtime/sync/entity_versions.jsonl").unwrap(), versions);
+    }
+
+    let path = &copied_files[0].0;
+    b.workspace().trackPaths(&[path], || {
+        b.host.writeBytes(path, b"edited copy").map_err(|error| error.to_string())
+    }).unwrap();
+    b.workspace().scan().unwrap();
+    b.send(&a);
+    assert_eq!(a.host.readBytes(path).unwrap(), b"edited copy");
+    assert_eq!(a.workspace().scan().unwrap(), 0);
+    assert_eq!(b.workspace().scan().unwrap(), 0);
+
+    let output = "runtime/data/chat_outputs/chat/identities";
+    a.workspace().trackPaths(&[output], || {
+        a.host.delete(output, true).map_err(|error| error.to_string())
+    }).unwrap();
+    a.workspace().scan().unwrap();
+    a.send(&b);
+    for suffix in ["records.sqlite", "records.sqlite.operit-storage.json"] {
+        let path = format!("{output}/old/runtime/plugin_data/space/demo/{suffix}");
+        assert!(!a.host.exists(&path).unwrap());
+        assert!(!b.host.exists(&path).unwrap());
+    }
+    assert_eq!(a.workspace().scan().unwrap(), 0);
+    assert_eq!(b.workspace().scan().unwrap(), 0);
+}
+
 #[test]
 fn bidirectional_binary_empty_and_no_echo() {
     let a = Node::new();
@@ -251,17 +319,19 @@ fn direct_workspace_repository_writes_do_not_echo_or_duplicate() {
     files
         .writeBytes("workspaces/project/direct.txt", b"one")
         .unwrap();
-    assert_eq!(a.workspace().scan().unwrap(), 0);
+    assert_eq!(a.workspace().scan().unwrap(), 1);
     a.send(&b);
     files
         .appendBytes("workspaces/project/direct.txt", b" two")
         .unwrap();
+    a.workspace().scan().unwrap();
     a.send(&b);
     assert_eq!(
         b.host.readBytes("workspaces/project/direct.txt").unwrap(),
         b"one two"
     );
     files.delete("workspaces/project/direct.txt").unwrap();
+    a.workspace().scan().unwrap();
     a.send(&b);
     assert!(!b.host.exists("workspaces/project/direct.txt").unwrap());
     // operationsSince compacts superseded states of the same entity.
@@ -439,6 +509,43 @@ impl CountedNode {
 
 }
 
+/// A tracked write commits local bytes and intent without traversing unrelated trees.
+#[test]
+fn tracked_writes_leave_discovery_to_the_scanner() {
+    let node = CountedNode::new();
+    node.host.writeBytes("workspaces/unrelated/file.txt", b"old").unwrap();
+    node.workspace().scan().unwrap();
+    node.host.directoryListings.lock().unwrap().clear();
+    let inventory_writes = node.host.inventoryWrites.load(Ordering::SeqCst);
+    let reads = node.reads();
+    RuntimeFileSyncStore::new(node.host.clone(), SYNC)
+        .writeBytes("workspaces/project/file.txt", b"new").unwrap();
+    assert!(node.host.directoryListings.lock().unwrap().is_empty());
+    assert_eq!(node.host.inventoryWrites.load(Ordering::SeqCst), inventory_writes);
+    assert_eq!(node.reads(), reads);
+    assert_eq!(node.host.readBytes("workspaces/project/file.txt").unwrap(), b"new");
+    assert!(node.host.exists("runtime/sync/workspace_dirty.json").unwrap());
+    assert_eq!(node.workspace().scan().unwrap(), 1);
+    assert!(!node.host.exists("runtime/sync/workspace_dirty.json").unwrap());
+}
+
+/// An invalid policy retains local intent until a later scan can safely publish it.
+#[test]
+fn failed_discovery_preserves_intent_across_store_recreation() {
+    let node = Node::new();
+    let path = "workspaces/project/file.txt";
+    let policy = "workspaces/project/.operit/sync.json";
+    node.write(policy, b"invalid JSON");
+    node.workspace().trackPaths(&[path], || node.host.writeBytes(path, b"local").map_err(|e| e.to_string())).unwrap();
+    node.workspace().scan().unwrap();
+    assert!(node.host.exists("runtime/sync/workspace_dirty.json").unwrap());
+    node.host.delete(policy, false).unwrap();
+    let restarted = Arc::new(NativeRuntimeStorageHost::new(node.root.join("runtime"), node.root.join("workspaces")));
+    WorkspaceFileSyncStore::new(restarted.clone(), SYNC).scan().unwrap();
+    assert!(!restarted.exists("runtime/sync/workspace_dirty.json").unwrap());
+    assert!(node.ops().iter().any(|operation| operation.entityId == path && operation.operation == "upsert"));
+}
+
 #[test]
 fn size_unchanged_scans_reuse_references_without_reading() {
     let node = CountedNode::new();
@@ -500,7 +607,7 @@ fn equal_time_and_size_do_not_read_or_hash_contents() {
 }
 
 #[test]
-fn structured_same_size_writes_publish_immediately() {
+fn structured_same_size_writes_publish_on_discovery() {
     let a = Node::new();
     let b = Node::new();
     a.write("workspaces/project/file.txt", b"hello");
@@ -508,6 +615,9 @@ fn structured_same_size_writes_publish_immediately() {
     RuntimeFileSyncStore::new(a.host.clone(), SYNC)
         .writeBytes("workspaces/project/file.txt", b"world")
         .unwrap();
+    assert!(a.host.exists("runtime/sync/workspace_dirty.json").unwrap());
+    a.workspace().scan().unwrap();
+    assert!(!a.host.exists("runtime/sync/workspace_dirty.json").unwrap());
     a.send(&b);
     assert_eq!(
         b.host.readBytes("workspaces/project/file.txt").unwrap(),
@@ -571,8 +681,10 @@ fn adding_ignore_rules_does_not_delete_peer_files_and_invalid_policy_is_safe() {
     assert!(!a.ops().iter().any(|o| o.operation == "delete"));
     let count = a.ops().len();
     a.write("workspaces/p/.operit/sync.json", b"{ invalid");
-    assert!(a.workspace().scan().is_err());
-    assert_eq!(a.ops().len(), count);
+    a.write("workspaces/healthy/next.txt", b"keep scanning");
+    assert_eq!(a.workspace().scan().unwrap(), 1);
+    assert_eq!(a.ops().len(), count + 1);
+    assert!(!a.ops().iter().any(|o| o.operation == "delete"));
 }
 
 #[test]
@@ -620,6 +732,23 @@ fn ignored_incoming_file_is_restored_when_rule_is_removed() {
     b.write("workspaces/p/.operit/sync.json", b"{}");
     b.workspace().scan().unwrap();
     assert_eq!(b.host.readBytes("workspaces/p/a.txt").unwrap(), b"arrived while ignored");
+}
+
+#[test]
+fn invalid_policy_defers_incoming_file_without_blocking_other_workspaces() {
+    let a = Node::new();
+    let b = Node::new();
+    b.write("workspaces/p/.operit/sync.json", b"{ invalid");
+    a.write("workspaces/p/incoming.txt", b"arrived while policy was broken");
+    a.workspace().scan().unwrap();
+    a.send(&b);
+    assert!(!b.host.exists("workspaces/p/incoming.txt").unwrap());
+
+    b.write("workspaces/healthy/note.txt", b"independent local edit");
+    assert_eq!(b.workspace().scan().unwrap(), 1);
+    b.write("workspaces/p/.operit/sync.json", b"{}");
+    b.workspace().scan().unwrap();
+    assert_eq!(b.host.readBytes("workspaces/p/incoming.txt").unwrap(), b"arrived while policy was broken");
 }
 
 /// Bindings and their relative files use the same existing Space file protocol.
@@ -917,6 +1046,123 @@ fn batch_flush_failure_keeps_recovery_intent_and_does_not_publish_versions() {
         assert!(!target._node.log().shouldApplyOperation(op).unwrap());
     }
     assert_eq!(target._node.ops().len(), operations.len());
+}
+
+fn wall_clock_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
+}
+
+/// Republishes one received operation under a fresh identity with a shifted
+/// createdAt, modelling a peer whose wall clock runs fast (or slow).
+fn skewed_copy(operation: &SyncOperation, shift_millis: i64) -> SyncOperation {
+    let mut skewed = operation.clone();
+    skewed.createdAt += shift_millis;
+    skewed.sequence += 1;
+    skewed.opId = format!("{}:{}", skewed.originDeviceId, skewed.sequence);
+    skewed
+}
+
+fn local_file_operation(node: &Node, path: &str) -> SyncOperation {
+    let device = node.log().localDeviceId().unwrap();
+    node.ops()
+        .into_iter()
+        .find(|op| op.originDeviceId == device && op.entityId == path)
+        .expect("local file operation was published")
+}
+
+/// A peer ten minutes ahead must not outrank every later local edit forever:
+/// observing its operation raises the local hybrid-clock floor instead.
+#[test]
+fn fast_peer_clock_does_not_outrank_later_local_edits() {
+    let a = Node::new();
+    let b = Node::new();
+    let path = "workspaces/project/skew.txt";
+    a.write(path, b"desktop");
+    a.workspace().scan().unwrap();
+    a.send(&b);
+    let skewed = skewed_copy(&a.ops().pop().unwrap(), 600_000);
+    a.log().appendOperations(&[skewed.clone()]).unwrap();
+    a.deliver(&b, &skewed);
+    assert_eq!(b.host.readBytes(path).unwrap(), b"desktop");
+
+    b.write(path, b"phone edit");
+    b.workspace().scan().unwrap();
+    let local = local_file_operation(&b, path);
+    assert!(
+        local.createdAt >= skewed.createdAt + 1,
+        "later local edit must outrank the fast peer clock: local={} peer={}",
+        local.createdAt,
+        skewed.createdAt
+    );
+    b.send(&a);
+    assert_eq!(a.host.readBytes(path).unwrap(), b"phone edit");
+    assert_eq!(b.host.readBytes(path).unwrap(), b"phone edit");
+}
+
+/// The floor is durable journal state, so a restart cannot lose the skew guard.
+#[test]
+fn hybrid_clock_floor_survives_restart() {
+    use operit_store::SyncOperationStore::{NewSyncOperation, SyncOperationSemantics};
+    let a = Node::new();
+    let b = Node::new();
+    let path = "workspaces/project/restart.txt";
+    a.write(path, b"desktop");
+    a.workspace().scan().unwrap();
+    a.send(&b);
+    let skewed = skewed_copy(&a.ops().pop().unwrap(), 600_000);
+    a.deliver(&b, &skewed);
+
+    let restarted = Arc::new(NativeRuntimeStorageHost::new(
+        b.root.join("runtime"),
+        b.root.join("workspaces"),
+    ));
+    let operation = SyncOperationStore::new(restarted, SYNC)
+        .appendLocalOperation(
+            &b.log().localDeviceId().unwrap(),
+            NewSyncOperation {
+                domain: RUNTIME_FILE_SYNC_DOMAIN.into(),
+                entityType: "file".into(),
+                entityId: "workspaces/project/restart-probe.txt".into(),
+                operation: "delete".into(),
+                semantics: SyncOperationSemantics::EntityState,
+                payload: serde_json::Value::Null,
+            },
+        )
+        .unwrap();
+    assert!(operation.createdAt >= skewed.createdAt + 1);
+}
+
+/// Without a newer peer timestamp, local createdAt keeps tracking the wall
+/// clock; an older peer operation neither pulls it down nor pushes it up.
+#[test]
+fn wall_clock_timestamps_are_unchanged_without_ahead_peer() {
+    let a = Node::new();
+    let b = Node::new();
+    let path = "workspaces/project/normal.txt";
+    let before = wall_clock_millis();
+    a.write(path, b"one");
+    a.workspace().scan().unwrap();
+    let first = a.ops().pop().unwrap();
+    let after = wall_clock_millis();
+    assert!(first.createdAt >= before && first.createdAt <= after + 100);
+    a.send(&b);
+
+    let stale = skewed_copy(&first, -600_000);
+    b.log().appendOperations(&[stale]).unwrap();
+    let before = wall_clock_millis();
+    b.write(path, b"two");
+    b.workspace().scan().unwrap();
+    let local = local_file_operation(&b, path);
+    let after = wall_clock_millis();
+    assert!(
+        local.createdAt >= before && local.createdAt <= after + 100,
+        "local createdAt must stay near the wall clock: {} not in [{before}, {}]",
+        local.createdAt,
+        after + 100
+    );
 }
 
 #[test]

@@ -559,6 +559,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "fnv"
+version = "1.0.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3f9eec918d3f24069decb9af1554cad7c880e2da24a9afd88aca000531ab82c1"
+
+[[package]]
 name = "form_urlencoded"
 version = "1.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -761,6 +767,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "h2"
+version = "0.4.19"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ef8e5e5a340588f4452631496976cf8636d4a7ecf600239fdc27615d2530bc16"
+dependencies = [
+ "atomic-waker",
+ "bytes",
+ "fnv",
+ "futures-core",
+ "futures-sink",
+ "http",
+ "indexmap",
+ "slab",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
 name = "hashbrown"
 version = "0.14.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -848,6 +873,7 @@ dependencies = [
  "bytes",
  "futures-channel",
  "futures-core",
+ "h2",
  "http",
  "http-body",
  "httparse",
@@ -1342,14 +1368,8 @@ checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 name = "operit-host-api"
 version = "0.1.0"
 dependencies = [
- "async-trait",
- "bytes",
- "chrono",
- "http",
- "http-body-util",
- "js-sys",
- "serde",
- "serde_json",
+ "operit-host-contract",
+ "operit-vfs",
 ]
 
 [[package]]
@@ -1378,6 +1398,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "operit-host-contract"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "base64",
+ "bytes",
+ "chrono",
+ "http",
+ "http-body-util",
+ "js-sys",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "operit-host-native-common"
 version = "0.1.0"
 dependencies = [
@@ -1401,7 +1436,7 @@ dependencies = [
  "grep-regex",
  "grep-searcher",
  "ignore",
- "operit-host-api",
+ "operit-host-contract",
  "zip",
 ]
 
@@ -1447,7 +1482,7 @@ name = "operit-host-native-storage"
 version = "0.1.0"
 dependencies = [
  "fs2",
- "operit-host-api",
+ "operit-host-contract",
  "rusqlite",
  "uuid",
  "windows-sys 0.59.0",
@@ -1462,6 +1497,16 @@ dependencies = [
  "operit-host-api",
  "operit-host-native-scheduler",
  "portable-pty",
+ "uuid",
+]
+
+[[package]]
+name = "operit-vfs"
+version = "0.1.0"
+dependencies = [
+ "operit-host-contract",
+ "serde",
+ "serde_json",
  "uuid",
 ]
 
@@ -1732,6 +1777,7 @@ dependencies = [
  "futures-channel",
  "futures-core",
  "futures-util",
+ "h2",
  "http",
  "http-body",
  "http-body-util",

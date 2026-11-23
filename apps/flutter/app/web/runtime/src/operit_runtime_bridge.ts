@@ -464,7 +464,7 @@ interface LinuxVmSession {
   progressVisible: boolean;
   activeCommand: LinuxVmCommand | null;
   pendingCommands: LinuxVmCommand[];
-  managedExecution: { output: number[]; result: LinuxVmCommandResult | null; error: string | null } | null;
+  managedExecution: { output: number[]; result: LinuxVmCommandResult | null; error: string | null; waiters: Set<Int32Array> } | null;
   screen: number[];
   workingDir: string;
 }
@@ -509,6 +509,8 @@ interface ManagedRuntimeProcess {
 }
 
 interface RuntimeGlobals {
+  __operitReportRuntimePanic?: (message: string) => void;
+  __operitShowWebError?: (source: string, details: string) => void;
   Tesseract?: BrowserOcrEngine;
   __OPERIT_MODEL_INSTALL_WORKER__?: boolean;
   __OPERIT_RUNTIME_WORKER__?: boolean;
@@ -650,10 +652,12 @@ interface RuntimeWorkerLeaderMessage {
   response?: Uint8Array;
   event?: Uint8Array;
   message?: unknown;
+  source?: string;
   module?: string;
   method?: string;
   args?: unknown[];
   control?: SharedArrayBuffer;
+  filesystem?: SharedArrayBuffer;
 }
 
 interface RuntimeWorkerShutdownComplete {
@@ -735,6 +739,7 @@ interface ModelInstallWorkerError {
 
 (function () {
   const runtimeGlobal = globalThis as typeof globalThis & RuntimeGlobals;
+  runtimeGlobal.__operitReportRuntimePanic = reportRuntimePanic;
   const workerHostModules = new WeakSet<object>();
   const mainHostModules = new WeakSet<object>();
   runtimeGlobal.__operitWorkerHostModules = workerHostModules;
@@ -761,16 +766,26 @@ interface ModelInstallWorkerError {
   }
 
   let terminalFilesystemBuffer: SharedArrayBuffer | null = null;
-  let terminalFilesystemControl: Int32Array | null = null;
   let notifyTerminalFilesystemWorker: (() => void) | null = null;
+
+  /** Wakes the owner independently of the page serving its current Host call. */
+  function wakeRuntimeWorkerHost(): void {
+    if (terminalFilesystemBuffer === null) throw new Error("Terminal filesystem owner is unavailable");
+    const header = new Int32Array(terminalFilesystemBuffer, 0, 3);
+    Atomics.add(header, 2, 1);
+    Atomics.notify(header, 2);
+  }
 
   /** Calls the OPFS owner directly, including while it waits for a guest command. */
   async function callTerminalFilesystem(method: string, args: unknown[]): Promise<unknown> {
     const buffer = terminalFilesystemBuffer;
     if (buffer === null) throw new Error("Terminal filesystem owner is unavailable");
-    const header = new Int32Array(buffer, 0, 2), payload = new Uint8Array(buffer, 8);
-    while (Atomics.compareExchange(header, 0, 0, 4) !== 0) {
-      await new Promise(resolve => setTimeout(resolve, 1));
+    const header = new Int32Array(buffer, 0, 3), payload = new Uint8Array(buffer, 12);
+    for (;;) {
+      const state = Atomics.compareExchange(header, 0, 0, 4);
+      if (state === 0) break;
+      if (state === -1) throw new Error("Terminal filesystem owner stopped");
+      await Atomics.waitAsync(header, 0, state).value;
     }
     try {
       const request = MessagePack.encode([method, args]);
@@ -778,20 +793,21 @@ interface ModelInstallWorkerError {
       payload.set(request);
       Atomics.store(header, 1, request.length);
       Atomics.store(header, 0, 1);
-      const control = terminalFilesystemControl;
-      if (control !== null) {
-        Atomics.compareExchange(control, 0, 0, 3);
-        Atomics.notify(control, 0);
-      }
+      wakeRuntimeWorkerHost();
       notifyTerminalFilesystemWorker?.();
-      while (Atomics.load(header, 0) !== 2) {
-        await new Promise(resolve => setTimeout(resolve, 1));
+      for (;;) {
+        const state = Atomics.load(header, 0);
+        if (state === 2) break;
+        if (state === -1) throw new Error("Terminal filesystem owner stopped");
+        await Atomics.waitAsync(header, 0, state).value;
       }
       const response = MessagePack.decode(payload.slice(0, Atomics.load(header, 1)));
       if (!Array.isArray(response) || response[0] !== 0) throw new Error(String(response[1]));
       return response[1];
     } finally {
-      Atomics.store(header, 0, 0);
+      Atomics.compareExchange(header, 0, 2, 0);
+      Atomics.compareExchange(header, 0, 4, 0);
+      Atomics.notify(header, 0);
     }
   }
 
@@ -1798,8 +1814,8 @@ interface ModelInstallWorkerError {
     return key(runtimePrefix, path);
   }
 
-  /** Persists SQLite bytes while restoring the real foreign-key setting reset by sql.js export. */
-  function saveSqliteDatabase(connection: SqliteConnection): void {
+  /** Exports SQLite pages while restoring the foreign-key setting reset by sql.js export. */
+  function exportSqliteDatabase(connection: SqliteConnection): Uint8Array {
     const rows = querySqlite(connection.db, "PRAGMA foreign_keys", []);
     if (rows.length !== 1 || rows[0].values.length !== 1) {
       throw new Error("sqlite foreign_keys query did not return one value");
@@ -1810,7 +1826,12 @@ interface ModelInstallWorkerError {
     }
     const bytes = connection.db.export();
     connection.db.run(`PRAGMA foreign_keys = ${foreignKeys.value}`);
-    storageWrite(runtimePrefix, connection.path, bytes);
+    return bytes;
+  }
+
+  /** Persists a standalone image without altering the live connection's foreign-key policy. */
+  function saveSqliteDatabase(connection: SqliteConnection): void {
+    storageWrite(runtimePrefix, connection.path, exportSqliteDatabase(connection));
   }
 
   function sqliteConnection(id: string): SqliteConnection {
@@ -3504,8 +3525,18 @@ self.onmessage = (event) => {
       if (execution !== null) {
         execution.output.push(byte);
         if (execution.output.length >= 1048576) execution.output.splice(0, 524288);
+        notifyLinuxVmCommand(execution);
       }
     }
+  }
+
+  /** Publishes durable producer signals for output, completion, failure, and close. */
+  function notifyLinuxVmCommand(execution: NonNullable<LinuxVmSession["managedExecution"]>): void {
+    for (const waiter of execution.waiters) {
+      Atomics.store(waiter, 0, 1);
+      Atomics.notify(waiter, 0);
+    }
+    execution.waiters.clear();
   }
 
   /** Parses one exact OSC command lifecycle marker emitted by the guest shell. */
@@ -4026,12 +4057,23 @@ self.onmessage = (event) => {
       startPtyCommand(sessionId: string, command: string): void {
         const session = linuxVmSession(sessionId);
         if (session.activeCommand !== null || session.pendingCommands.length > 0) throw new Error("Terminal session is busy");
-        const execution = { output: [] as number[], result: null as LinuxVmCommandResult | null, error: null as string | null };
+        const execution = { output: [] as number[], result: null as LinuxVmCommandResult | null, error: null as string | null, waiters: new Set<Int32Array>() };
         session.managedExecution = execution;
         void executeLinuxVmCommand(sessionId, command, 0).then(
-          result => { execution.result = result; },
-          error => { execution.error = String(error); },
+          result => { execution.result = result; notifyLinuxVmCommand(execution); },
+          error => { execution.error = String(error); notifyLinuxVmCommand(execution); },
         );
+      },
+      /** Registers a worker-owned signal, checking retained state before accepting a wait. */
+      armPtyCommand(sessionId: string, signal: SharedArrayBuffer): void {
+        const execution = linuxVmSession(sessionId).managedExecution;
+        if (execution === null) throw new Error("Terminal has no managed command");
+        const header = new Int32Array(signal);
+        if (header.length !== 1) throw new Error("Invalid terminal command signal");
+        execution.waiters.add(header);
+        if (execution.output.length > 0 || execution.result !== null || execution.error !== null) {
+          notifyLinuxVmCommand(execution);
+        }
       },
       /** Drains command output and reads its original receipt without sending terminal input. */
       pollPtyCommand(sessionId: string) {
@@ -4272,6 +4314,11 @@ self.onmessage = (event) => {
       },
     }),
     sqlite: registerWorkerHostModule({
+      /** Releases the database image retained by a Rust-owned connection. */
+      close(id: string): void {
+        sqliteConnection(id).db.close();
+        sqliteConnections.delete(id);
+      },
       open(path: string): string {
         if (!SQLite) {
           throw new Error("sqlite host is not initialized");
@@ -4731,6 +4778,18 @@ self.onmessage = (event) => {
       module_or_path: new URL("./operit_flutter_bridge_bg.wasm", import.meta.url),
     });
     return new module.OperitFlutterBridgeWasm();
+  }
+
+  /** Preserves Rust's panic location before an asynchronous Wasm trap loses that context. */
+  function reportRuntimePanic(message: string): void {
+    const details = `${message}\n\n${new Error("Rust runtime panic").stack}`;
+    if (isRuntimeWorker()) {
+      runtimeGlobal.postMessage({ type: "runtimeFatalError", source: "Rust panic", message: details });
+    } else if (isModelInstallWorker()) {
+      runtimeGlobal.postMessage({ type: "error", message: details });
+    } else {
+      runtimeGlobal.__operitShowWebError("Rust panic", details);
+    }
   }
 
   async function bridge() {
@@ -5200,6 +5259,7 @@ self.onmessage = (event) => {
     let runtimeWorker: Worker | null = null;
     let releaseLeadership: (() => void) | null = null;
     let closed = false;
+    let runtimeFailure: Error | null = null;
     let nextRequestId = 0;
     let nextRuntimeRequestId = 0;
     const pendingRequests = new Map<number, RuntimeWorkerPendingRequest>();
@@ -5232,6 +5292,7 @@ self.onmessage = (event) => {
       });
       runtimeWorker = worker;
       worker.addEventListener("message", handleRuntimeWorkerMessage);
+      worker.addEventListener("error", handleRuntimeWorkerError);
       worker.postMessage({ type: "configure", clientId });
       coordinator.postMessage({ type: "leaderReady" });
       forwardPendingRequests();
@@ -5275,6 +5336,10 @@ self.onmessage = (event) => {
         return;
       }
       const message = value as RuntimeWorkerLeaderMessage;
+      if (message.type === "runtimeFatalError") {
+        handleClientRuntimeMessage(message);
+        return;
+      }
       if (message.type === "clientDisconnect" && typeof message.clientId === "string") {
         if (runtimeWorker !== null) {
           disconnectLeaderClient(message.clientId);
@@ -5316,6 +5381,12 @@ self.onmessage = (event) => {
 
     /** Registers one globally routed request and dispatches it through the owner worker. */
     function forwardLeaderRequest(request: RuntimeWorkerLeaderRequest): void {
+      if (runtimeFailure !== null) {
+        deliverCoordinatorMessage(request.clientId, {
+          type: "runtimeFatalError", source: "Runtime worker error", message: runtimeFailure.message,
+        });
+        return;
+      }
       const routedRequests = leaderRequestIdsFor(request.clientId);
       if (routedRequests.has(request.clientRequestId)) {
         return;
@@ -5339,6 +5410,10 @@ self.onmessage = (event) => {
     /** Handles a result, event, or synchronous host message produced by the owner worker. */
     function handleRuntimeWorkerMessage(event: MessageEvent<unknown>): void {
       const message = event.data as RuntimeWorkerLeaderMessage;
+      if (message.type === "runtimeFatalError") {
+        publishRuntimeFailure(message);
+        return;
+      }
       if (message.type === "hostCall") {
         forwardLeaderHostCall(message);
         return;
@@ -5350,6 +5425,18 @@ self.onmessage = (event) => {
       if (message.type === "coreResult" || message.type === "coreError" || message.type === "coreWatchEvent") {
         forwardLeaderRuntimeReply(message);
       }
+    }
+
+    /** Delivers an uncaught worker exception with its source location to every runtime client. */
+    function handleRuntimeWorkerError(event: ErrorEvent): void {
+      const details = `${event.message}\n${event.filename}:${event.lineno}:${event.colno}`;
+      publishRuntimeFailure({ type: "runtimeFatalError", source: "Runtime worker error", message: details });
+    }
+
+    /** Broadcasts the owner's terminal failure without restarting the failed Wasm instance. */
+    function publishRuntimeFailure(message: RuntimeWorkerLeaderMessage): void {
+      coordinator.postMessage(message);
+      handleClientRuntimeMessage(message);
     }
 
     /** Routes one owner-worker reply to the page that issued its original Core request. */
@@ -5403,6 +5490,7 @@ self.onmessage = (event) => {
       if (typeof message.id !== "number" || typeof message.clientId !== "string" || !(message.control instanceof SharedArrayBuffer)) {
         throw new Error("runtime worker host call is invalid");
       }
+      if (message.filesystem instanceof SharedArrayBuffer) terminalFilesystemBuffer = message.filesystem;
       if (leaderClientHasDisconnectedRoute(message.clientId)) {
         respondToDisconnectedHostCall(message.id, message.control);
         return;
@@ -5436,6 +5524,12 @@ self.onmessage = (event) => {
 
     /** Handles a result, Watch event, or synchronous Host phase delivered to this browser page. */
     function handleClientRuntimeMessage(message: RuntimeWorkerLeaderMessage): void {
+      if (message.type === "runtimeFatalError") {
+        runtimeFailure ??= new Error(String(message.message));
+        rejectRuntimeRequests(runtimeFailure);
+        runtimeGlobal.__operitShowWebError(message.source, String(message.message));
+        return;
+      }
       if (message.type === "coreResult" && typeof message.id === "number" && message.response instanceof Uint8Array) {
         const pending = pendingRequests.get(message.id);
         if (pending !== undefined) {
@@ -5474,6 +5568,9 @@ self.onmessage = (event) => {
       payload: Uint8Array | string,
       onWatchEvent?: (event: Uint8Array) => void,
     ): Promise<{ id: number; response: Uint8Array }> {
+      if (runtimeFailure !== null) {
+        return Promise.reject(runtimeFailure);
+      }
       if (closed) {
         return Promise.reject(new Error("runtime page coordinator is closed"));
       }
@@ -5585,6 +5682,7 @@ self.onmessage = (event) => {
       Atomics.store(control, 1, payload.byteLength);
       Atomics.store(control, 0, 1);
       Atomics.notify(control, 0);
+      wakeRuntimeWorkerHost();
     }
 
     /** Completes the Dedicated Worker's second Host payload phase after page disconnection. */
@@ -5606,6 +5704,7 @@ self.onmessage = (event) => {
       const control = new Int32Array(controlBuffer);
       Atomics.store(control, 0, 2);
       Atomics.notify(control, 0);
+      wakeRuntimeWorkerHost();
     }
 
     /** Returns the globally routed request map for one client page. */
@@ -5641,6 +5740,12 @@ self.onmessage = (event) => {
     /** Rejects local requests when acquiring or maintaining the Web Lock fails. */
     function rejectRuntimeRequests(error: unknown): void {
       const failure = error instanceof Error ? error : new Error(String(error));
+      if (terminalFilesystemBuffer !== null) {
+        const header = new Int32Array(terminalFilesystemBuffer, 0, 3);
+        Atomics.store(header, 0, -1);
+        Atomics.notify(header, 0);
+        wakeRuntimeWorkerHost();
+      }
       for (const pending of pendingRequests.values()) {
         pending.reject(failure);
       }
@@ -5746,7 +5851,6 @@ self.onmessage = (event) => {
   ): Promise<void> {
     if (message.filesystem instanceof SharedArrayBuffer) {
       terminalFilesystemBuffer = message.filesystem;
-      terminalFilesystemControl = new Int32Array(message.control);
     }
     let encoded: Uint8Array;
     try {
@@ -5769,6 +5873,7 @@ self.onmessage = (event) => {
     Atomics.store(control, 1, encoded.byteLength);
     Atomics.store(control, 0, 1);
     Atomics.notify(control, 0);
+    wakeRuntimeWorkerHost();
   }
 
   /** Copies one prepared host response into the worker-provided shared buffer. */
@@ -5789,6 +5894,7 @@ self.onmessage = (event) => {
     const control = new Int32Array(message.control);
     Atomics.store(control, 0, 2);
     Atomics.notify(control, 0);
+    wakeRuntimeWorkerHost();
   }
 
   /** Converts one local runtime worker exception into a stable host error message. */

@@ -140,6 +140,7 @@ export function encodePackageToolParameter(value: PackageToolParameter): Record<
 
 export interface ToolPackage {
   readonly name: string;
+  readonly api_version: string;
   readonly description: LocalizedText;
   readonly tools: Array<PackageTool>;
   readonly states: Array<ToolPackageState>;
@@ -155,6 +156,7 @@ export function decodeToolPackage(value: unknown): ToolPackage {
   const input = value as Record<string, unknown>;
   return {
     name: input['name'] as string,
+    api_version: input['api_version'] as string,
     description: decodeLocalizedText(input['description']) as LocalizedText,
     tools: (input['tools'] as unknown[]).map((item) => decodePackageTool(item)) as Array<PackageTool>,
     states: (input['states'] as unknown[]).map((item) => decodeToolPackageState(item)) as Array<ToolPackageState>,
@@ -171,6 +173,7 @@ export function decodeToolPackage(value: unknown): ToolPackage {
 export function encodeToolPackage(value: ToolPackage): Record<string, unknown> {
   return {
     'name': value.name,
+    'api_version': value.api_version,
     'description': encodeLocalizedText(value.description),
     'tools': value.tools.map(item => encodePackageTool(item)),
     'states': value.states.map(item => encodeToolPackageState(item)),
@@ -606,6 +609,7 @@ export interface ToolPkgContainerRuntime {
   readonly publicApi: string | null;
   readonly publicApis: Array<ToolPkgRegisteredFunctionHook>;
   readonly requires: Array<ToolPkgManifestRequirement>;
+  readonly optionalRequires: Array<ToolPkgManifestRequirement>;
   readonly dependencyIssues: Array<ToolPkgDependencyIssue>;
   readonly manifestExtensions: Record<string, unknown>;
   readonly author: Array<string>;
@@ -639,6 +643,7 @@ export interface ToolPkgContainerRuntime {
   readonly chatResponseHooks: Array<ToolPkgFunctionHookRuntime>;
   readonly hostEventHooks: Array<ToolPkgHostEventHookRuntime>;
   readonly toolLifecycleHooks: Array<ToolPkgFunctionHookRuntime>;
+  readonly toolPermissionHooks: Array<ToolPkgFunctionHookRuntime>;
   readonly promptInputHooks: Array<ToolPkgFunctionHookRuntime>;
   readonly promptHistoryHooks: Array<ToolPkgFunctionHookRuntime>;
   readonly promptEstimateHistoryHooks: Array<ToolPkgFunctionHookRuntime>;
@@ -665,6 +670,7 @@ export function decodeToolPkgContainerRuntime(value: unknown): ToolPkgContainerR
     publicApi: input['publicApi'] == null ? null : input['publicApi'] as string | null,
     publicApis: (input['publicApis'] as unknown[]).map((item) => decodeToolPkgRegisteredFunctionHook(item)) as Array<ToolPkgRegisteredFunctionHook>,
     requires: (input['requires'] as unknown[]).map((item) => decodeToolPkgManifestRequirement(item)) as Array<ToolPkgManifestRequirement>,
+    optionalRequires: (input['optional_requires'] as unknown[]).map((item) => decodeToolPkgManifestRequirement(item)) as Array<ToolPkgManifestRequirement>,
     dependencyIssues: (input['dependencyIssues'] as unknown[]).map((item) => decodeToolPkgDependencyIssue(item)) as Array<ToolPkgDependencyIssue>,
     manifestExtensions: input['manifestExtensions'] as Record<string, unknown>,
     author: (input['author'] as unknown[]).map((item) => item) as Array<string>,
@@ -698,6 +704,7 @@ export function decodeToolPkgContainerRuntime(value: unknown): ToolPkgContainerR
     chatResponseHooks: (input['chatResponseHooks'] as unknown[]).map((item) => decodeToolPkgFunctionHookRuntime(item)) as Array<ToolPkgFunctionHookRuntime>,
     hostEventHooks: (input['hostEventHooks'] as unknown[]).map((item) => decodeToolPkgHostEventHookRuntime(item)) as Array<ToolPkgHostEventHookRuntime>,
     toolLifecycleHooks: (input['toolLifecycleHooks'] as unknown[]).map((item) => decodeToolPkgFunctionHookRuntime(item)) as Array<ToolPkgFunctionHookRuntime>,
+    toolPermissionHooks: (input['toolPermissionHooks'] as unknown[]).map((item) => decodeToolPkgFunctionHookRuntime(item)) as Array<ToolPkgFunctionHookRuntime>,
     promptInputHooks: (input['promptInputHooks'] as unknown[]).map((item) => decodeToolPkgFunctionHookRuntime(item)) as Array<ToolPkgFunctionHookRuntime>,
     promptHistoryHooks: (input['promptHistoryHooks'] as unknown[]).map((item) => decodeToolPkgFunctionHookRuntime(item)) as Array<ToolPkgFunctionHookRuntime>,
     promptEstimateHistoryHooks: (input['promptEstimateHistoryHooks'] as unknown[]).map((item) => decodeToolPkgFunctionHookRuntime(item)) as Array<ToolPkgFunctionHookRuntime>,
@@ -725,6 +732,7 @@ export function encodeToolPkgContainerRuntime(value: ToolPkgContainerRuntime): R
     'publicApi': value.publicApi === null ? null : value.publicApi,
     'publicApis': value.publicApis.map(item => encodeToolPkgRegisteredFunctionHook(item)),
     'requires': value.requires.map(item => encodeToolPkgManifestRequirement(item)),
+    'optional_requires': value.optionalRequires.map(item => encodeToolPkgManifestRequirement(item)),
     'dependencyIssues': value.dependencyIssues.map(item => encodeToolPkgDependencyIssue(item)),
     'manifestExtensions': Object.fromEntries(Object.entries(value.manifestExtensions).map(([key, item]) => [key, item])),
     'author': value.author.map(item => item),
@@ -758,6 +766,7 @@ export function encodeToolPkgContainerRuntime(value: ToolPkgContainerRuntime): R
     'chatResponseHooks': value.chatResponseHooks.map(item => encodeToolPkgFunctionHookRuntime(item)),
     'hostEventHooks': value.hostEventHooks.map(item => encodeToolPkgHostEventHookRuntime(item)),
     'toolLifecycleHooks': value.toolLifecycleHooks.map(item => encodeToolPkgFunctionHookRuntime(item)),
+    'toolPermissionHooks': value.toolPermissionHooks.map(item => encodeToolPkgFunctionHookRuntime(item)),
     'promptInputHooks': value.promptInputHooks.map(item => encodeToolPkgFunctionHookRuntime(item)),
     'promptHistoryHooks': value.promptHistoryHooks.map(item => encodeToolPkgFunctionHookRuntime(item)),
     'promptEstimateHistoryHooks': value.promptEstimateHistoryHooks.map(item => encodeToolPkgFunctionHookRuntime(item)),

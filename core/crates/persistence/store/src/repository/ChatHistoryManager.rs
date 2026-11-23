@@ -520,7 +520,12 @@ impl ChatHistoryManager {
         if let Some(id) = chat.workspaceId.as_deref() {
             if let Some(workspace) = self.getWorkspace(id)? {
                 let path = workspace.primaryFolder().path.clone();
-                if let Some(relative) = path.strip_prefix("/operitapp/workspaces/").or_else(|| path.strip_prefix("/app/workspaces/")) {
+                let localPath = match operit_util::FileUtils::FileUtils::splitQualifiedVfsPath(&path) {
+                    Some((owner, localPath)) if Some(owner) == crate::CoreNodeIdentityStore::CoreNodeIdentityStore::localNodeId().as_deref() => Some(localPath),
+                    Some(_) => None,
+                    None => Some(path.as_str()),
+                };
+                if let Some(relative) = localPath.and_then(|path| path.strip_prefix("/operitapp/workspaces/").or_else(|| path.strip_prefix("/app/workspaces/"))) {
                     crate::FileSyncPolicy::FileSyncPolicy::ensure(crate::RuntimeStorageHost::defaultRuntimeStorageHost().as_ref(), &format!("workspaces/{relative}"))
                         .map_err(ChatHistoryManagerError::IllegalState)?;
                 }
@@ -582,6 +587,11 @@ impl ChatHistoryManager {
     /// Reads the persisted current chat id.
     pub fn currentChatIdFlow(&self) -> ChatHistoryManagerResult<Option<String>> {
         Ok(self.currentChatIdFlow.first()?)
+    }
+
+    /// Reads the most recently updated remaining conversation without loading message histories.
+    pub fn mostRecentChatId(&self) -> ChatHistoryManagerResult<Option<String>> {
+        Ok(self.chatDao.getMostRecentChatId()?)
     }
 
     /// Saves host metadata and message edits without overwriting live namespaces or deleting independent variants.

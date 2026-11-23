@@ -153,7 +153,7 @@ test("policy bootstrap registers exactly the existing lifecycle and prompt handl
 /** Runs production policy against a full production-resolved snapshot, not current stored card permissions. */
 test("actual execution policy accepts only frozen builtin and registered source permissions", async t => {
   const runtime = await environment(t), context = await bind(runtime), before = ioCounts(runtime);
-  for (const name of ["read_file", "approved_package:read", "approved_skill:task", "approved_server:request", "search", "proxy", "package_proxy"]) assert.equal((await runtime.toolCallPolicy(event(name, context))).action, "allow", name);
+  for (const name of ["read_file", "approved_package:read", "approved_skill:task", "approved_server:request", "search", "package_wait", "proxy", "package_proxy"]) assert.equal((await runtime.toolCallPolicy(event(name, context))).action, "allow", name);
   for (const name of ["delete_file", "another_package:read", "approved_package_name_collision:read"]) {
     const decision = await runtime.toolCallPolicy(event(name, context));
     assert.equal(decision.action, "block", name); assert.equal(decision.reason, "Selected execution participant is not allowed to access tool: " + name);
@@ -162,6 +162,21 @@ test("actual execution policy accepts only frozen builtin and registered source 
   assert.equal((await runtime.toolCallPolicy(event("use_package", context, { package_name: "another_package" }))).action, "block");
   await assert.rejects(runtime.toolCallPolicy(event("use_package", context, {})), /actual package_name/);
   await assert.rejects(runtime.toolCallPolicy(event("approved_package:read:extra", context)), /Invalid registered package tool name/);
+  assert.deepEqual(ioCounts(runtime), before);
+});
+
+/** Saving an independent source choice must not implicitly grant its activation permission. */
+test("source policies without use_package save successfully and still block activation at execution", async t => {
+  const runtime = await environment(t);
+  await bind(runtime);
+  await runtime.dispatchDomain("character.update", { id: "default", changes: { toolAccessConfig: {
+    enabled: true, allowedBuiltinTools: ["read_file"], allowedPackages: ["approved_package"], allowedSkills: [], allowedMcpServers: [],
+  } } });
+  const context = await resolveContext(runtime, "policy-chat", "default"), before = ioCounts(runtime);
+  assert.equal((await runtime.toolCallPolicy(event("read_file", context))).action, "allow");
+  assert.equal((await runtime.toolCallPolicy(event("approved_package:read", context))).action, "allow");
+  assert.equal((await runtime.toolCallPolicy(event("use_package", context, { package_name: "approved_package" }))).action, "block");
+  assert.equal((await runtime.toolCallPolicy(event("another_package:read", context))).action, "block");
   assert.deepEqual(ioCounts(runtime), before);
 });
 

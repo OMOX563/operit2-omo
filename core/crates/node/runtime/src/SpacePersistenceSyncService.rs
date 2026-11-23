@@ -47,13 +47,13 @@ const MAX_SYNC_PAGES_PER_PASS: usize = 64;
 const PEER_FULL_SYNC_BACKOFF_BASE_MS: i64 = 2_000;
 /// Ceiling for the exponential retry delay of one peer's full synchronization pass.
 const PEER_FULL_SYNC_BACKOFF_MAX_MS: i64 = 60_000;
-/// Fast workspace-scan polling while scans keep finding changes. App writes and
-/// incoming batches scan inline, so this only bounds discovery latency for
-/// writes made by terminals and external editors while activity continues.
+/// Polls for app and external-editor changes without putting discovery on app writes.
 const WORKSPACE_SCAN_ACTIVE_INTERVAL_MS: u64 = 2_000;
-/// Bound external-editor discovery even after a long idle period. Unchanged files
+/// Bound idle polling for local edits. Unchanged files
 /// reuse metadata and blob references; the five-second ceiling leaves time to apply.
 const WORKSPACE_SCAN_IDLE_INTERVAL_MS: u64 = 5_000;
+const WORKSPACE_CHANGED: &str = "workspace_changed";
+const WORKSPACE_RETRY_POLL: &str = "workspace_retry_poll";
 
 /// Only verified exchange boundaries may become a caller's scheduling baseline.
 #[derive(Serialize, Deserialize)]
@@ -296,7 +296,7 @@ impl SpacePersistenceSyncService {
     fn startWorkspaceScanner(&self) -> Result<(), String> {
         let weakState = Arc::downgrade(&self.state);
         let (sender, mut stopped) = tokio::sync::oneshot::channel();
-        defaultHostRuntimeTaskSchedulerHost().scheduleHostRuntimeAsyncTask(
+        defaultHostRuntimeTaskSchedulerHost().scheduleHostRuntimeBlockingAsyncTask(
             "core-node-workspace-file-scan",
             Box::new(move || Box::pin(async move {
                 let mut intervalMs = WORKSPACE_SCAN_ACTIVE_INTERVAL_MS;
@@ -315,6 +315,10 @@ impl SpacePersistenceSyncService {
                         operit_util::AppLogger::AppLogger::w("SpacePersistenceSyncService",
                             &format!("Workspace scan failed; no missing-file deletions published: {error}"));
                     }
+                    // Reclamation belongs to background maintenance, never a file commit.
+                    operit_store::SyncOperationStore::SyncOperationStore::new(
+                        service.state.localRuntime.runtimeStorageHost(), RUNTIME_SYNC_DIR_PATH,
+                    ).collectBlobs(None);
                     // A productive round pulls the scanner back to fast polling;
                     // quiet rounds double the interval up to the idle ceiling.
                     intervalMs = if changes > 0 {
@@ -323,7 +327,7 @@ impl SpacePersistenceSyncService {
                         (intervalMs * 2).min(WORKSPACE_SCAN_IDLE_INTERVAL_MS)
                     };
                     // Also retry interrupted transfers even when no new edits occur.
-                    let _ = service.scheduleSynchronization(if changes > 0 { "workspace_changed" } else { "workspace_retry_poll" });
+                    let _ = service.scheduleSynchronization(if changes > 0 { WORKSPACE_CHANGED } else { WORKSPACE_RETRY_POLL });
                 }
             })),
         ).map_err(|e| e.to_string())?;
@@ -369,6 +373,10 @@ impl SpacePersistenceSyncService {
 
     /// Exchanges Space projections through direct pairings, then synchronizes every reachable member.
     pub async fn synchronizeOnce(&self) -> Result<(), String> {
+        self.synchronizeCycle(true).await
+    }
+
+    async fn synchronizeCycle(&self, scanWorkspace: bool) -> Result<(), String> {
         let space = self.state.spaceStore.initialize()?;
         self.state.progress.retain(&space.spaceId, &space.members);
         // A shared removal takes effect before any exchange: when the replayed
@@ -385,8 +393,10 @@ impl SpacePersistenceSyncService {
             }
         }
         let mut errors = Vec::new();
-        if let Err(error) = crate::fault_isolation::run("scan workspace files", || self.workspaceFiles().scan().map(|_| ())) {
-            errors.push(error);
+        if scanWorkspace {
+            if let Err(error) = crate::fault_isolation::run("scan workspace files", || self.workspaceFiles().scan().map(|_| ())) {
+                errors.push(error);
+            }
         }
         let services = self.state.nodeRouter.nodeServices()?;
         let activePeers = services.peers().activePeerNodeIds().map_err(|error| error.to_string())?;
@@ -920,7 +930,6 @@ impl SpacePersistenceSyncService {
         let mut seen = BTreeSet::new();
         let mut boundary = None;
         let mut failed = BTreeMap::<String, BTreeSet<String>>::new();
-        let mut compatible = true;
         loop {
             for page in 0..MAX_SYNC_PAGES_PER_PASS {
                 if !self.storageReplicationAllowed(targetNodeId)? { return Ok(false); }
@@ -930,18 +939,14 @@ impl SpacePersistenceSyncService {
                         self.callLocal::<Value>("syncClock", Value::Null),
                     );
                     let (mut local, mut remote) = (local?, remote?);
-                    validateDomainClock(&local, domains, "local")?;
-                    validateDomainClock(&remote, domains, "remote")?;
-                    if let Err(error) = consistency::requireConsistencySupport(&local, &remote) {
-                        compatible = false;
-                        return Err(error);
-                    }
+                    validateSyncReceipt(&local, "local")?;
+                    validateSyncReceipt(&remote, "remote")?;
                     boundary = Some((local.clone(), remote.clone()));
                     self.recordPendingWork(targetNodeId, "local receipt", &local);
                     self.recordPendingWork(targetNodeId, "remote receipt", &remote);
                     let mut blobs: Vec<RuntimeFileSyncReference> = serde_json::from_value(local["pendingBlobs"].clone()).map_err(|e|e.to_string())?;
                     blobs.extend(serde_json::from_value::<Vec<RuntimeFileSyncReference>>(remote["pendingBlobs"].clone()).map_err(|e|e.to_string())?);
-                    if let Err(error) = self.synchronizeBlobReferences(targetNodeId, blobs).await {
+                    if let Err(error) = self.synchronizeBlobReferences(targetNodeId, blobs, &BTreeMap::new()).await {
                         if SYNC_NETWORK_FAILURE.try_with(std::cell::Cell::get).unwrap_or(false) { return Err(error); }
                         self.recordPendingWork(targetNodeId, "pending blobs", &json!({"errors":[error]}));
                     }
@@ -979,7 +984,7 @@ impl SpacePersistenceSyncService {
                     Ok(false) => continue,
                     Ok(true) => break,
                     Err(error) => {
-                        if !compatible || SYNC_NETWORK_FAILURE.try_with(std::cell::Cell::get).unwrap_or(false) { return Err(error); }
+                        if SYNC_NETWORK_FAILURE.try_with(std::cell::Cell::get).unwrap_or(false) { return Err(error); }
                         self.recordPendingWork(targetNodeId, "incremental exchange", &json!({"errors":[error]}));
                         break;
                     }
@@ -1162,21 +1167,31 @@ impl SpacePersistenceSyncService {
         operations: &[SyncOperation],
     ) -> Result<(), String> {
         let mut errors = Vec::new();
-        let references = operations.iter().filter_map(|value| {
+        let mut references = Vec::new();
+        let mut sources = BTreeMap::<String, Vec<String>>::new();
+        for value in operations {
             match RuntimeFileSyncStore::requiredBlob(value) {
-                Ok(reference) => reference,
-                Err(error) => { errors.push(error); None }
+                Ok(Some(reference)) => {
+                    let ids = sources.entry(reference.contentHash.clone()).or_default();
+                    if ids.len() < 2 { ids.push(value.opId.clone()); }
+                    references.push(reference);
+                }
+                Ok(None) => {}
+                Err(error) => { errors.push(error); }
             }
-        }).collect();
-        if let Err(error) = self.synchronizeBlobReferences(targetNodeId, references).await { errors.push(error); }
+        }
+        if let Err(error) = self.synchronizeBlobReferences(targetNodeId, references, &sources).await { errors.push(error); }
         if errors.is_empty() { Ok(()) } else { Err(errors.join("; ")) }
     }
 
     /// Overlaps independent blob transfers on the existing multiplexed channel with bounded buffers.
+    /// The attribution map names the operations requiring each hash so a full
+    /// transfer logs which original or correction snapshot demanded it.
     async fn synchronizeBlobReferences(
         &self,
         targetNodeId: &str,
         references: Vec<RuntimeFileSyncReference>,
+        attribution: &BTreeMap<String, Vec<String>>,
     ) -> Result<(), String> {
         let references = references.into_iter()
             .map(|reference|((reference.contentHash.clone(),reference.size),reference))
@@ -1191,7 +1206,14 @@ impl SpacePersistenceSyncService {
             match local.and_then(|local| remote.map(|remote| (local, remote))) {
                 Ok((true,true)) => {},
                 Ok((false,false)) => errors.push(format!("blob {} is missing from both direct peers",reference.contentHash)),
-                Ok((local,_)) => pending.push((reference,local)),
+                Ok((local,_)) => {
+                    let ops = attribution.get(&reference.contentHash)
+                        .map(|ids| ids.join(",")).unwrap_or_else(|| "receipt".to_string());
+                    operit_util::AppLogger::AppLogger::i("CoreSyncTrace", &format!(
+                        "sync_blobs.required target={targetNodeId} hash={} bytes={} holder={} ops={}",
+                        reference.contentHash.get(..12).unwrap_or(&reference.contentHash), reference.size, if local {"local"} else {"remote"}, ops));
+                    pending.push((reference,local));
+                },
                 Err(error) => errors.push(error),
             }
         }
@@ -1309,7 +1331,11 @@ impl SpacePersistenceSyncService {
                     }
                     service.state.synchronizationRequested.store(false, Ordering::Release);
                     let reasons = std::mem::take(&mut *service.state.synchronizationReasons.lock()
-                        .unwrap_or_else(|error| error.into_inner())).into_iter().collect::<Vec<_>>().join(",");
+                        .unwrap_or_else(|error| error.into_inner()));
+                    // A workspace tick has already scanned (and reported any failure).
+                    // Other wakeups keep the immediate scan before exchanging with peers.
+                    let scanWorkspace = !reasons.contains(WORKSPACE_CHANGED) && !reasons.contains(WORKSPACE_RETRY_POLL);
+                    let reasons = reasons.into_iter().collect::<Vec<_>>().join(",");
                     let synchronizedRevision = syncMutationRevision();
                     let syncStartedAt = currentTimeMillis();
                     let localNodeId = service.state.nodeRouter.localNodeId();
@@ -1321,7 +1347,7 @@ impl SpacePersistenceSyncService {
                         ),
                         operit_util::AppLogger::VERBOSE_LEVEL_5,
                     );
-                    match crate::fault_isolation::operation("Space synchronization pass", service.synchronizeOnce()).await {
+                    match crate::fault_isolation::operation("Space synchronization pass", service.synchronizeCycle(scanWorkspace)).await {
                         Ok(()) => {
                             operit_util::AppLogger::AppLogger::v_with_level(
                                 "SpacePersistenceSyncService",
@@ -1401,12 +1427,9 @@ fn persistenceServices() -> &'static Mutex<BTreeMap<String, Weak<SpacePersistenc
     SPACE_SYNC_SERVICES.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
 
-/// Rejects only the requested domains whose durable clocks could not be read.
+/// Validates receipt intervals after the unified peer protocol has been admitted.
 #[allow(non_snake_case)]
-fn validateDomainClock(clock: &Value, _domains: &[&str], side: &str) -> Result<(), String> {
-    if clock.get("protocolVersion").and_then(Value::as_u64) != Some(1) {
-        return Err(format!("{side} synchronization receipt protocol mismatch"));
-    }
+fn validateSyncReceipt(clock: &Value, side: &str) -> Result<(), String> {
     let receipt: operit_store::SyncOperationStore::SyncReceipt =
         serde_json::from_value(clock.clone())
             .map_err(|error| format!("{side} synchronization receipt: {error}"))?;
@@ -1699,10 +1722,10 @@ mod page_budget_tests {
     #[test]
     fn plugin_clock_failures_are_isolated_from_core_domains() {
         let clock = json!({
-            "protocolVersion": 1, "ranges": {"core": [[1,7]]},
+            "ranges": {"core": [[1,7]]},
             "errors": ["invalid plugin catalog"],
         });
-        assert!(validateDomainClock(&clock, &SYNC_DOMAINS, "local").is_ok());
+        assert!(validateSyncReceipt(&clock, "local").is_ok());
         let durable: operit_store::SyncOperationStore::SyncReceipt = serde_json::from_value(clock).unwrap();
         assert_eq!(durable.ranges["core"], vec![[1,7]]);
     }
@@ -1710,8 +1733,8 @@ mod page_budget_tests {
     /// Clears a plugin clock error only when the actual clock can be read again.
     #[test]
     fn recovered_plugin_clock_can_synchronize_again() {
-        let clock = json!({"protocolVersion": 1, "ranges": {"plugin": [[1,2]]}, "errors": []});
-        assert!(validateDomainClock(&clock, &SYNC_DOMAINS, "local").is_ok());
+        let clock = json!({"ranges": {"plugin": [[1,2]]}, "errors": []});
+        assert!(validateSyncReceipt(&clock, "local").is_ok());
     }
 
 

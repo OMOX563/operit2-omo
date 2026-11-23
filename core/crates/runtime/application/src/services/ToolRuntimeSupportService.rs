@@ -1,6 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, OnceLock, RwLock};
 
+#[path = "compat/v1/ChatArchive.rs"]
+mod v1_chat_archive;
+
 use operit_host_api::HostEnvironmentDescriptor;
 use operit_model::FunctionType::FunctionType;
 use operit_model::PromptFunctionType::PromptFunctionType;
@@ -12,7 +15,7 @@ use operit_providers::chat::config::SystemToolPrompts as ProviderToolPrompts;
 use operit_providers::chat::enhance::FileBindingService::{
     FileBindingService, StructuredEditAction, StructuredEditOperation,
 };
-use operit_providers::chat::llmprovider::AIService::SendMessageRequest;
+use operit_providers::chat::llmprovider::AIService::{ensure_response_completed, SendMessageRequest};
 use operit_providers::chat::llmprovider::ThinkingDialect::RequestThinking;
 use operit_providers::chat::EnhancedAIService::EnhancedAIService;
 use operit_providers::runtime_support::ProviderRuntimeContext;
@@ -29,13 +32,12 @@ use operit_tools::tools::packTool::RuntimePackageManager::RuntimePackageManager;
 use operit_tools::tools::skill::SkillManager::SkillManager;
 use operit_tools::tools::AIToolHandler::AIToolHandler;
 use operit_util::stream::Stream::Stream;
-use operit_util::TtsCleaner::TtsCleaner;
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::services::core::ChatTurnTransport::{
     AdmittedChatTurn, AdmittedChatTurnWork, ChatTurnTransport, SharedChatTurnTransport,
 };
-use crate::core::chat::ChatRuntimeHolder::ChatRuntimeHolder;
+use crate::core::chat::ChatRuntimeHolder::{ChatRuntimeHolder, ChatRuntimeProcessingState};
 use crate::core::chat::ChatRuntimeSlot::ChatRuntimeSlot;
 use crate::data::preferences::EnvPreferences::EnvPreferences;
 use crate::data::preferences::SkillVisibilityPreferences::SkillVisibilityPreferences;
@@ -57,8 +59,10 @@ impl ToolRuntimeSupportService {
         Arc::new(RuntimeToolSupport {
             hostManager,
             chatRuntimeHolder,
+            preparedChatDelivery: Default::default(),
             chatTurnTransport: Arc::new(std::sync::Mutex::new(ChatTurnTransport::default())),
             runtimeBindings: OnceLock::new(),
+            chatProcessingState: OnceLock::new(),
             chatHistoryManager: OnceLock::new(),
             coreNodeToolRuntime: RwLock::new(None),
             deviceToolRuntime: OnceLock::new(),
@@ -75,10 +79,12 @@ struct RuntimeToolBindings {
 
 /// Bridges tool-owned interfaces to runtime-owned managers and registries.
 pub struct RuntimeToolSupport {
+    preparedChatDelivery: crate::services::PreparedChatDeliveryService::PreparedChatDeliveryService,
     hostManager: operit_host_api::HostManager::HostManager,
     chatRuntimeHolder: Arc<AsyncMutex<ChatRuntimeHolder>>,
     chatTurnTransport: SharedChatTurnTransport,
     runtimeBindings: OnceLock<RuntimeToolBindings>,
+    chatProcessingState: OnceLock<ChatRuntimeProcessingState>,
     chatHistoryManager: OnceLock<operit_store::repository::ChatHistoryManager::ChatHistoryManager>,
     coreNodeToolRuntime: RwLock<Option<Arc<dyn CoreNodeToolRuntime>>>,
     deviceToolRuntime: OnceLock<Arc<dyn operit_tools::tools::DeviceTools::DeviceToolRuntime>>,
@@ -86,6 +92,24 @@ pub struct RuntimeToolSupport {
 }
 
 impl RuntimeToolSupport {
+    /// Starts one host-owned delivery worker. It survives plugin unload and restores persisted plans.
+    pub fn startScheduledChatDelivery(self: &Arc<Self>) -> Result<(), String> {
+        if self.hostManager.runtimeStorageHost.is_none() { return Ok(()); }
+        let scheduler = self.hostManager.hostRuntimeTaskSchedulerHost.clone().ok_or("Scheduled chat scheduler is unavailable")?;
+        let timer = scheduler.clone();
+        let weak = Arc::downgrade(self);
+        scheduler.scheduleHostRuntimeAsyncTask("scheduled-chat-messages", Box::new(move || Box::pin(async move {
+            loop {
+                let Some(runtime) = weak.upgrade() else { break; };
+                if let Err(error) = runtime.preparedChatDelivery.reconcile(&runtime.hostManager, &runtime.chatRuntimeHolder).await {
+                    operit_util::AppLogger::AppLogger::e("ScheduledChatMessages", &error);
+                }
+                drop(runtime);
+                if timer.waitForHostRuntimeDelay(1000).await.is_err() { break; }
+            }
+        }))).map_err(|e| e.message)
+    }
+
     /// Binds services that depend on the tool runtime support instance itself.
     pub fn bindRuntimeServices(
         &self,
@@ -98,6 +122,17 @@ impl RuntimeToolSupport {
                 providerRuntimeContext,
             })
             .map_err(|_| "Tool runtime services are already bound".to_string())
+    }
+
+    /// Captures live execution-flow readers before publishing the initialized chat runtime.
+    #[allow(non_snake_case)]
+    pub(crate) fn bindChatProcessingState(
+        &self,
+        state: ChatRuntimeProcessingState,
+    ) -> Result<(), String> {
+        self.chatProcessingState
+            .set(state)
+            .map_err(|_| "Tool runtime chat processing state is already bound".to_string())
     }
 
     /// Captures the canonical manager shared with this runtime's chat delegates and execution leases.
@@ -135,6 +170,36 @@ impl RuntimeToolSupport {
 }
 
 impl ToolRuntimeSupport for RuntimeToolSupport {
+    /// Routes plugin approval decisions to the same broker used by inline chat controls.
+    fn toolPermissionCommand(&self, payload: serde_json::Value) -> Result<serde_json::Value, String> {
+        use crate::services::RuntimeHostInteractionService::{pendingToolPermissions, respondChatToolPermission};
+        #[derive(serde::Deserialize)]
+        #[serde(tag = "operation", deny_unknown_fields)]
+        enum Command {
+            #[serde(rename = "list")]
+            List,
+            #[serde(rename = "respond", rename_all = "camelCase")]
+            Respond { chat_id: String, request_id: String, result: operit_plugin_sdk::js_sdk::toolpkg::ToolPkgToolPermissionDecision },
+        }
+        match serde_json::from_value(payload).map_err(|error| error.to_string())? {
+            Command::List => serde_json::to_value(pendingToolPermissions()).map_err(|error| error.to_string()),
+            Command::Respond { chat_id, request_id, result } => {
+                let decision = match result {
+                    operit_plugin_sdk::js_sdk::toolpkg::ToolPkgToolPermissionDecision::Allow => "allow",
+                    operit_plugin_sdk::js_sdk::toolpkg::ToolPkgToolPermissionDecision::Deny => "deny",
+                    operit_plugin_sdk::js_sdk::toolpkg::ToolPkgToolPermissionDecision::AllowSession => "allow_session",
+                };
+                respondChatToolPermission(chat_id, request_id, decision.into())?;
+                Ok(serde_json::Value::Null)
+            }
+        }
+    }
+
+    /// Imports the v1 migrator's archive through the runtime's bound chat store.
+    fn importV1MigratorArchive(&self, path: String) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + '_>> {
+        Box::pin(v1_chat_archive::import(self, path))
+    }
+
     fn bindDeviceToolRuntime(&self, runtime: Arc<dyn operit_tools::tools::DeviceTools::DeviceToolRuntime>) -> Result<(), String> {
         self.deviceToolRuntime.set(runtime).map_err(|_| "Device tool routing is already initialized".into())
     }
@@ -230,35 +295,61 @@ impl ToolRuntimeSupport for RuntimeToolSupport {
             .synthesizeAudioWithConfig(&id, &request.text)
     }
 
-    /// Resolves the exact configured system voice and applies utterance-only playback overrides.
+    /// Resolves the selected voice and starts configured speech with utterance-only overrides.
     #[allow(non_snake_case)]
-    fn speakSpeech(&self, request: TtsSpeakRequest) -> Result<TtsSpeakResultData, String> {
-        let manager = crate::data::preferences::TtsConfigManager::TtsConfigManager::getInstance();
-        let id = match request.configId {
-            Some(id) => id,
-            None => manager.getCurrentTtsConfigId()?,
-        };
-        let mut config = manager.getTtsConfig(&id)?;
-        if let Some(speed) = request.speed {
-            config.speed = speed;
-        }
-        let interrupt = request.interrupt.unwrap_or(true);
-        let pitch = request.pitch.unwrap_or(1.0);
-        let providerType = operit_model::TtsConfig::TtsProviderType::normalize(&config.providerType);
-        let speed = config.speed;
-        let status = TtsPlaybackService::getInstance(&self.hostManager)?.speakWithResolvedConfig(
-            config,
-            TtsCleaner::clean(&request.text),
-            interrupt,
-            pitch,
-        )?;
-        Ok(TtsSpeakResultData {
-            providerType,
-            started: status.active,
-            interrupt,
-            speed,
-            pitch,
+    fn speakSpeech(
+        &self,
+        request: TtsSpeakRequest,
+        owner: Option<String>,
+    ) -> futures_util::future::BoxFuture<'_, Result<TtsSpeakResultData, String>> {
+        Box::pin(async move {
+            let playbackKey = match request.playbackId {
+                Some(id) => {
+                    if id.is_empty() || id.trim() != id || id.len() > 128 {
+                        return Err("Speech playback ID must be 1–128 bytes of trimmed text".into());
+                    }
+                    Some((owner.ok_or("Named speech requires an authenticated plugin")?, id))
+                }
+                None => None,
+            };
+            let manager =
+                crate::data::preferences::TtsConfigManager::TtsConfigManager::getInstance();
+            let id = match request.configId {
+                Some(id) => id,
+                None => manager.getCurrentTtsConfigId()?,
+            };
+            let mut config = manager.getTtsConfig(&id)?;
+            if let Some(speed) = request.speed {
+                config.speed = speed;
+            }
+            let interrupt = request.interrupt.unwrap_or(true);
+            let pitch = request.pitch.unwrap_or(1.0);
+            let providerType =
+                operit_model::TtsConfig::TtsProviderType::normalize(&config.providerType);
+            let speed = config.speed;
+            let status = TtsPlaybackService::speakConfigured(
+                &self.hostManager,
+                config,
+                request.text,
+                interrupt,
+                pitch,
+                request.waitForCompletion.unwrap_or(false),
+                playbackKey,
+            )
+            .await?;
+            Ok(TtsSpeakResultData {
+                providerType,
+                started: status.active,
+                interrupt,
+                speed,
+                pitch,
+            })
         })
+    }
+
+    /// Cancels a queued or playing utterance owned by this plugin.
+    fn cancelSpeech(&self, owner: &str, id: &str) -> Result<bool, String> {
+        TtsPlaybackService::getInstance(&self.hostManager)?.cancelConfigured(owner, id)
     }
 
     fn transcribeSpeech(&self, request: operit_plugin_sdk::js_sdk::stt::SttTranscribeRequest)
@@ -640,23 +731,14 @@ impl ToolRuntimeSupport for RuntimeToolSupport {
             .chatRuntimeHolder
             .try_lock()
             .map_err(|_| "Chat runtime holder is busy".to_string())?;
-        holder.cores.clear();
-        holder.activeConversationCount = 0;
-        holder.currentSessionToolCount = 0;
+        holder.clearCores();
         Ok(())
     }
 
-    /// Returns whether the requested chat is currently processing.
-    #[allow(non_snake_case)]
-    fn isChatProcessing(&self, chatId: &str) -> Result<bool, String> {
-        let holder = self
-            .chatRuntimeHolder
-            .try_lock()
-            .map_err(|_| "Chat runtime holder is busy".to_string())?;
-        Ok(holder
-            .cores
-            .values()
-            .any(|core| core.messageProcessingDelegate.isChatProcessing(chatId)))
+    fn chatAgentStatus(&self, chatId: &str) -> Result<operit_plugin_sdk::js_sdk::results::AgentStatusResultData, String> {
+        self.chatProcessingState.get()
+            .ok_or_else(|| "Tool runtime chat processing state is not bound".to_string())?
+            .agentStatus(chatId)
     }
 
     /// Switches the main chat only after its registered configuration owner has resolved the actual binding.
@@ -715,6 +797,34 @@ impl ToolRuntimeSupport for RuntimeToolSupport {
             holder.observeStats();
             Ok(chatId)
         })
+    }
+
+    fn listScheduledChatMessages<'a>(&'a self, owner: &'a str)
+        -> futures_util::future::BoxFuture<'a, Result<operit_plugin_sdk::js_sdk::results::ChatScheduledMessagesResultData, String>> {
+        Box::pin(self.preparedChatDelivery.list(&self.hostManager, owner))
+    }
+    fn setScheduledChatForeground(&self, foreground: bool) { self.preparedChatDelivery.setForeground(foreground); }
+    fn deliverPreparedChatMessage<'a>(&'a self, request: operit_plugin_sdk::js_sdk::chat::ChatPreparedMessageRequest)
+        -> futures_util::future::BoxFuture<'a, Result<operit_plugin_sdk::js_sdk::results::ChatPreparedDeliveryResultData, String>> {
+        Box::pin(crate::services::PreparedChatDeliveryService::PreparedChatDeliveryService::deliver(
+            &self.hostManager, &self.chatRuntimeHolder, request))
+    }
+    fn scheduleChatMessage<'a>(&'a self, owner: &'a str, request: operit_plugin_sdk::js_sdk::chat::ChatScheduledMessageRequest)
+        -> futures_util::future::BoxFuture<'a, Result<operit_plugin_sdk::js_sdk::results::ChatScheduleMessageResultData, String>> {
+        Box::pin(async move {
+            let service = match &request.generation {
+                Some(_) => {
+                    let bindings = self.runtimeBindings()?.clone();
+                    Some(EnhancedAIService::new(bindings.toolHandler, bindings.providerRuntimeContext))
+                }
+                None => None,
+            };
+            self.preparedChatDelivery.schedule(&self.hostManager, self.runtimeChatHistoryManager()?, owner, request, &self.chatRuntimeHolder, service).await
+        })
+    }
+    fn cancelScheduledChatMessage<'a>(&'a self, owner: &'a str, id: String)
+        -> futures_util::future::BoxFuture<'a, Result<operit_plugin_sdk::js_sdk::results::ChatCancelScheduledMessageResultData, String>> {
+        Box::pin(self.preparedChatDelivery.cancel(&self.hostManager, owner, id))
     }
 
     /// Reads one owner's extension directly from the canonical record without acquiring a chat holder lock.
@@ -829,11 +939,14 @@ impl ToolRuntimeSupport for RuntimeToolSupport {
         let holder = self.chatRuntimeHolder.clone();
         operit_host_api::HostManager::defaultHostRuntimeTaskSchedulerHost()
             .scheduleHostRuntimeAsyncTask("native-chat-cancel", Box::new(move || Box::pin(async move {
-                let mut runtime = holder.lock().await;
-                if let Err(error) = runtime.getCore(slot).cancelNativeChatExecution(&capturedChatId, &executionId).await {
+                let pending = {
+                    let mut runtime = holder.lock().await;
+                    runtime.getCore(slot).cancelNativeChatExecution(&capturedChatId, &executionId)
+                };
+                if let Err(error) = pending.await {
                     operit_util::AppLogger::AppLogger::e("NativeChatCancel", &error);
                 }
-                runtime.observeStats();
+                holder.lock().await.observeStats();
             }))).map_err(|error| format!("Native chat cancellation scheduling failed: {error}"))?;
         Ok(ChatCancelResult { chatId: chatId.to_string(), cancelRequested: true })
     }
@@ -909,6 +1022,9 @@ impl ToolRuntimeSupport for RuntimeToolSupport {
         request: RuntimeChatCallRequest,
     ) -> ToolRuntimeSupportFuture<'a, Result<String, String>> {
         Box::pin(async move {
+            let modelErrors = self.chatRuntimeHolder.lock().await
+                .getCore(ChatRuntimeSlot::MAIN).messageProcessingDelegate.toastEventFlow.clone();
+            let providerErrors = modelErrors.clone();
             let bindings = self.runtimeBindings()?.clone();
             let mut service =
                 EnhancedAIService::new(bindings.toolHandler, bindings.providerRuntimeContext);
@@ -935,14 +1051,25 @@ impl ToolRuntimeSupport for RuntimeToolSupport {
                         available_tools: Vec::new(),
                         preserve_think_in_history: true,
                         enable_retry: false,
-                        on_non_fatal_error: None,
+                        on_non_fatal_error: Some(Arc::new(move |error| {
+                            providerErrors.set_value(Some(error));
+                        })),
                         on_tool_invocation: None,
                     })
                     .await
-                    .map_err(|error| error.to_string())?
+                    .map_err(|error| {
+                        let message = error.to_string();
+                        modelErrors.set_value(Some(message.clone()));
+                        message
+                    })?
             };
             let mut output = String::new();
             response.collect(&mut |chunk| output.push_str(&chunk)).await;
+            ensure_response_completed(response.as_ref()).map_err(|error| {
+                let message = error.to_string();
+                modelErrors.set_value(Some(message.clone()));
+                message
+            })?;
             if request.recordTokenUsage {
                 let (inputTokens, cachedInputTokens, outputTokens) = {
                     let provider = aiService.lock().await;
@@ -1134,13 +1261,18 @@ async fn runAdmittedChatTurn(
             message, None, None, None, attachments, reply, options, Some(admitted.lease.clone()))
     };
     let submission = submission.await?;
-    {
+    let cancellation = {
         let mut runtime = holder.lock().await;
-        if admitted.cancelled.load(Ordering::Acquire) {
+        let cancellation = admitted.cancelled.load(Ordering::Acquire).then(|| {
             runtime.getCore(admitted.slot.clone())
-                .cancelNativeChatExecution(chatId, &admitted.handle.executionId).await?;
-        }
+                .cancelNativeChatExecution(chatId, &admitted.handle.executionId)
+        });
         runtime.observeStats();
+        cancellation
+    };
+    if let Some(cancellation) = cancellation {
+        cancellation.await?;
+        holder.lock().await.observeStats();
     }
     submission.wait().await
 }
@@ -1300,3 +1432,7 @@ fn runtimeEditOperationToProvider(
         newContent: operation.newContent.clone(),
     }
 }
+
+#[cfg(test)]
+#[path = "ToolRuntimeSupportService.tests.rs"]
+mod tests;

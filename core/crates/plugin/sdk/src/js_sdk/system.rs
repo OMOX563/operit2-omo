@@ -229,10 +229,23 @@ pub struct TerminalExecRequest {
 #[serde(deny_unknown_fields)]
 pub struct TerminalRunRequest {
     pub sessionName: String,
-    pub terminalType: TerminalType,
+    /// Exact saved profile; omission together with terminalType uses the configured default.
+    pub profileId: Option<String>,
+    /// Legacy explicit interpreter selection. Cannot be combined with profileId.
+    pub terminalType: Option<TerminalType>,
     pub command: String,
     /// Limits foreground waiting only; zero returns as soon as execution starts.
     pub waitMs: u64,
+}
+
+/// Streams a named-session command until actual completion, independently of foreground waits.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TerminalRunStreamRequest {
+    pub sessionName: String,
+    pub profileId: Option<String>,
+    pub terminalType: Option<TerminalType>,
+    pub command: String,
 }
 
 /// Carries live PTY output followed by the complete execution receipt.
@@ -599,13 +612,15 @@ pub trait SystemTerminalHost: Send + Sync {
     ///
     ///Creates or returns an interactive terminal session with the supplied name.
     ///@param sessionName Stable name used to identify the terminal session.
-    ///@param type Exact interpreter type; omission requests the host's configured default terminal.
+    ///@param type Legacy exact interpreter; cannot be combined with profileId.
+    ///@param profileId Saved profile ID from info().profiles; omission of both selectors uses the default.
     ///@returns Promise resolving to the actual session creation result.
     ///
     fn create(
         &self,
         sessionName: String,
         r#type: Option<TerminalType>,
+        profileId: Option<String>,
     ) -> JsFuture<TerminalSessionCreationResultData>;
     ///
     ///Execute a command in a terminal session.
@@ -640,6 +655,8 @@ pub trait SystemTerminalHost: Send + Sync {
     /// Runs a command under session ownership. Expired foreground waits retain the running command.
     /// A yielded session is reserved; the next run with this name acquires a new session generation.
     fn run(&self, request: TerminalRunRequest) -> JsFuture<TerminalCommandResultData>;
+    /// Streams a named-session command until it completes; returning detaches its observation.
+    fn runStream(&self, request: TerminalRunStreamRequest) -> JsAsyncIterable<TerminalExecEvent>;
     /// Waits for the original managed command without writing anything to its terminal.
     /// Expired waits return timedOut=true while the command continues in its original session.
     fn wait(&self, sessionId: String, waitMs: u64) -> JsFuture<TerminalCommandResultData>;
@@ -661,6 +678,9 @@ pub trait SystemTerminalHost: Send + Sync {
     ///@returns Promise resolving to the session close result.
     ///
     fn close(&self, sessionId: String) -> JsFuture<TerminalSessionCloseResultData>;
+    /// Atomically close an idle session only when it belongs to the supplied name.
+    /// Hosts without atomic support reject this operation without closing the session.
+    fn closeIfIdle(&self, sessionId: String, sessionName: String) -> JsFuture<TerminalSessionCloseResultData>;
     ///
     ///Get the current visible terminal screen content for a session (single screen only, no history).
     ///@param sessionId The ID of the session.

@@ -521,7 +521,7 @@ pub(crate) fn save_initialization(
     tx.execute("INSERT INTO _operit_transaction_initialization(id,operation_id,origin,sequence,original) VALUES(1,?1,?2,?3,?4)
         ON CONFLICT(id) DO UPDATE SET operation_id=excluded.operation_id,origin=excluded.origin,sequence=excluded.sequence,original=excluded.original",
         vec![text(&operation.opId),text(&operation.originDeviceId),SqliteValue::Integer(operation.sequence),SqliteValue::Text(original)])?;
-    tx.execute("INSERT INTO _operit_initialization_metadata VALUES(1,?1) ON CONFLICT(id) DO UPDATE SET data=excluded.data",vec![text(&serde_json::to_string(&serde_json::json!({"owner":data.owner,"revision":data.revision,"originalFingerprint":super::digest(operation).map_err(fail)?})).map_err(|e|fail(e.to_string()))?)])?;
+    tx.execute("INSERT INTO _operit_initialization_metadata VALUES(1,?1) ON CONFLICT(id) DO UPDATE SET data=excluded.data",vec![text(&serde_json::to_string(&serde_json::json!({"owner":data.owner,"revision":data.revision,"restoration":data.restoration,"originalFingerprint":super::digest(operation).map_err(fail)?})).map_err(|e|fail(e.to_string()))?)])?;
     tx.execute("DELETE FROM _operit_initialization_coverage", vec![])?;
     for id in covered {
         tx.execute(
@@ -539,6 +539,74 @@ pub(crate) fn initialization_identity(
     use crate::SqliteStore::SqliteRowGet;
     store.queryOne("SELECT operation_id,origin,sequence FROM _operit_transaction_initialization WHERE id=1",vec![])?.map(|row|
         Ok((row.get(0)?,row.get(1)?,row.get(2)?))).transpose()
+}
+
+/// Why a sealed checkpoint still has to ship to one peer in full.
+#[cfg(feature = "full")]
+pub(crate) enum CheckpointTransferReason {
+    /// Coverage proves nothing; the receiver's state is unknowable from here.
+    EmptyCoverage,
+    /// The receiver misses a covered original that sealed away locally.
+    MissingCovered(String),
+}
+
+#[cfg(feature = "full")]
+impl CheckpointTransferReason {
+    pub(crate) fn as_str(&self) -> &'static str {
+        match self {
+            Self::EmptyCoverage => "empty-coverage",
+            Self::MissingCovered(_) => "missing-covered",
+        }
+    }
+}
+
+/// Reports whether a peer still needs this sealed checkpoint shipped in full.
+///
+/// The initialization identity is the digest of its complete payload, so every
+/// local seal rotates it. Exporting on identity alone turns each routine seal
+/// of a large synchronized database into a complete database transfer on every
+/// peer, even when ordinary record exchange already delivered the same
+/// history. The checkpoint only carries irreplaceable state while the receiver
+/// is missing a covered original: sealed originals are no longer exported as
+/// records, so without the checkpoint the receiver could never rebuild them.
+/// Chained checkpoint identities are ignored because every seal's coverage
+/// transitively retains its ancestor's covered originals, so an adopted
+/// checkpoint contributes no state beyond those same originals. An empty
+/// coverage table cannot prove the receiver's state either way and stays
+/// conservative. The returned reason identifies the triggering gap for logs.
+#[cfg(feature = "full")]
+pub(crate) fn initialization_transfer_reason<K: crate::SyncOperationStore::SyncOperationKnowledge>(
+    store: &crate::SqliteStore::SqliteStore,
+    clock: &K,
+) -> Result<Option<CheckpointTransferReason>, crate::SqliteStore::SqliteStoreError> {
+    use crate::SqliteStore::SqliteRowGet;
+    let mut covered = 0usize;
+    let mut missing = None;
+    store.visitRows("SELECT id FROM _operit_initialization_coverage", vec![], &mut |row| {
+        let id = row.valueAt(0)?.asString()?;
+        if id.starts_with("~init:") { return Ok(()); }
+        covered += 1;
+        let known = match id.rsplit_once(':') {
+            Some((origin, sequence)) => sequence.parse::<i64>().is_ok_and(|sequence| clock.containsSequence(origin, sequence)),
+            None => false,
+        };
+        if !known && missing.is_none() { missing = Some(id); }
+        Ok(())
+    })?;
+    Ok(match missing {
+        Some(id) => Some(CheckpointTransferReason::MissingCovered(id)),
+        None if covered == 0 => Some(CheckpointTransferReason::EmptyCoverage),
+        None => None,
+    })
+}
+
+/// Boolean convenience over [`initialization_transfer_reason`].
+#[cfg(feature = "full")]
+pub(crate) fn initialization_transfer_required<K: crate::SyncOperationStore::SyncOperationKnowledge>(
+    store: &crate::SqliteStore::SqliteStore,
+    clock: &K,
+) -> Result<bool, crate::SqliteStore::SqliteStoreError> {
+    Ok(initialization_transfer_reason(store, clock)?.is_some())
 }
 
 #[cfg(all(test, feature = "full"))]

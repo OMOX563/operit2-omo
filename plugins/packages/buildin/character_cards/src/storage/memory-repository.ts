@@ -2,12 +2,13 @@ import type { StorageRecordGuard } from "../../../../../types/storage.generated"
 import type { Storage } from "../../../../../types/storage";
 import type { DocumentChunk, Memory, MemoryAutoSaveStatus, MemoryGraph, MemoryImportResult, MemoryJobState, MemoryLink, MemoryLinkUpdate, MemoryLinkValues, MemoryRebuildProgress, MemorySearchConfig, MemorySearchDebug, MemorySearchOptions, MemorySettings, MemorySpace, MemoryValues } from "../model";
 import { uuid } from "../identity";
-import { assertMemory, assertMemoryValues, assertMemorySettings, assertNumber, assertSearchConfig, assertSearchOptions, assertString, normalizeNames, requireId, requireName } from "../validation";
+import { assertMemory, assertMemoryValues, assertObject, assertMemorySettings, normalizeMemorySettings, assertNumber, assertSearchConfig, assertSearchOptions, assertString, normalizeNames, requireId, requireName } from "../validation";
 import { assertMemorySpace, createMemorySpace } from "./state";
 import { clone, equal, storedValue } from "./records";
 import { CharacterMemoryDatabase } from "./memory";
 import type { ObjectMutation } from "./memory";
 import { embedTexts, embeddingSpace } from "../memory-jobs/embeddings";
+import { readNextAutoSaveRun, writeNextAutoSaveRun } from "./device-schedule";
 import type { SourceEmbedding } from "../memory-jobs/embeddings";
 import { searchDocumentChunks } from "../search/chunks";
 import { prepareMemoryQuery, searchMemoryDatabase } from "../memory-search";
@@ -43,8 +44,32 @@ export class DatabaseMemoryRepository {
   constructor(protected readonly memoryDatabase: CharacterMemoryDatabase) {}
 
   /** Keeps nullable reads separate from versioned writes to an existing library. */
-  private findOwner(ownerKey: string): Promise<Storage.Entry<Owner> | null> {
-    return this.memoryDatabase.get<Owner>("owners", requireId(ownerKey, "memory owner"));
+  private async findOwner(ownerKey: string): Promise<Storage.Entry<Owner> | null> {
+    const entry = await this.memoryDatabase.get<Owner>("owners", requireId(ownerKey, "memory owner"));
+    if (entry === null) return null;
+    entry.value.settings = normalizeMemorySettings(entry.value.settings);
+    // A non-zero value can only be a legacy write; the live cursor lives in device-local storage.
+    const stored = entry.value.settings.nextAutoSaveRunAtMs;
+    entry.value.settings.nextAutoSaveRunAtMs = stored > 0 ? stored : await readNextAutoSaveRun(ownerKey);
+    return entry;
+  }
+
+  /**
+   * Moves a cursor left in the synchronized record by an older build into this device's schedule.
+   *
+   * Older builds stored the writer's own clock there, so two peers with identical
+   * memory never agreed and every comparison looked like content drift. The value is
+   * adopted locally first, then the synchronized record is reset to its zero placeholder.
+   * Only background job passes and explicit writes call this; reads never do.
+   */
+  async adoptLegacyScheduleCursor(ownerKey: string): Promise<boolean> {
+    const entry = await this.memoryDatabase.get<Owner>("owners", requireId(ownerKey, "memory owner"));
+    if (entry === null) return false;
+    const settings = normalizeMemorySettings(entry.value.settings), stored = settings.nextAutoSaveRunAtMs;
+    if (stored === 0) return false;
+    if ((await readNextAutoSaveRun(ownerKey)) === 0) await writeNextAutoSaveRun(ownerKey, stored);
+    await this.commit([put("owners", ownerKey, { ...entry.value, settings: { ...settings, nextAutoSaveRunAtMs: 0 } }, entry.version)]);
+    return true;
   }
 
   async hasMemoryOwner(ownerKey: string): Promise<boolean> { return (await this.findOwner(ownerKey)) !== null; }
@@ -97,15 +122,19 @@ export class DatabaseMemoryRepository {
     assertMemorySettings(settings);
     if (settings.cloudEmbeddingEnabled) embeddingSpace(settings);
     const owner = await this.owner(ownerKey);
-    await this.commit([put("owners", ownerKey, { ...owner.value, settings }, owner.version)]);
+    // The due time is device-local: persist it here and keep the synchronized record at zero.
+    await writeNextAutoSaveRun(ownerKey, settings.nextAutoSaveRunAtMs);
+    await this.commit([put("owners", ownerKey, { ...owner.value, settings: { ...settings, nextAutoSaveRunAtMs: 0 } }, owner.version)]);
   }
 
   /** Saves editor settings and weights atomically while preserving the scheduler's current due time. */
   async writeMemoryOwnerSettings(ownerKey: string, settings: MemorySettings, config: MemorySearchConfig): Promise<{ settings: MemorySettings; config: MemorySearchConfig }> {
     assertMemorySettings(settings); assertSearchConfig(config);
     if (settings.cloudEmbeddingEnabled) embeddingSpace(settings);
-    const owner = await this.owner(ownerKey), saved = { ...settings, nextAutoSaveRunAtMs: owner.value.settings.nextAutoSaveRunAtMs };
-    await this.commit([put("owners", ownerKey, { ...owner.value, settings: saved, searchConfig: config }, owner.version)]);
+    const owner = await this.owner(ownerKey);
+    // The due time belongs to this device only and lives outside synchronized records.
+    const saved = { ...settings, nextAutoSaveRunAtMs: await readNextAutoSaveRun(ownerKey) };
+    await this.commit([put("owners", ownerKey, { ...owner.value, settings: { ...saved, nextAutoSaveRunAtMs: 0 }, searchConfig: config }, owner.version)]);
     return { settings: saved, config };
   }
 
@@ -141,11 +170,11 @@ export class DatabaseMemoryRepository {
   }
 
   /** Returns bounded score explanations from the same database query used by recall. */
-  async searchMemoryDebug(options: MemorySearchOptions, config: MemorySearchConfig): Promise<MemorySearchDebug> {
+  async searchMemoryDebug(options: MemorySearchOptions, config: MemorySearchConfig, includeBelowThreshold = true): Promise<MemorySearchDebug> {
     assertSearchOptions(options); assertSearchConfig(config);
     const owner = await this.findOwner(options.ownerKey);
     if (owner === null) return { query: options.query, config, relevanceThreshold: options.relevanceThreshold ?? 0, memoriesInScopeCount: 0, candidates: [], excludedBySnapshotCount: 0 };
-    return (await searchMemoryDatabase(this.memoryDatabase, owner.value.settings, options, config, true)).result;
+    return (await searchMemoryDatabase(this.memoryDatabase, owner.value.settings, options, config, includeBelowThreshold)).result;
   }
 
   /** Lists an explicitly requested owner library without loading other owners. */
@@ -482,6 +511,8 @@ export class DatabaseMemoryRepository {
 
   /** Imports complete document-aware records, relationships, settings and USER text in this operation. */
   async importMemorySpace(ownerKey: string, imported: MemorySpace, strategy: "SKIP" | "UPDATE" | "CREATE_NEW"): Promise<MemoryImportResult> {
+    assertObject(imported, "memory space");
+    imported = { ...imported, settings: normalizeMemorySettings(imported.settings) };
     assertMemorySpace(imported);
     const space = await this.readMemorySpace(ownerKey), result = { newMemories: 0, updatedMemories: 0, skippedMemories: 0, newLinks: 0 };
     const idMapping = new Map<string, string>();

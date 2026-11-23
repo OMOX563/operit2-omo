@@ -131,18 +131,7 @@ impl VisualFileSystem {
                 .is_some())
             }
             (Some(_), _) | (_, Some(_)) => Ok(false),
-            (None, None) => {
-                let root = PathMapper::resolveFileResourcePath(None, &root.physicalPath)?;
-                let path = PathMapper::resolveFileResourcePath(None, &path.physicalPath)?;
-                let (root, path) = if root.starts_with("/virtual/windows/")
-                    && path.starts_with("/virtual/windows/")
-                {
-                    (root.to_lowercase(), path.to_lowercase())
-                } else {
-                    (root, path)
-                };
-                Ok(PathMapper::relativePath(&root, &path)?.is_some())
-            }
+            (None, None) => Ok(PathMapper::physicalPathWithin(&root.physicalPath, &path.physicalPath)),
         }
     }
 
@@ -320,11 +309,7 @@ impl VisualFileSystem {
 
     /// Rejects self/descendant transfers, including aliases of overlapping mounts.
     pub fn validateTransfer(&self, source: &str, destination: &str, directory: bool) -> Result<(), String> {
-        let source = self.resolvePath(source)?.physicalPath;
-        let destination = self.resolvePath(destination)?.physicalPath;
-        let source = source.trim_end_matches('/');
-        let destination = destination.trim_end_matches('/');
-        if source == destination || (directory && destination.starts_with(&format!("{source}/"))) {
+        if self.isWithin(source, destination)? && (directory || self.isWithin(destination, source)?) {
             return Err("Cannot paste an entry onto itself or into its own subfolder".to_string());
         }
         Ok(())
@@ -333,6 +318,7 @@ impl VisualFileSystem {
     /// Moves a file between two mapped host paths.
     #[allow(non_snake_case)]
     pub fn moveFile(&self, source: &str, destination: &str) -> Result<(), String> {
+        self.validateTransfer(source, destination, self.fileExists(source)?.isDirectory)?;
         let source = self.resolvePath(source)?;
         let destination = self.resolvePath(destination)?;
         self.host
@@ -344,6 +330,7 @@ impl VisualFileSystem {
     /// Copies a file or directory between two mapped host paths.
     #[allow(non_snake_case)]
     pub fn copyFile(&self, source: &str, destination: &str, recursive: bool) -> Result<(), String> {
+        self.validateTransfer(source, destination, self.fileExists(source)?.isDirectory)?;
         let source = self.resolvePath(source)?;
         let destination = self.resolvePath(destination)?;
         self.host
@@ -620,6 +607,13 @@ mod tests {
         assert!(vfs.validateTransfer("/app/workspaces/a", "/operitapp/workspaces/a/child", true).is_err());
         assert!(vfs.validateTransfer("/operitapp/workspaces/a", "/operitapp/workspaces/a-copy", true).is_ok());
         assert!(vfs.validateTransfer("/operitapp/workspaces/a", "/operitapp/workspaces/b/a", true).is_ok());
+        vfs.makeDirectory("/operitapp/workspaces/a", true).unwrap();
+        assert!(vfs.copyFile("/operitapp/workspaces/a", "/app/workspaces/a/child", true).is_err());
+        assert!(vfs.moveFile("/operitapp/workspaces/a", "/app/workspaces/a/child").is_err());
+        let storage = Arc::new(NativeRuntimeStorageHost::new(root.clone(), root.join("workspaces")));
+        let mount = crate::MountRegistry::MountRegistry::withStorage(storage)
+            .register("/virtual/test/documents", "test", "opaque-root", "documents").unwrap();
+        assert!(vfs.validateTransfer(&format!("{}/src", mount.vfsPath()), &format!("{}/src/child", mount.vfsPath()), true).is_err());
         if root.exists() { std::fs::remove_dir_all(root).unwrap(); }
     }
 
@@ -885,25 +879,19 @@ mod tests {
 
     /// Mounted platform roots resolve through the same VFS surface on their host.
     #[test]
-    #[cfg(target_os = "linux")]
-    fn fileInfoResolvesThroughTheLinuxMountRoot() {
+    fn fileInfoResolvesThroughTheActiveHostMountRoot() {
         let (vfs, root) = vfs();
-        // Address the real temp directory through the /virtual/linux mount root so
-        // the physical target stays writable regardless of the active TMPDIR.
-        // Some sandboxes refuse file creation directly inside the temp root,
-        // so keep the marker inside a directory the host can create.
-        let marker = format!(
-            "/virtual/linux{}",
-            std::env::temp_dir()
+        let directory = crate::VfsPath::storageLocationPath(
+            &std::env::temp_dir()
                 .join(format!("operit-vfs-check-{}", uuid::Uuid::new_v4()))
-                .join("marker.txt")
-                .display()
-        );
+                .to_string_lossy(),
+        ).unwrap();
+        let marker = crate::VfsPath::joinVfsPath(&directory, "marker.txt").unwrap();
         vfs.writeFile(&marker, "mounted", false).unwrap();
         let info = vfs.fileInfo(&marker).unwrap();
         assert!(info.exists);
         assert_eq!(info.path, marker);
-        vfs.deleteFile(&marker, false).unwrap();
+        vfs.deleteFile(&directory, true).unwrap();
         // The mount-root write never touches the runtime root, so it may not exist.
         drop(std::fs::remove_dir_all(root));
     }

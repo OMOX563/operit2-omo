@@ -179,6 +179,7 @@ class PackageToolParameter {
 class ToolPackage {
   const ToolPackage({
     required this.name,
+    required this.api_version,
     required this.description,
     required this.tools,
     required this.states,
@@ -193,6 +194,7 @@ class ToolPackage {
   /// Decodes `operit_plugin_sdk::package::ToolPackage` from a MessagePack value map.
   factory ToolPackage.fromMessagePackValue(Map<String, Object?> value) => ToolPackage(
     name: value['name'] as String,
+    api_version: value['api_version'] as String,
     description: LocalizedText.fromMessagePackValue(value['description'] as Map<String, Object?>),
     tools: (value['tools'] as List<Object?>).map((item) => PackageTool.fromMessagePackValue(item as Map<String, Object?>)).toList(growable: false),
     states: (value['states'] as List<Object?>).map((item) => ToolPackageState.fromMessagePackValue(item as Map<String, Object?>)).toList(growable: false),
@@ -207,6 +209,7 @@ class ToolPackage {
   /// Encodes this model into a MessagePack-compatible value map.
   Map<String, Object?> toMessagePackValue() => <String, Object?>{
     'name': name,
+    'api_version': api_version,
     'description': description.toMessagePackValue(),
     'tools': tools.map((item) => item.toMessagePackValue()).toList(growable: false),
     'states': states.map((item) => item.toMessagePackValue()).toList(growable: false),
@@ -219,6 +222,7 @@ class ToolPackage {
   };
 
   final String name;
+  final String api_version;
   final LocalizedText description;
   final List<PackageTool> tools;
   final List<ToolPackageState> states;
@@ -733,6 +737,7 @@ class ToolPkgContainerRuntime {
     required this.publicApi,
     required this.publicApis,
     required this.requires,
+    required this.optionalRequires,
     required this.dependencyIssues,
     required this.manifestExtensions,
     required this.author,
@@ -766,6 +771,7 @@ class ToolPkgContainerRuntime {
     required this.chatResponseHooks,
     required this.hostEventHooks,
     required this.toolLifecycleHooks,
+    required this.toolPermissionHooks,
     required this.promptInputHooks,
     required this.promptHistoryHooks,
     required this.promptEstimateHistoryHooks,
@@ -791,6 +797,7 @@ class ToolPkgContainerRuntime {
     publicApi: value['publicApi'] == null ? null : value['publicApi'] as String,
     publicApis: (value['publicApis'] as List<Object?>).map((item) => ToolPkgRegisteredFunctionHook.fromMessagePackValue(item as Map<String, Object?>)).toList(growable: false),
     requires: (value['requires'] as List<Object?>).map((item) => ToolPkgManifestRequirement.fromMessagePackValue(item as Map<String, Object?>)).toList(growable: false),
+    optionalRequires: (value['optional_requires'] as List<Object?>).map((item) => ToolPkgManifestRequirement.fromMessagePackValue(item as Map<String, Object?>)).toList(growable: false),
     dependencyIssues: (value['dependencyIssues'] as List<Object?>).map((item) => ToolPkgDependencyIssue.fromMessagePackValue(item as Map<String, Object?>)).toList(growable: false),
     manifestExtensions: (value['manifestExtensions'] as Map).map((key, item) => MapEntry(key as String, item)),
     author: (value['author'] as List<Object?>).map((item) => item as String).toList(growable: false),
@@ -824,6 +831,7 @@ class ToolPkgContainerRuntime {
     chatResponseHooks: (value['chatResponseHooks'] as List<Object?>).map((item) => ToolPkgFunctionHookRuntime.fromMessagePackValue(item as Map<String, Object?>)).toList(growable: false),
     hostEventHooks: (value['hostEventHooks'] as List<Object?>).map((item) => ToolPkgHostEventHookRuntime.fromMessagePackValue(item as Map<String, Object?>)).toList(growable: false),
     toolLifecycleHooks: (value['toolLifecycleHooks'] as List<Object?>).map((item) => ToolPkgFunctionHookRuntime.fromMessagePackValue(item as Map<String, Object?>)).toList(growable: false),
+    toolPermissionHooks: (value['toolPermissionHooks'] as List<Object?>).map((item) => ToolPkgFunctionHookRuntime.fromMessagePackValue(item as Map<String, Object?>)).toList(growable: false),
     promptInputHooks: (value['promptInputHooks'] as List<Object?>).map((item) => ToolPkgFunctionHookRuntime.fromMessagePackValue(item as Map<String, Object?>)).toList(growable: false),
     promptHistoryHooks: (value['promptHistoryHooks'] as List<Object?>).map((item) => ToolPkgFunctionHookRuntime.fromMessagePackValue(item as Map<String, Object?>)).toList(growable: false),
     promptEstimateHistoryHooks: (value['promptEstimateHistoryHooks'] as List<Object?>).map((item) => ToolPkgFunctionHookRuntime.fromMessagePackValue(item as Map<String, Object?>)).toList(growable: false),
@@ -849,6 +857,7 @@ class ToolPkgContainerRuntime {
     'publicApi': publicApi == null ? null : publicApi!,
     'publicApis': publicApis.map((item) => item.toMessagePackValue()).toList(growable: false),
     'requires': requires.map((item) => item.toMessagePackValue()).toList(growable: false),
+    'optional_requires': optionalRequires.map((item) => item.toMessagePackValue()).toList(growable: false),
     'dependencyIssues': dependencyIssues.map((item) => item.toMessagePackValue()).toList(growable: false),
     'manifestExtensions': manifestExtensions.map((key, item) => MapEntry(key, item)),
     'author': author.map((item) => item).toList(growable: false),
@@ -882,6 +891,7 @@ class ToolPkgContainerRuntime {
     'chatResponseHooks': chatResponseHooks.map((item) => item.toMessagePackValue()).toList(growable: false),
     'hostEventHooks': hostEventHooks.map((item) => item.toMessagePackValue()).toList(growable: false),
     'toolLifecycleHooks': toolLifecycleHooks.map((item) => item.toMessagePackValue()).toList(growable: false),
+    'toolPermissionHooks': toolPermissionHooks.map((item) => item.toMessagePackValue()).toList(growable: false),
     'promptInputHooks': promptInputHooks.map((item) => item.toMessagePackValue()).toList(growable: false),
     'promptHistoryHooks': promptHistoryHooks.map((item) => item.toMessagePackValue()).toList(growable: false),
     'promptEstimateHistoryHooks': promptEstimateHistoryHooks.map((item) => item.toMessagePackValue()).toList(growable: false),
@@ -905,6 +915,7 @@ class ToolPkgContainerRuntime {
   final String? publicApi;
   final List<ToolPkgRegisteredFunctionHook> publicApis;
   final List<ToolPkgManifestRequirement> requires;
+  final List<ToolPkgManifestRequirement> optionalRequires;
   final List<ToolPkgDependencyIssue> dependencyIssues;
   final Map<String, Object?> manifestExtensions;
   final List<String> author;
@@ -938,6 +949,7 @@ class ToolPkgContainerRuntime {
   final List<ToolPkgFunctionHookRuntime> chatResponseHooks;
   final List<ToolPkgHostEventHookRuntime> hostEventHooks;
   final List<ToolPkgFunctionHookRuntime> toolLifecycleHooks;
+  final List<ToolPkgFunctionHookRuntime> toolPermissionHooks;
   final List<ToolPkgFunctionHookRuntime> promptInputHooks;
   final List<ToolPkgFunctionHookRuntime> promptHistoryHooks;
   final List<ToolPkgFunctionHookRuntime> promptEstimateHistoryHooks;

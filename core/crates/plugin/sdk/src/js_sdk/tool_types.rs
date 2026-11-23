@@ -143,6 +143,7 @@ pub struct ToolResultMap {
     #[display(action = "speak", icon = "audio", target = "text")]
     pub tts_synthesize: TtsSynthesizeResultData,
     pub tts_speak: TtsSpeakResultData,
+    pub tts_cancel: BooleanResultData,
     #[display(action = "transcribe", icon = "audio", target = "path")]
     pub stt_transcribe: SttTranscribeResultData,
     pub tts_list_configs: TtsListConfigsResultData,
@@ -158,6 +159,8 @@ pub struct ToolResultMap {
     pub list_core_nodes: String,
     pub switch_core: String,
     pub package_proxy: ToolResultData,
+    #[display(action = "wait", icon = "time", target = "execution_id")]
+    pub package_wait: JsonResultData,
     pub get_terminal_info: TerminalInfoResultData,
     #[display(action = "execute", icon = "terminal", target = "command")]
     pub execute_in_terminal_session: TerminalCommandResultData,
@@ -201,6 +204,10 @@ pub struct ToolResultMap {
     pub send_message_to_ai_streaming: MessageSendResultData,
     pub chat_send_message: ChatSendMessageResultData,
     pub chat_observe: ChatObservationResultData,
+    pub chat_deliver_prepared: ChatPreparedDeliveryResultData,
+    pub chat_list_scheduled_messages: ChatScheduledMessagesResultData,
+    pub chat_schedule_message: ChatScheduleMessageResultData,
+    pub chat_cancel_scheduled_message: ChatCancelScheduledMessageResultData,
     pub chat_cancel: ChatCancelResultData,
     pub chat_read_extension: ChatReadExtensionResultData,
     pub chat_write_extension: ChatWriteExtensionResultData,

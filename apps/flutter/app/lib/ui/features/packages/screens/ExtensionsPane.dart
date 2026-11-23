@@ -490,6 +490,7 @@ class _ExtensionsPaneState extends State<ExtensionsPane> {
     );
   }
 
+  /// Offers removal for failed import records and installed failure sources.
   Widget _diagnosticAction(core_proxy.ExtensionCatalogDiagnostic diagnostic) {
     if (!diagnostic.canDelete) {
       return Tooltip(
@@ -508,7 +509,7 @@ class _ExtensionsPaneState extends State<ExtensionsPane> {
       );
     }
     return IconButton(
-      tooltip: '删除失败来源',
+      tooltip: diagnostic.code == 'import_failed' ? '删除失败记录' : '删除失败来源',
       onPressed: () => _run(() => _controller.deleteDiagnostic(diagnostic)),
       icon: const Icon(Icons.delete_outline_rounded),
     );
@@ -576,7 +577,7 @@ class _SummaryBar extends StatelessWidget {
               Padding(
                 padding: const EdgeInsets.only(right: 8),
                 child: Text(
-                  updates > 0 ? '发现 $updates 个更新' : '都是最新版本',
+                  updates > 0 ? '发现 $updates 个更新' : '未发现可用更新',
                   style: theme.textTheme.labelSmall?.copyWith(
                     color: colorScheme.onSurfaceVariant,
                   ),

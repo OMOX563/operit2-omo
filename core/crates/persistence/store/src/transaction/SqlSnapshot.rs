@@ -8,6 +8,8 @@ use super::{Cell, Data, Result, sql_identifier};
 
 fn fail(error: impl std::fmt::Display) -> SqliteStoreError { SqliteStoreError::Message(error.to_string()) }
 fn host_error(error: impl std::fmt::Display) -> HostError { HostError::new(error.to_string()) }
+const INSERT_ROW: &str = "INSERT INTO rows(name,value) VALUES(?1,?2)
+    ON CONFLICT(name,value) DO UPDATE SET copies=copies+1";
 struct StagingHost(Arc<dyn RuntimeStorageHost>);
 impl RuntimeSqliteHost for StagingHost {
     fn runtimeStorage(&self) -> Option<Arc<dyn RuntimeStorageHost>> { Some(self.0.clone()) }
@@ -48,12 +50,13 @@ impl SqlSnapshot {
         let path = format!("runtime/sync/staging/{}.sqlite", uuid::Uuid::new_v4());
         let store = SqliteStore::openWithHost(Arc::new(StagingHost(storage.clone())), &path).map_err(|e|e.to_string())?;
         let snapshot = Self { store:Some(store), storage, path, columns:BTreeMap::new() };
-        // These settings apply to the disposable staging database, never to business durability.
+        // Store the row in canonical sort order without copying its payload into a second B-tree.
+        // Raw snapshots preserve multiplicity; the content projection is already defined as distinct.
         snapshot.store().executeBatch("PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF; PRAGMA cache_size=-2048; PRAGMA temp_store=FILE;
-            CREATE TABLE rows(id INTEGER PRIMARY KEY,name TEXT NOT NULL,value TEXT NOT NULL);
-            CREATE INDEX row_order ON rows(name,value);
-            CREATE TABLE projected(name TEXT NOT NULL,value TEXT NOT NULL);
-            CREATE INDEX projected_order ON projected(name,value);").map_err(|e|e.to_string())?;
+            CREATE TABLE rows(name TEXT NOT NULL,value TEXT NOT NULL,copies INTEGER NOT NULL DEFAULT 1,
+                PRIMARY KEY(name,value)) WITHOUT ROWID;
+            CREATE TABLE projected(name TEXT NOT NULL,value TEXT NOT NULL,
+                PRIMARY KEY(name,value)) WITHOUT ROWID;").map_err(|e|e.to_string())?;
         Ok(snapshot)
     }
     fn store(&self) -> &SqliteStore { self.store.as_ref().expect("live snapshot") }
@@ -83,7 +86,7 @@ impl SqlSnapshot {
                     let mut value = RowBuffer(Vec::new());
                     serde_json::to_writer(&mut value, &cells).map_err(host_error)?;
                     let value = String::from_utf8(value.0).map_err(host_error)?;
-                    stage.execute("INSERT INTO rows(name,value) VALUES(?1,?2)",vec![SqliteValue::Text(name.clone()),SqliteValue::Text(value)]).map_err(host_error)?;
+                    stage.execute(INSERT_ROW,vec![SqliteValue::Text(name.clone()),SqliteValue::Text(value)]).map_err(host_error)?;
                     Ok(())
                 })?;
             }
@@ -93,14 +96,18 @@ impl SqlSnapshot {
     }
     pub(crate) fn has_rows(&self) -> Result<bool> { self.store().queryOne("SELECT 1 FROM rows LIMIT 1",vec![]).map(|v|v.is_some()).map_err(|e|e.to_string()) }
     pub(crate) fn insert(&self, name: &str, cells: &[Cell]) -> Result<()> {
-        self.store().execute("INSERT INTO rows(name,value) VALUES(?1,?2)",vec![SqliteValue::Text(name.into()),SqliteValue::Text(serde_json::to_string(&cells).map_err(|e|e.to_string())?)]).map_err(|e|e.to_string())?;
+        self.store().execute(INSERT_ROW,vec![SqliteValue::Text(name.into()),SqliteValue::Text(serde_json::to_string(&cells).map_err(|e|e.to_string())?)]).map_err(|e|e.to_string())?;
         Ok(())
     }
     pub(crate) fn visit(&self, name: &str, projected: bool, visitor: &mut dyn FnMut(Vec<Cell>) -> Result<()>) -> Result<()> {
-        let sql = if projected { "SELECT DISTINCT value FROM projected WHERE name=?1 ORDER BY value" } else { "SELECT value FROM rows WHERE name=?1 ORDER BY value" };
+        let sql = if projected { "SELECT value,1 FROM projected WHERE name=?1 ORDER BY value" } else { "SELECT value,copies FROM rows WHERE name=?1 ORDER BY value" };
         self.store().visitRows(sql,vec![SqliteValue::Text(name.into())],&mut |row| {
-            let value: Vec<Cell> = serde_json::from_str(&row.get::<_,String>(0).map_err(host_error)?).map_err(host_error)?;
-            visitor(value).map_err(host_error)
+            let value: String = row.get(0).map_err(host_error)?;
+            let copies: i64 = row.get(1).map_err(host_error)?;
+            for _ in 0..copies {
+                visitor(serde_json::from_str(&value).map_err(host_error)?).map_err(host_error)?;
+            }
+            Ok(())
         }).map_err(|e|e.to_string())
     }
     pub(crate) fn install(&self, tx: &mut SqliteTransaction<'_>, names: &[String]) -> std::result::Result<(),SqliteStoreError> {
@@ -128,18 +135,43 @@ impl SqlSnapshot {
         self.visit(name,false,&mut |row| { rows.push(serde_json::to_value(row).map_err(|e|e.to_string())?); Ok(()) })?;
         Ok(serde_json::json!({"columns":columns,"rows":rows}))
     }
-    pub(crate) fn content_digest(&self, owner: &super::Owner) -> Result<String> {
+    /// Hashes projected business contents and counts their bytes in one streamed pass.
+    pub(crate) fn content_summary(&self, owner: &super::Owner) -> Result<(String, u64)> {
         if self.columns.values().any(Vec::is_empty) { return Err("Missing synchronized SQL table".into()); }
         let mut projected_columns = self.columns.clone();
         for (name, columns) in &self.columns {
-            let (local, identity): (&[&str],Option<(&str,&str)>) = if owner.path == operit_util::RuntimeStorageLayout::SQLITE_DATABASE_PATH {
-                match name.as_str() { "messages"=>( &["messageId"],None), "message_variants"=>( &["variantId"],None), _=>continue }
+            let (local, alias): (&[&str],Option<(&str,&str)>) = if owner.path == operit_util::RuntimeStorageLayout::SQLITE_DATABASE_PATH {
+                match name.as_str() {
+                    "messages"=>( &["messageId"],None), "message_variants"=>( &["variantId"],None),
+                    // Scope clocks record which device last wrote each range, not the range contents.
+                    "sync_sql_versions"=>( &["createdAt","origin","sequence"],None),
+                    _=>continue }
             } else {
-                match name.as_str() { "_operit_values"=>( &["version"],None), "_operit_merge_map"=>( &["origin"],Some(("remote_key","canonical_key"))), _=>continue }
+                match name.as_str() {
+                    "_operit_values"=>( &["version"],None),
+                    // Aliases only mean something together, so this table is resolved as one graph.
+                    "_operit_merge_map"=>( &["origin"],Some(("remote_key","canonical_key"))),
+                    // Last writer per synchronized record; two peers holding the same record still differ here.
+                    "_operit_versions"=>( &["created_at","origin","sequence"],None),
+                    _=>continue }
             };
-            let identity = identity.map(|(a,b)| Ok::<_,String>((columns.iter().position(|v|v==a).ok_or("Missing identity source column")?,columns.iter().position(|v|v==b).ok_or("Missing identity destination column")?))).transpose()?;
             let removed = columns.iter().enumerate().filter_map(|(i,v)|local.contains(&v.as_str()).then_some(i)).collect::<Vec<_>>();
             projected_columns.insert(name.clone(),columns.iter().filter(|v|!local.contains(&v.as_str())).cloned().collect());
+            if let Some((source,target)) = alias {
+                // Tiny by construction: the alias graph is rows of identity equivalence, not payload.
+                let resolved = super::project_sql_alias_closure(&self.table(name)?, local, source, target)?;
+                let rows = resolved["rows"].as_array().ok_or("Missing projected alias rows")?
+                    .iter().map(|row| serde_json::to_string(row).map_err(|e|e.to_string())).collect::<Result<Vec<_>>>()?;
+                self.store().transaction(|tx| {
+                    tx.execute("DELETE FROM projected WHERE name=?1",vec![SqliteValue::Text(name.clone())])?;
+                    for row in &rows {
+                        tx.execute("INSERT OR IGNORE INTO projected(name,value) VALUES(?1,?2)",
+                            vec![SqliteValue::Text(name.clone()),SqliteValue::Text(row.clone())])?;
+                    }
+                    Ok(())
+                }).map_err(|e|e.to_string())?;
+                continue;
+            }
             // SQLite projects and sorts on disk without a Rust row or sort-key collection.
             self.store().transaction(|tx| {
                 let params=vec![SqliteValue::Text(name.clone())];
@@ -148,12 +180,11 @@ impl SqlSnapshot {
                 tx.execute("DELETE FROM projected WHERE name=?1",params.clone())?;
                 let paths=removed.iter().rev().map(|i|format!(",'$[{i}]'")).collect::<String>();
                 let value=if paths.is_empty() { "value".into() } else { format!("json_remove(value{paths})") };
-                let filter=identity.map_or(String::new(),|(a,b)|format!(" AND json_extract(value,'$[{a}]')!=json_extract(value,'$[{b}]')"));
-                tx.execute(&format!("INSERT INTO projected SELECT name,{value} FROM rows WHERE name=?1{filter}"),params)?;
+                tx.execute(&format!("INSERT OR IGNORE INTO projected SELECT name,{value} FROM rows WHERE name=?1"),params)?;
                 Ok(())
             }).map_err(|e|e.to_string())?;
         }
-        super::digest(&Values { snapshot:self, columns:&projected_columns, projected:true })
+        super::serialized_digest(&Values { snapshot:self, columns:&projected_columns, projected:true })
     }
     pub(crate) fn values(&self) -> Values<'_> { Values { snapshot:self, columns:&self.columns, projected:false } }
     pub(crate) fn files(&self) -> RuntimeFileSyncStore { RuntimeFileSyncStore::new(self.storage.clone(),"runtime/sync") }
@@ -186,12 +217,13 @@ pub(crate) struct DataWire<'a> { pub data:&'a Data, pub canonical:bool }
 impl Serialize for DataWire<'_> {
     fn serialize<S:Serializer>(&self, serializer:S) -> std::result::Result<S::Ok,S::Error> {
         let d=self.data;
-        let mut map=serializer.serialize_map(Some(7))?;
-        let keys=if self.canonical { ["additions","aliases","deleted","owner","revision","values","versions"] } else { ["owner","values","revision","deleted","aliases","versions","additions"] };
+        let mut map=serializer.serialize_map(Some(7 + usize::from(d.restoration.is_some())))?;
+        let keys=if self.canonical { ["additions","aliases","deleted","owner","restoration","revision","values","versions"] } else { ["owner","values","revision","restoration","deleted","aliases","versions","additions"] };
         for key in keys { match key {
             "owner"=>if self.canonical { map.serialize_entry(key,&serde_json::to_value(&d.owner).map_err(serde::ser::Error::custom)?)?; } else { map.serialize_entry(key,&d.owner)?; },
             "values"=>if let Some(sql)=&d.sql { map.serialize_entry(key,&sql.values())?; } else { map.serialize_entry(key,&d.values)?; },
             "revision"=>map.serialize_entry(key,&d.revision)?, "deleted"=>map.serialize_entry(key,&d.deleted)?,
+            "restoration"=>if let Some(restoration)=&d.restoration { map.serialize_entry(key,restoration)?; },
             "aliases"=>map.serialize_entry(key,&d.aliases)?, "versions"=>map.serialize_entry(key,&d.versions)?,
             _=>map.serialize_entry(key,&d.additions)?,
         } }

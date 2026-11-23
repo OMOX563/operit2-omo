@@ -9,7 +9,7 @@ use crate::chat::enhance::MultiServiceManager::MultiServiceManager;
 use crate::chat::hooks::SummaryHookRegistry::{SummaryHookContext, SummaryHookRegistry};
 use crate::chat::llmprovider::ThinkingDialect::RequestThinking;
 use crate::chat::llmprovider::AIService::{
-    collect_stream_chunks, AiServiceError, SendMessageRequest,
+    ensure_response_completed, AiServiceError, SendMessageRequest, TokenCounts,
 };
 use crate::runtime_support::ProviderRuntimeContext;
 use operit_model::FunctionType::FunctionType;
@@ -24,6 +24,36 @@ use crate::chat::llmprovider::MediaLinkParser::unescape_xml_attribute;
 
 const APPLY_FILE_TOOL_NAME: &str = "apply_file";
 pub type SummaryProgressCallback = Arc<dyn Fn(&'static str) + Send + Sync>;
+
+/// Identifies the automatic threshold check that requested compaction.
+#[derive(Clone, Copy, Debug, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SummaryTriggerPoint {
+    BeforeSend,
+    AfterReply,
+}
+
+/// Captures measurements from a threshold check with a positive token window.
+#[derive(Clone, Copy, Debug)]
+pub struct SummaryTriggerContext {
+    pub current_tokens: i64,
+    pub max_tokens: i32,
+    pub token_usage_threshold: f64,
+    pub trigger_point: SummaryTriggerPoint,
+}
+
+impl SummaryTriggerContext {
+    /// Projects the captured decision into the existing summary hook contract.
+    fn metadata(self) -> Value {
+        json!({
+            "currentTokens": self.current_tokens,
+            "maxTokens": self.max_tokens,
+            "tokenUsageThreshold": self.token_usage_threshold,
+            "usageRatio": self.current_tokens as f64 / f64::from(self.max_tokens),
+            "triggerPoint": self.trigger_point,
+        })
+    }
+}
 
 /// Controls how much tool metadata is exposed in prompt history.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -397,11 +427,13 @@ impl ConversationService {
             .join("\n")
     }
 
+    /// Generates a summary while forwarding every provider retry error to its owner.
     pub async fn generateSummary(
         &self,
         messages: Vec<(String, String)>,
         previousSummary: Option<String>,
         multiServiceManager: &mut MultiServiceManager,
+        onNonFatalError: Arc<dyn Fn(String) + Send + Sync>,
     ) -> Result<String, AiServiceError> {
         self.generateSummaryFromPromptTurns(
             messages
@@ -410,26 +442,32 @@ impl ConversationService {
                 .collect(),
             previousSummary,
             multiServiceManager,
+            onNonFatalError,
         )
         .await
     }
 
+    /// Summarizes prepared turns with an explicit provider error consumer.
     pub async fn generateSummaryFromPromptTurns(
         &self,
         messages: Vec<PromptTurn>,
         previousSummary: Option<String>,
         multiServiceManager: &mut MultiServiceManager,
+        onNonFatalError: Arc<dyn Fn(String) + Send + Sync>,
     ) -> Result<String, AiServiceError> {
-        self.generateSummaryWithProgress(messages, previousSummary, multiServiceManager, None).await
+        self.generateSummaryWithProgress(messages, previousSummary, multiServiceManager, None, None, onNonFatalError).await.map(|(content, _)| content)
     }
 
+    /// Runs summary hooks and generation with progress and required retry-error delivery.
     pub async fn generateSummaryWithProgress(
         &self,
         messages: Vec<PromptTurn>,
         previousSummary: Option<String>,
         multiServiceManager: &mut MultiServiceManager,
         progress: Option<SummaryProgressCallback>,
-    ) -> Result<String, AiServiceError> {
+        trigger: Option<SummaryTriggerContext>,
+        onNonFatalError: Arc<dyn Fn(String) + Send + Sync>,
+    ) -> Result<(String, TokenCounts), AiServiceError> {
         let useEnglish = false;
         let previousSummary = previousSummary.map(|summary| ChatMarkupRegex::remove_meta_tags(&summary));
         let mut systemPrompt =
@@ -459,6 +497,9 @@ impl ConversationService {
                 "chatId": context.callerChatId,
                 "participantId": context.callerParticipantId,
             }));
+        }
+        if let Some(trigger) = trigger {
+            baseSummaryMetadata.insert("trigger".to_string(), trigger.metadata());
         }
 
         let beforePrepareBaseContext = SummaryHookContext {
@@ -535,22 +576,22 @@ impl ConversationService {
                     available_tools: Vec::new(),
                     preserve_think_in_history: false,
                     enable_retry: true,
-                    on_non_fatal_error: None,
+                    on_non_fatal_error: Some(onNonFatalError),
                     on_tool_invocation: None,
                 })
                 .await?
         };
         let mut content = String::new();
         summaryStream.collect(&mut |chunk| content.push_str(&chunk)).await;
-        crate::chat::llmprovider::AIService::ensure_response_completed(summaryStream.as_ref())?;
+        ensure_response_completed(summaryStream.as_ref())?;
         let mut summaryContent = ChatMarkupRegex::remove_meta_tags(&removeThinkingContent(content.trim()));
-        let (summaryInputTokens, summaryCachedInputTokens, summaryOutputTokens) = {
+        let usage = {
             let service = summaryService.lock().await;
-            (
-                service.input_token_count(),
-                service.cached_input_token_count(),
-                service.output_token_count(),
-            )
+            TokenCounts {
+                input: service.input_token_count(),
+                cached_input: service.cached_input_token_count(),
+                output: service.output_token_count(),
+            }
         };
 
         let afterGenerateContext =
@@ -571,12 +612,12 @@ impl ConversationService {
                         "preparedMessageCount".to_string(),
                         json!(preparedHistory.len()),
                     );
-                    metadata.insert("inputTokens".to_string(), json!(summaryInputTokens));
+                    metadata.insert("inputTokens".to_string(), json!(usage.input));
                     metadata.insert(
                         "cachedInputTokens".to_string(),
-                        json!(summaryCachedInputTokens),
+                        json!(usage.cached_input),
                     );
-                    metadata.insert("outputTokens".to_string(), json!(summaryOutputTokens));
+                    metadata.insert("outputTokens".to_string(), json!(usage.output));
                     metadata
                 },
             })
@@ -591,9 +632,9 @@ impl ConversationService {
             .support()
             .updateTokensForProviderModel(
                 &providerModel,
-                summaryInputTokens,
-                summaryOutputTokens,
-                summaryCachedInputTokens,
+                usage.input,
+                usage.output,
+                usage.cached_input,
             )
             .map_err(AiServiceError::RequestFailed)?;
         UsageStatisticsStore::new()
@@ -602,12 +643,12 @@ impl ConversationService {
                 FunctionType::SUMMARY,
                 UsageRequestSource::SUMMARY_GENERATION,
                 None,
-                summaryInputTokens,
-                summaryOutputTokens,
-                summaryCachedInputTokens,
+                usage.input,
+                usage.output,
+                usage.cached_input,
             )
             .map_err(AiServiceError::RequestFailed)?;
-        Ok(summaryContent)
+        Ok((summaryContent, usage))
     }
 
     /// Generates a concise title from the first user message and attachment names.
@@ -617,6 +658,7 @@ impl ConversationService {
         user_text: String,
         attachment_file_names: Vec<String>,
         multi_service_manager: &mut MultiServiceManager,
+        onNonFatalError: Arc<dyn Fn(String) + Send + Sync>,
     ) -> Result<String, AiServiceError> {
         let use_english = false;
         let prepared_history = vec![
@@ -641,7 +683,7 @@ impl ConversationService {
             let service = title_service.lock().await;
             service.provider_model()
         };
-        let title_stream = {
+        let mut title_stream = {
             let mut service = title_service.lock().await;
             service
                 .send_message(SendMessageRequest {
@@ -652,13 +694,15 @@ impl ConversationService {
                     available_tools: Vec::new(),
                     preserve_think_in_history: false,
                     enable_retry: false,
-                    on_non_fatal_error: None,
+                    on_non_fatal_error: Some(onNonFatalError),
                     on_tool_invocation: None,
                 })
                 .await?
         };
-        let title_chunks = collect_stream_chunks(title_stream).await;
-        let title = sanitizeConversationTitle(&removeThinkingContent(&title_chunks.join("")));
+        let mut title_content = String::new();
+        title_stream.collect(&mut |chunk| title_content.push_str(&chunk)).await;
+        ensure_response_completed(title_stream.as_ref())?;
+        let title = sanitizeConversationTitle(&removeThinkingContent(&title_content));
         let (input_tokens, cached_input_tokens, output_tokens) = {
             let service = title_service.lock().await;
             (
@@ -1022,6 +1066,30 @@ fn build_media_intent_prompt(media_type: &str, path: &str, user_intent: Option<&
 mod summary_tests {
     use super::*;
     use crate::chat::hooks::SummaryHookRegistry::{applySummaryHookMutation, SummaryHookMutation};
+
+    /// Keeps both trigger names and the derived ratio stable across plugin metadata edits.
+    #[test]
+    fn automatic_summary_trigger_preserves_the_hook_contract() {
+        for (point, name) in [
+            (SummaryTriggerPoint::BeforeSend, "before_send"),
+            (SummaryTriggerPoint::AfterReply, "after_reply"),
+        ] {
+            let trigger = SummaryTriggerContext {
+                current_tokens: 6094, max_tokens: 2000,
+                token_usage_threshold: 0.25, trigger_point: point,
+            }.metadata();
+            assert_eq!(trigger, json!({
+                "currentTokens": 6094, "maxTokens": 2000,
+                "tokenUsageThreshold": 0.25, "usageRatio": 3.047, "triggerPoint": name,
+            }));
+            let mut context = summary_context();
+            context.metadata.insert("trigger".into(), trigger.clone());
+            let updated = applySummaryHookMutation(context, SummaryHookMutation {
+                metadata: HashMap::from([("plugin".into(), json!(true))]), ..Default::default()
+            });
+            assert_eq!(updated.metadata["trigger"], trigger);
+        }
+    }
 
     /// Creates the same proposed prompt supplied to the summary preparation hooks.
     fn summary_context() -> SummaryHookContext {

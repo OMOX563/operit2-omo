@@ -3,7 +3,7 @@ import test from "node:test";
 import { selectorEnvironment } from "./selector-environment.mjs";
 import { mountRegisteredComposeRoute, composeNodes, keyedNode } from "./selector-render.mjs";
 import { buildUiScreenScripts } from "../scripts/build.mjs";
-import { plain } from "./runtime.mjs";
+import { loadModule, plain } from "./runtime.mjs";
 import { fixture } from "./fixtures.mjs";
 const modules = await buildUiScreenScripts();
 
@@ -17,6 +17,7 @@ async function environment(t, runtimeGlobals = {}) {
 /** Dispatches the SDK's actual callback on a keyed native control. */
 async function action(ui, key, prop = "onClick", payload) {
   if (key === "import-card" || key === "create-card") return ui.dispatch(keyedNode(ui.render().tree, "add-card").props.onSelect, key === "create-card" ? 0 : 1);
+  if (key === "import-group" || key === "create-group") return ui.dispatch(keyedNode(ui.render().tree, "add-group").props.onSelect, key === "create-group" ? 0 : 1);
   return ui.dispatch(keyedNode(ui.render().tree, key).props[prop], payload);
 }
 /** Checks that forms and management routes have no platform view underneath. */
@@ -55,6 +56,31 @@ test("native batch binding preserves hidden selections, writes only on submit an
   await action(ui, "binding-submit");
   assert.equal((await plugin.binding()).selection, "card:" + card.id); assert.equal((await plugin.binding("other-chat")).selection, "card:" + card.id);
   assert.deepEqual(plain((await plugin.web({ action: "snapshot" })).active), active);
+});
+
+/** Exercises the same batch transaction for group and card targets through the real management controls. */
+test("native group batch binding supports existing assignments and switching to a card", async t => {
+  const plugin = await environment(t), card = await plugin.api("character.create", { values: { name: "绑定角色" } });
+  const group = await plugin.api("group.create", { values: { name: "绑定群组", members: [{ characterCardId: card.id, orderIndex: 0 }] } });
+  plugin.records.set("other-chat", { extension: null });
+  await plugin.api("chat.configuration.binding.write", { chatId: "other-chat", selection: "group:" + group.id });
+  const active = plain(await plugin.api("activePrompt.get", {}));
+  const ui = mountRegisteredComposeRoute(plugin, null, "main"); await ui.load();
+  await action(ui, "group-bind:" + group.id);
+  assert.equal(keyedNode(ui.render().tree, "binding-check:other-chat").props.enabled, false);
+  await action(ui, "binding-check:selector-chat", "onCheckedChange", true);
+  await action(ui, "binding-submit");
+  assert.equal((await plugin.binding()).selection, "group:" + group.id);
+  assert.equal((await plugin.binding("other-chat")).selection, "group:" + group.id);
+  await action(ui, "group-bind:" + group.id);
+  const picker = keyedNode(ui.render().tree, "binding-selection");
+  const choices = [...(await plugin.api("character.list", {})).map(card => "card:" + card.id), ...(await plugin.api("group.list", {})).map(group => "group:" + group.id)];
+  await ui.dispatch(picker.props.onClick, choices.indexOf("card:" + card.id));
+  assert.equal(keyedNode(ui.render().tree, "binding-check:selector-chat").props.enabled, true);
+  await action(ui, "binding-select-visible"); await action(ui, "binding-submit");
+  assert.equal((await plugin.binding()).selection, "card:" + card.id);
+  assert.equal((await plugin.binding("other-chat")).selection, "card:" + card.id);
+  assert.deepEqual(plain(await plugin.api("activePrompt.get", {})), active);
 });
 
 test("native memory libraries persist global switches and shared store CRUD", async t => {
@@ -110,6 +136,29 @@ test("settings load authoritative values, validate numeric drafts and persist on
   await action(ui, "memory-settings-back"); await more(ui, "memory-settings-open"); await action(ui, "memory-settings-root", "onLoad"); assert.equal(keyedNode(ui.render().tree, "memory-interval").props.value, "7"); await action(ui, "memory-settings-back");
 });
 
+test("memory settings restore saved embedding batch and history window values when reopened", async t => {
+  const plugin = await environment(t), ownerKey = "character:default", ui = await memory(t, plugin);
+  await more(ui, "memory-settings-open"); await action(ui, "memory-settings-root", "onLoad");
+  await action(ui, "memory-settings-tabs:rebuild");
+  assert.equal(keyedNode(ui.render().tree, "memory-rebuild-window").props.value, "32");
+  await action(ui, "memory-rebuild-window", "onValueChange", "16");
+  await action(ui, "memory-settings-tabs:search");
+  await action(ui, "memory-embedding", "onCheckedChange", true);
+  await action(ui, "memory-embedding-endpoint", "onValueChange", "https://provider.test");
+  await action(ui, "memory-embedding-model", "onValueChange", "test-model");
+  assert.equal(keyedNode(ui.render().tree, "memory-embedding-batch").props.value, "20");
+  await action(ui, "memory-embedding-batch", "onValueChange", "12");
+  await action(ui, "memory-settings-save"); await action(ui, "memory-settings-back");
+  await more(ui, "memory-settings-open"); await action(ui, "memory-settings-root", "onLoad");
+  await action(ui, "memory-settings-tabs:rebuild");
+  assert.equal(keyedNode(ui.render().tree, "memory-rebuild-window").props.value, "16");
+  await action(ui, "memory-settings-tabs:search");
+  assert.equal(keyedNode(ui.render().tree, "memory-embedding-batch").props.value, "12");
+  const saved = await plugin.web({ action: "readMemorySettings", ownerKey });
+  assert.equal(saved.cloudEmbeddingBatchSize, 12); assert.equal(saved.rebuildWindowMessageCount, 16);
+  await action(ui, "memory-settings-back");
+});
+
 test("attachment owner/folder selection uses exact persisted records and emits the existing result", async t => {
   const plugin = await environment(t), ownerKey = "character:default"; await seed(plugin, ownerKey, "根目录"); await seed(plugin, ownerKey, "工作记忆", "工作"); await seed(plugin, ownerKey, "子目录记忆", "工作/子目录");
   const ui = mountRegisteredComposeRoute(plugin, { requestId: "attachment-native", input: { mode: "memory-attachment", ownerKey: null, folderPath: null } }, "memory-attachment"); await ui.load(); nativeOnly(ui);
@@ -119,10 +168,13 @@ test("attachment owner/folder selection uses exact persisted records and emits t
 });
 
 
-test("graph keeps the original modal, toolbar and inspector; forms unmount its platform view", async t => {
+test("graph opens as a separate page with toolbar and inspector; forms unmount its platform view", async t => {
   const plugin = await environment(t), ownerKey = "character:default"; await seed(plugin, ownerKey, "图谱源"); await seed(plugin, ownerKey, "图谱目标");
   const ui = await memory(t, plugin); await action(ui, "memory-graph-loader", "onLoad");
   assert.equal(composeNodes(ui.render().tree, node => node.type === "WebView").length, 1);
+  keyedNode(ui.render().tree, "memory-graph-page");
+  assert.equal(composeNodes(ui.render().tree, node => node.type === "Dialog").length, 0);
+  assert.equal(composeNodes(ui.render().tree, node => node.props.key === "management-list").length, 0);
   const bridge = ui.graphBridge(); assert.deepEqual(Object.keys(bridge).sort(), ["load", "select"]);
   const loaded = await ui.dispatch(bridge.load, []), graph = loaded.actionResult.data; assert.equal(graph.items.length, 2);
   assert.throws(() => ui.dispatch(bridge.select, ["memory", "nonexistent"]), /no longer exists/);
@@ -170,7 +222,7 @@ test("original action catalog retains independent owner entries, dialog forms an
   const role = mountRegisteredComposeRoute(plugin, null, "main"); await role.load();
   await action(role, "bind-chats");
   keyedNode(role.render().tree, "character-section"); keyedNode(role.render().tree, "management-dialog");
-  for (const key of ["binding-card", "binding-query", "binding-filter:all", "binding-filter:unbound", "binding-select-visible", "binding-submit"]) keyedNode(role.render().tree, key);
+  for (const key of ["binding-selection", "binding-query", "binding-filter:all", "binding-filter:unbound", "binding-select-visible", "binding-submit"]) keyedNode(role.render().tree, key);
   await action(role, "management-back");
   await action(role, "import-card"); assert.equal(keyedNode(role.render().tree, "import-format").type, "DropdownMenu");
   await action(role, "management-back");
@@ -196,4 +248,56 @@ test("original action catalog retains independent owner entries, dialog forms an
   assert.equal(keyedNode(ui.render().tree, "memory-credibility").type, "Slider");
   assert.equal(keyedNode(ui.render().tree, "memory-importance").type, "Slider");
   nativeOnly(ui); await action(ui, "memory-form-cancel");
+});
+
+
+test("search preview preserves production ranking, scores, threshold and folder scope in both graph and list", async t => {
+  const plugin = await environment(t), ownerKey = "character:default";
+  for (const [title, importance, folderPath] of [["ranked weaker", 0.5, "work"], ["ranked strongest", 1, "work"], ["unrelated neighbor", 0.8, "work"], ["ranked other folder", 1, "other"]]) {
+    await plugin.web({ action: "saveMemory", ownerKey, originalTitle: null, title, content: title, folderPath, importance, tags: "", contentType: "text/plain", source: "manual", credibility: 1 });
+  }
+  await plugin.web({ action: "writeMemorySearchConfig", ownerKey, config: { scoreMode: "BALANCED", keywordWeight: 3, tagWeight: 0, vectorWeight: 0, edgeWeight: 0 } });
+  await plugin.web({ action: "writeMemoryRecallSettings", settings: { enabled: true, limit: 2, allowRepeated: false } });
+  await plugin.web({ action: "createLink", ownerKey, sourceTitle: "ranked strongest", targetTitle: "unrelated neighbor", linkType: "related", weight: 1, description: "" });
+  const ui = await memory(t, plugin);
+  await action(ui, "memory-folder-filter", "onSelect", 3); // all, root, other, work
+  await action(ui, "memory-search-query", "onValueChange", "ranked");
+  assert.equal(keyedNode(ui.render().tree, "memory-search-query").props.imeAction, "search");
+  assert.equal(keyedNode(ui.render().tree, "memory-create").props.shape.cornerRadius, 16);
+  // Submit the latest native text, even when no change callback has reached DSL yet.
+  await action(ui, "memory-search-query", "onValueChange", "stale-query");
+  await action(ui, "memory-search-query", "onSubmitted", "ranked"); await action(ui, "memory-graph-loader", "onLoad");
+  const preview = plain(await plugin.web({ action: "previewMemorySearch", ownerKey, query: "ranked", folderPath: "work" }));
+  const production = plain(await plugin.web({ action: "searchMemories", options: { ownerKey, query: "ranked", folderPath: "work", relevanceThreshold: 0.025, createdAtStartMs: null, createdAtEndMs: null, limit: 2 } }));
+  assert.deepEqual(preview.candidates.map(hit => hit.memory.id), production.map(item => item.id));
+  assert.deepEqual(preview.candidates.map(hit => hit.memory.title), ["ranked strongest", "ranked weaker"]);
+  assert.ok(preview.candidates.every(hit => hit.passedThreshold && hit.score >= 0.025));
+  const displayed = plain((await ui.dispatch(ui.graphBridge().load, [])).actionResult.data);
+  assert.deepEqual(displayed.items.map(item => item.uuid), preview.candidates.map(hit => hit.memory.uuid));
+  assert.deepEqual(displayed.graph.nodes.map(node => node.id).sort(), displayed.items.map(item => item.uuid).sort());
+  assert.equal(displayed.graph.edges.length, 0);
+  const rows = composeNodes(ui.render().tree, node => String(node.props.key).startsWith("memory-select:"));
+  assert.deepEqual(rows.map(row => row.props.key), preview.candidates.map(hit => "memory-select:" + hit.memory.uuid));
+  assert.ok(composeNodes(ui.render().tree, node => node.type === "Text").some(node => String(node.props.text).includes("相关性 " + preview.candidates[0].score.toFixed(4))));
+  await action(ui, "memory-search-query", "onSubmitted", "no-match");
+  assert.equal(composeNodes(ui.render().tree, node => String(node.props.key).startsWith("memory-select:")).length, 0);
+  await action(ui, "memory-search-clear");
+  assert.equal(composeNodes(ui.render().tree, node => String(node.props.key).startsWith("memory-select:")).length, 3);
+  await action(ui, "memory-workspace-back"); keyedNode(ui.render().tree, "management-list");
+});
+
+test("large-library projections bound each page and do not add unmatched neighbors", () => {
+  const { memoryGraphPage, filteredMemoryGraph, MEMORY_GRAPH_PAGE_SIZE, MEMORY_GRAPH_EDGE_LIMIT } = loadModule("src/ui-memory-workspace.ts");
+  const base = fixture().graph.items[0];
+  const items = Array.from({ length: 10000 }, (_, index) => ({ ...base, id: String(index), uuid: "large-" + index }));
+  const data = { items, graph: { nodes: items.map(item => ({ id: item.uuid, label: item.title, color: 0, metadata: {} })), edges: Array.from({ length: 1500 }, (_, index) => ({ id: String(index), sourceId: "large-0", targetId: "large-" + (index % 199 + 1), weight: 1, metadata: {}, isCrossFolderLink: false, label: "related" })) } };
+  const first = memoryGraphPage(data, 0), last = memoryGraphPage(data, 49);
+  assert.equal(first.items.length, MEMORY_GRAPH_PAGE_SIZE); assert.equal(first.graph.nodes.length, MEMORY_GRAPH_PAGE_SIZE);
+  assert.equal(first.graph.edges.length, MEMORY_GRAPH_EDGE_LIMIT);
+  assert.equal(last.items.length, MEMORY_GRAPH_PAGE_SIZE); assert.equal(last.items[0].uuid, "large-9800");
+  assert.equal(last.graph.edges.length, 0);
+  const filtered = filteredMemoryGraph(data, "*", ["large-3", "large-0"]);
+  assert.deepEqual(plain(filtered.items.map(item => item.uuid)), ["large-3", "large-0"]);
+  assert.equal(filtered.graph.nodes.length, 2);
+  assert.ok(filtered.graph.edges.every(edge => edge.targetId === "large-3"));
 });

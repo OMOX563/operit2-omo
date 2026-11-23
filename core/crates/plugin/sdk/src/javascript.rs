@@ -211,6 +211,11 @@ impl JsEnvironmentOwner {
 
 /// Defines the fixed Rust execution contract required by package JavaScript.
 pub trait JsExecutionHost: Send + Sync {
+    /// Imports an archive through the authenticated v1 chat history migrator bridge.
+    fn import_v1_migrator_archive(&self, _path: String) -> JsExecutionCompletion<Result<Value, String>> {
+        Box::pin(async { Err("The v1 chat archive importer is unavailable on this host".into()) })
+    }
+
     /// Captures immutable native caller state before crossing the JavaScript runtime scheduler.
     fn capture_tool_invocation_host(&self) -> Arc<dyn JsExecutionHost>;
 
@@ -317,8 +322,13 @@ pub trait JsExecutionHost: Send + Sync {
     fn open_compose_file_picker(&self, payload: &Value) -> Result<Value, String>;
 
     /// Controls a floating surface with identity supplied by the authenticated engine.
-    fn floating_window_command(&self, _payload: &Value) -> Result<Value, String> {
-        Err("Floating windows are unavailable on this host".into())
+    fn floating_window_command(&self, _payload: Value) -> JsExecutionFuture<Result<Value, String>> {
+        Box::pin(async { Err("Floating windows are unavailable on this host".into()) })
+    }
+
+    /// Reads or resolves approval requests for an authenticated permission presenter.
+    fn tool_permission_command(&self, _payload: Value) -> Result<Value, String> {
+        Err("Tool permission presentation is unavailable on this host".into())
     }
 
     /// Saves a UTF-8 export through the embedding application's file selector.
@@ -328,7 +338,7 @@ pub trait JsExecutionHost: Send + Sync {
     fn is_package_imported(&self, package_name: &str) -> Result<bool, String>;
 
     /// Imports one package into the active package set.
-    fn import_package(&self, package_name: &str) -> Result<String, String>;
+    fn import_package(&self, package_name: &str) -> JsExecutionFuture<Result<String, String>>;
 
     /// Removes one package from the active package set.
     fn remove_package(&self, package_name: &str) -> Result<String, String>;
@@ -418,8 +428,6 @@ pub trait JsExecutionHost: Send + Sync {
         Box::pin(async { Err("Plugin storage record watches are unavailable on this host".to_string()) })
     }
 
-    /// Waits for the host runtime to advance JavaScript work on a later turn.
-    fn wait_for_javascript_runtime_turn(&self) -> operit_host_api::HostRuntimeTurnFuture;
 }
 
 /// Executes package JavaScript through one bound package and host context.
@@ -428,6 +436,14 @@ pub trait JsPackageExecutor: Send + Sync {
     fn execute_package_tool(
         &self,
         request: &JsPackageToolCallRequest,
+    ) -> JsExecutionCompletion<JsPackageToolCallResult> {
+        self.execute_package_tool_streaming(request, None)
+    }
+
+    /// Executes one package while delivering its explicitly emitted intermediate output.
+    fn execute_package_tool_streaming(
+        &self, request: &JsPackageToolCallRequest,
+        on_intermediate_result: Option<Arc<dyn Fn(String) + Send + Sync>>,
     ) -> JsExecutionCompletion<JsPackageToolCallResult>;
 }
 
@@ -479,6 +495,8 @@ pub struct JsPackageToolCallResult {
 /// Captures an exact executable declaration together with its immutable runtime selection.
 #[derive(Clone, Debug)]
 pub struct JsPackageToolSelection {
+    /// Contains the registered package API contract, including the v1 default for legacy metadata.
+    pub api_version: String,
     /// Contains the selected registered declaration, including its authoritative script and parameter schema.
     pub definition: crate::package::PackageTool,
     /// Contains the selected conditional state when the registered package uses one.
@@ -599,6 +617,8 @@ pub struct ToolPkgMainRegistrationCapture {
     pub hostEventHooks: Vec<String>,
     #[serde(rename = "toolLifecycleHooks", default)]
     pub toolLifecycleHooks: Vec<String>,
+    #[serde(default)]
+    pub toolPermissionHooks: Vec<String>,
     #[serde(rename = "promptInputHooks", default)]
     pub promptInputHooks: Vec<String>,
     #[serde(rename = "promptHistoryHooks", default)]
@@ -676,6 +696,15 @@ pub trait JsExecutionEngine: Send + Sync {
         self.execute_script_function(&script, &function_name, &params, &env_overrides, None, true)
     }
 
+    /// Transfers a package call while preserving its execution-owned intermediate output sink.
+    fn execute_script_function_owned_with_output(
+        &self, script: String, function_name: String, params: BTreeMap<String, Value>,
+        env_overrides: BTreeMap<String, String>,
+        on_intermediate_result: Option<Arc<dyn Fn(String) + Send + Sync>>,
+    ) -> JsExecutionCompletion<JsExecutionResult<Option<String>>> {
+        self.execute_script_function(&script, &function_name, &params, &env_overrides, on_intermediate_result, true)
+    }
+
     /// Executes a before hook under its caller-owned millisecond completion deadline.
     fn execute_script_function_with_timeout_millis(
         &self,
@@ -699,14 +728,14 @@ pub trait JsExecutionEngine: Send + Sync {
         dispatch_intermediate_on_main: bool,
     ) -> JsExecutionFuture<JsExecutionResult<Option<String>>>;
 
-    /// Executes a ToolPkg registration function and returns captured declarations.
+    /// Awaits a ToolPkg registration function without blocking the caller's scheduler.
     fn execute_toolpkg_main_registration_function_with_text_resources(
         &self,
         script: &str,
         function_name: &str,
         params: &BTreeMap<String, Value>,
         text_resources: Option<Arc<BTreeMap<String, String>>>,
-    ) -> JsExecutionResult<ToolPkgMainRegistrationCapture>;
+    ) -> JsExecutionCompletion<JsExecutionResult<ToolPkgMainRegistrationCapture>>;
 
     /// Executes a streamed render with a synchronous sink for every generated retained commit.
     fn execute_compose_dsl_script_stream_async(

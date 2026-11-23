@@ -3,6 +3,7 @@
 import 'dart:async';
 import 'PluginHotReload.dart';
 import 'WorkActivityPresentationService.dart';
+import 'AppVisibilityService.dart';
 
 import 'package:flutter/foundation.dart';
 import 'package:operit_keep_alive/operit_keep_alive.dart';
@@ -33,6 +34,8 @@ class CoreApplicationService with WidgetsBindingObserver {
   bool _initialized = false;
   bool _ownsRuntime = true;
   AppLifecycleState? _lastEmittedLifecycleState;
+  AppVisibility? _lastEmittedVisibility;
+  Future<void> _visibilityDelivery = Future.value();
   KeepAliveLease? _coreResidency;
   Future<void>? _runtimeServicesStart;
   Object? _pendingStartupError;
@@ -69,6 +72,8 @@ class CoreApplicationService with WidgetsBindingObserver {
     }
     PluginHotReload.register(_coreClients);
     WidgetsBinding.instance.addObserver(this);
+    AppVisibilityService.instance.addListener(_handleVisibilityChanged);
+    unawaited(AppVisibilityService.instance.initialize());
     _runtimeManager.addListener(_handleRuntimeBootstrapChanged);
     unawaited(_syncHostSubscriber());
     unawaited(_startRuntimeServices());
@@ -79,9 +84,51 @@ class CoreApplicationService with WidgetsBindingObserver {
     );
   }
 
+  /// Delivers product visibility in order; raw Flutter events remain independent diagnostics.
+  void _handleVisibilityChanged() {
+    unawaited(_emitVisibility(AppVisibilityService.instance.value));
+  }
+
+  Future<void> _emitVisibility(AppVisibility visibility) {
+    if (!_runtimeManager.runtimeConfigured ||
+        visibility == AppVisibility.unknown) {
+      return Future.value();
+    }
+    final occurredAt = DateTime.now().millisecondsSinceEpoch;
+    final work = _visibilityDelivery.then((_) async {
+      if (_lastEmittedVisibility == visibility) return;
+      await _coreClients.application.ingestRuntimeEvent(
+        event: RuntimeEvent(
+          domain: RuntimeEventDomain.host,
+          source: RuntimeEventSource.flutterLifecycle,
+          topic: RuntimeEventTopic.appVisibilityChanged,
+          platform: _runtimeEventPlatform,
+          payload: {'visibility': visibility.name},
+          occurredAtMillis: occurredAt,
+        ),
+      );
+      _lastEmittedVisibility = visibility;
+    });
+    _visibilityDelivery = work.catchError((Object error, StackTrace stack) {
+      ClientLogger.e(
+        'product visibility delivery failed',
+        tag: _logTag,
+        error: error,
+        stackTrace: stack,
+      );
+    });
+    return _visibilityDelivery;
+  }
+
   /// Forwards Flutter lifecycle changes through the normalized runtime event ingress.
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
+    ClientLogger.i(
+      'lifecycle received platform=${_runtimeEventPlatform.name} '
+      'previous=${_lastEmittedLifecycleState?.name} state=${state.name} '
+      'configured=${_runtimeManager.runtimeConfigured} ownsRuntime=$_ownsRuntime',
+      tag: _logTag,
+    );
     if (!_runtimeManager.runtimeConfigured) return;
     if (state == AppLifecycleState.resumed) {
       unawaited(_syncHostSubscriber());
@@ -101,6 +148,7 @@ class CoreApplicationService with WidgetsBindingObserver {
       return;
     }
     _lastEmittedLifecycleState = state;
+    final stopwatch = Stopwatch()..start();
     final timestamp = DateTime.now().millisecondsSinceEpoch;
     final topic = switch (state) {
       AppLifecycleState.resumed => RuntimeEventTopic.appLifecycleResumed,
@@ -119,6 +167,12 @@ class CoreApplicationService with WidgetsBindingObserver {
           payload: <String, Object?>{'state': state.name},
           occurredAtMillis: timestamp,
         ),
+      );
+      ClientLogger.i(
+        'lifecycle delivered platform=${_runtimeEventPlatform.name} '
+        'state=${state.name} occurredAtMillis=$timestamp '
+        'elapsedMs=${stopwatch.elapsedMilliseconds}',
+        tag: _logTag,
       );
     } catch (error, stackTrace) {
       ClientLogger.e(
@@ -199,8 +253,11 @@ class CoreApplicationService with WidgetsBindingObserver {
     try {
       if (!_runtimeManager.runtimeConfigured) return;
       ClientLogger.attachPersistentStorage();
+      await _syncHostSubscriber();
+      final lifecycle = WidgetsBinding.instance.lifecycleState;
+      if (lifecycle != null) await _emitLifecycleEvent(lifecycle);
+      await _emitVisibility(AppVisibilityService.instance.value);
       if (!_ownsRuntime) {
-        await _syncHostSubscriber();
         AppNotificationService.instance.initialize();
         return;
       }
@@ -210,7 +267,6 @@ class CoreApplicationService with WidgetsBindingObserver {
         verboseLevel: VerboseLevel.level1,
       );
       await _retainCoreRuntime();
-      await _syncHostSubscriber();
       AppNotificationService.instance.initialize();
       await WorkActivityPresentationService.instance.initialize();
       final deviceInfo = await RuntimeDeviceInfoProvider.current();
@@ -304,8 +360,7 @@ class CoreApplicationService with WidgetsBindingObserver {
 
   /// Synchronizes owner-host event handling with the selected runtime role.
   Future<void> _syncHostSubscriber() async {
-    final shouldInstall =
-        _runtimeManager.runtimeConfigured && _ownsHostInteractions;
+    final shouldInstall = _runtimeManager.runtimeConfigured;
     final installed = RuntimeHostInteractionSubscriber.isInstalled;
     if (shouldInstall && !installed) {
       final subscriberStopwatch = Stopwatch()..start();
@@ -336,10 +391,5 @@ class CoreApplicationService with WidgetsBindingObserver {
         verboseLevel: VerboseLevel.level1,
       );
     }
-  }
-
-  /// Returns whether this process owns native host interaction handling.
-  bool get _ownsHostInteractions {
-    return !kIsWeb;
   }
 }

@@ -65,11 +65,11 @@ impl AsyncToolExecutor for PackageToolExecutor {
         }
     }
 
-    /// Declares the access boundary for package tools.
+    /// Treats every outer package invocation as a write operation requiring approval in restricted modes.
     #[allow(non_snake_case)]
     fn accessSpec(&self, _tool: &AITool) -> Result<ToolAccessSpec, String> {
         Ok(ToolAccessSpec {
-            effect: ToolEffect::READ,
+            effect: ToolEffect::WRITE,
             boundary: ToolBoundary::None,
         })
     }
@@ -81,9 +81,10 @@ impl AsyncToolExecutor for PackageToolExecutor {
         let runtime = Arc::new(PackageManagerJsRuntime::new(self.packageManager.clone(), host.clone()));
         let executor = host.runtimeDependencies().js_execution_provider()
             .create_package_executor(runtime, Arc::new(host));
+        let onOutput = crate::PackageExecution::PackageExecution::outputCallback();
         Box::pin(async move {
             let request = packageToolCallRequest(tool);
-            vec![packageToolResult(executor.execute_package_tool(&request).await)]
+            vec![packageToolResult(executor.execute_package_tool_streaming(&request, onOutput).await)]
         })
     }
 }

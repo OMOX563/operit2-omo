@@ -9,6 +9,138 @@ class AppLocalizationsZh extends AppLocalizations {
   AppLocalizationsZh([String locale = 'zh']) : super(locale);
 
   @override
+  String get terminalProfileSelect => '选择终端配置';
+
+  @override
+  String get terminalProfilesUnavailable => '当前设备没有可用的终端。';
+
+  @override
+  String get terminalImplementationNative => '本机终端';
+
+  @override
+  String get terminalImplementationProot => 'PRoot Linux 终端';
+
+  @override
+  String get terminalImplementationAndroidSystem => 'Android 系统终端';
+
+  @override
+  String get terminalImplementationQemu => 'QEMU Linux 模拟终端';
+
+  @override
+  String get terminalImplementationArm64 => 'Linux ARM64 模拟终端';
+
+  @override
+  String get terminalImplementationSystem => '系统终端';
+
+  @override
+  String get terminalImplementationBrowser => '浏览器 Linux 虚拟机';
+
+  @override
+  String get terminalInterpreterShell => 'Shell 命令行';
+
+  @override
+  String terminalBuiltinMacNative(String interpreter) {
+    return 'macOS 本机 $interpreter 终端';
+  }
+
+  @override
+  String terminalBuiltinMacSandbox(String interpreter) {
+    return 'macOS 沙箱 $interpreter 终端';
+  }
+
+  @override
+  String get terminalBuiltinAndroidLinux => 'Android PRoot Linux Bash 终端';
+
+  @override
+  String get terminalBuiltinAndroidSystem => 'Android 系统 Shell 终端';
+
+  @override
+  String get terminalBuiltinLinux => 'Linux 本机 Bash 终端';
+
+  @override
+  String get terminalBuiltinPosix => 'POSIX 本机 Bash 终端';
+
+  @override
+  String get terminalBuiltinPrivileged => '系统特权 sh 终端';
+
+  @override
+  String get terminalBuiltinPowerShellDownload => 'PowerShell 7 终端';
+
+  @override
+  String get terminalBuiltinPowerShell => 'Windows 内置 PowerShell 7 终端';
+
+  @override
+  String get terminalBuiltinWindowsBash => 'Windows 内置 Bash 终端';
+
+  @override
+  String get terminalBuiltinArm64 => 'Linux ARM64 模拟终端';
+
+  @override
+  String get terminalBuiltinIosSystem => 'iOS 系统 sh 终端';
+
+  @override
+  String get terminalBuiltinOhosLinux => 'OpenHarmony QEMU Linux 模拟终端';
+
+  @override
+  String get terminalBuiltinOhosSystem => 'OpenHarmony 系统 sh 终端';
+
+  @override
+  String get terminalBuiltinBrowser => '浏览器 Linux 虚拟机终端';
+
+  @override
+  String get terminalProfilesTitle => '终端配置';
+
+  @override
+  String get terminalProfilesDescription =>
+      '为当前设备添加终端配置并选择默认项。工作区和 AI 新建的终端会话共用此设置；已有会话继续使用原来的环境。';
+
+  @override
+  String get terminalProfileAdd => '添加终端配置';
+
+  @override
+  String get terminalProfileEdit => '编辑终端配置';
+
+  @override
+  String get terminalProfileDelete => '删除终端配置';
+
+  @override
+  String get terminalProfileDeleteDescription =>
+      '删除后不能再用此配置新建终端。已经运行的会话会继续保留。默认配置需要先切换到其他配置才能删除。';
+
+  @override
+  String get terminalProfileName => '配置名称';
+
+  @override
+  String get terminalProfileNameRequired => '请输入配置名称';
+
+  @override
+  String get terminalProfileImplementation => '终端实现与解释器';
+
+  @override
+  String get terminalProfileRootfs => '根文件系统目录';
+
+  @override
+  String get terminalProfileRootfsHelp =>
+      '填写当前设备可访问的、已解压的同架构 Linux 根文件系统绝对路径，例如 Ubuntu。Android 需要包含 /bin/bash，OpenHarmony 需要包含 /bin/sh。留空使用内置环境。';
+
+  @override
+  String get terminalProfileExecutable => '解释器可执行文件路径';
+
+  @override
+  String get terminalProfileArguments => '启动器参数（JSON 数组）';
+
+  @override
+  String get terminalProfileArgumentsHelp =>
+      '例如 [\"--login\"]。启动参数放在应用管理的交互参数之前；设置启动参数时需要填写程序路径。PowerShell 5 和 7 可以分别添加为独立配置。';
+
+  @override
+  String get terminalProfileArgumentsError =>
+      '请输入字符串组成的 JSON 数组，例如 [\"--login\"]';
+
+  @override
+  String get terminalProfileNoOptions => '此终端由当前平台管理，可选择为默认终端；宿主未开放额外启动参数。';
+
+  @override
   String get chatPromoteToRoot => '提升为主对话';
 
   @override
@@ -233,6 +365,18 @@ class AppLocalizationsZh extends AppLocalizations {
 
   @override
   String get workspaceCloseOtherTabs => '关闭其他';
+
+  @override
+  String get workspaceDockDropTarget => '拖到工作区';
+
+  @override
+  String get workspaceOpenWith => '打开方式';
+
+  @override
+  String get workspaceBuiltInPreview => '内置预览';
+
+  @override
+  String get workspacePluginUnsavedChanges => '请先在编辑器中保存，或放弃未保存的修改。';
 
   @override
   String get workspaceCloseTabsToRight => '关闭右侧';
@@ -755,6 +899,22 @@ class AppLocalizationsZh extends AppLocalizations {
   String get downloads => '下载';
 
   @override
+  String get browserDownloadsAll => '全部';
+
+  @override
+  String get browserDownloadStorageHint =>
+      '文件保存在浏览器所在设备的下载目录中。打开文件时会先复制到当前工作区，也可以直接保存到工作区。';
+
+  @override
+  String get browserDownloadWorkspaceTarget => '保存到当前工作区：';
+
+  @override
+  String get browserDownloadSaveToWorkspace => '保存到工作区';
+
+  @override
+  String get browserDownloadInterrupted => '下载已中断，请重新下载';
+
+  @override
   String get scripts => '脚本';
 
   @override
@@ -825,6 +985,10 @@ class AppLocalizationsZh extends AppLocalizations {
 
   @override
   String get openExternalApplication => '打开外部应用';
+
+  @override
+  String get browserExternalNavigationFailed =>
+      '无法打开此链接。可能未安装对应应用、链接无效，或系统拒绝了打开请求。';
 
   @override
   String get open => '打开';
@@ -1046,11 +1210,16 @@ class AppLocalizationsZh extends AppLocalizations {
   String get settingsCategoryDataTitle => '数据与备份';
 
   @override
-  String get settingsCategoryDataSubtitle => '备份、恢复、统计';
+  String get settingsCategoryDataSubtitle => '备份、恢复、存储';
 
   @override
-  String get settingsCategoryDataDescription =>
-      '备份聊天、插件数据和模型配置，恢复备份内容，并查看数据统计。';
+  String get settingsCategoryDataDescription => '备份和恢复聊天、插件数据及模型配置，并管理存储位置。';
+
+  @override
+  String get settingsUsageReportTitle => 'Token 用量报告';
+
+  @override
+  String get settingsUsageReportSubtitle => '模型用量、缓存与费用';
 
   @override
   String get settingsCategoryAccessLinksTitle => '设备空间';
@@ -1075,6 +1244,13 @@ class AppLocalizationsZh extends AppLocalizations {
 
   @override
   String get settingsGlobalBehaviorChatInputSection => '聊天输入';
+
+  @override
+  String get settingsGlobalBehaviorEnterSendsMessage => '回车键发送消息';
+
+  @override
+  String get settingsGlobalBehaviorEnterSendsMessageDescription =>
+      '关闭后，回车键换行。Ctrl+Enter 和展开输入框中的回车键始终换行。';
 
   @override
   String get settingsGlobalBehaviorLongPastedTextAsAttachment => '将超长粘贴文本转为文件';
@@ -1544,7 +1720,52 @@ class AppLocalizationsZh extends AppLocalizations {
   }
 
   @override
-  String get localModelsAddModel => '添加模型';
+  String get localModelsAddModel => '在线找模型';
+
+  @override
+  String get localModelsImportFromDevice => '从设备导入';
+
+  @override
+  String get localModelsImportGgufHint => '选择一个适用于 llama.cpp 的完整 GGUF 聊天模型。';
+
+  @override
+  String get localModelsImportMnnHint =>
+      '一次选中解压后的 MNN 模型文件，包括 config.json 和权重。';
+
+  @override
+  String get localModelsImportInvalidGguf => '请只选择一个 .gguf 文件。';
+
+  @override
+  String get localModelsImportMissingConfig => '所选文件中缺少 config.json。';
+
+  @override
+  String get localModelsImportFileSizeRequired => '所选文件必须非空，并且能读取文件大小。';
+
+  @override
+  String get localModelsImportChangeFiles => '重新选择';
+
+  @override
+  String localModelsImportFileCount(int count) {
+    return '已选择 $count 个文件';
+  }
+
+  @override
+  String get localModelsImportName => '模型名称';
+
+  @override
+  String get localModelsImportCopyNotice => '文件将复制到应用存储，并保留在当前设备。';
+
+  @override
+  String get localModelsImportCopying => '正在复制模型文件…';
+
+  @override
+  String get localModelsImportFinishing => '正在校验并登记模型…';
+
+  @override
+  String get localModelsImportComplete => '模型已导入，打开「推理与设置」即可试跑。';
+
+  @override
+  String get localModelsImportedFile => '设备导入';
 
   @override
   String get localModelsFilterDownloads => '下载任务';
@@ -3109,11 +3330,14 @@ class AppLocalizationsZh extends AppLocalizations {
   String get settingsAppearanceBubbleImageAdjustAi => '调整 AI 气泡图片';
 
   @override
-  String get settingsAppearanceBubbleImagePreview => '预览';
+  String get settingsAppearanceBubbleImagePreview => '实时预览';
 
   @override
   String get settingsAppearanceBubbleImagePreviewText =>
       '这是一条气泡预览消息。\n可以查看边角和中间区域的实际效果。';
+
+  @override
+  String get settingsAppearanceBubbleImageSource => '原图';
 
   @override
   String get settingsAppearanceBubbleImageSourceHint =>
@@ -3352,29 +3576,17 @@ class AppLocalizationsZh extends AppLocalizations {
   }
 
   @override
-  String get settingsDataTokenSection => '使用统计';
-
-  @override
   String get settingsDataInputTokens => '输入';
 
   @override
   String get settingsDataOutputTokens => '输出';
 
   @override
-  String get settingsDataOpenDetailedStats => '查看详细统计';
-
-  @override
-  String get settingsDataOpenDetailedStatsDescription =>
-      '查看使用热力图，以及可按分钟缩放的各模型用量时间线。';
-
-  @override
-  String get settingsDataRefreshTokenStats => '刷新统计';
-
-  @override
   String get settingsDataResetTokenStats => '重置统计';
 
   @override
-  String get settingsDataDetailedStatsTitle => '详细统计';
+  String get settingsUsageReportResetConfirmation =>
+      '这将永久删除所有已保存的模型用量记录，聊天记录会保留。';
 
   @override
   String get settingsDataDetailedStatsDescription => '统计基于独立保存的模型请求明细计算。';
@@ -3611,14 +3823,87 @@ class AppLocalizationsZh extends AppLocalizations {
   String get settingsDataSnapshotBackupTitle => '完整快照';
 
   @override
-  String get settingsDataExportRawSnapshot => '导出快照';
+  String get settingsDataExportRawSnapshot => '导出完整快照';
 
   @override
-  String get settingsDataImportRawSnapshot => '恢复快照';
+  String get settingsDataImportRawSnapshot => '恢复完整快照';
 
   @override
   String get settingsDataExportRawSnapshotDescription =>
-      '把聊天、插件数据、模型设置和本地文件打包成一个备份文件。恢复时会用备份里的数据覆盖当前数据。';
+      '将聊天、插件数据、模型设置和本地文件打包为 .opsnapshot 文件。';
+
+  @override
+  String get settingsDataDatabaseBackup => '数据库备份';
+
+  @override
+  String get settingsDataDatabaseBackupDescription =>
+      '每天保存一份数据库文件，保留最近 10 份自动备份。附件和工作区文件单独存放。';
+
+  @override
+  String get settingsDataBackupScheduled => '每日备份已开启';
+
+  @override
+  String get settingsDataBackupUnavailable => '请选择可用的文件夹以开启每日备份';
+
+  @override
+  String get settingsDataBackupNow => '立即备份';
+
+  @override
+  String get settingsDataBackupSaved => '数据库备份已保存。';
+
+  @override
+  String get settingsDataRecoverySection => '恢复数据';
+
+  @override
+  String get settingsDataRestoreDatabaseDescription =>
+      '从备份目录按日期选择一份数据库，恢复后以这份数据为准同步到其他设备。';
+
+  @override
+  String get settingsDataRestoreArchiveDescription =>
+      '用 Operit2 的完整快照替换当前运行数据，恢复后会重启应用。';
+
+  @override
+  String get settingsDataImportSection => '导入数据';
+
+  @override
+  String get settingsDataImportOperit1Description =>
+      '选择 Operit1 快照，预览后迁移聊天、模型配置和资源。';
+
+  @override
+  String get settingsDataImportChatJson => '导入聊天 JSON';
+
+  @override
+  String get settingsDataImportChatJsonDescription => '新增聊天，已有相同 ID 的聊天会更新。';
+
+  @override
+  String get settingsDataImportModelJson => '导入模型配置 JSON';
+
+  @override
+  String get settingsDataImportModelJsonDescription =>
+      '新增模型服务商配置，已有相同 ID 的配置会更新。';
+
+  @override
+  String get settingsDataImportAction => '确认导入';
+
+  @override
+  String get settingsDataReadingSnapshot => '正在读取快照';
+
+  @override
+  String get settingsDataPreparingPreview => '正在生成预览';
+
+  @override
+  String settingsDataOperit1ImportResult(int chatCount, int messageCount) {
+    return '已导入 $chatCount 个聊天、$messageCount 条消息。';
+  }
+
+  @override
+  String get settingsDataExportSection => '导出文件';
+
+  @override
+  String get settingsDataExportChatJson => '导出聊天 JSON';
+
+  @override
+  String get settingsDataExportModelJson => '导出模型配置 JSON';
 
   @override
   String settingsDataSnapshotBytes(int bytes) {
@@ -4441,6 +4726,38 @@ class AppLocalizationsZh extends AppLocalizations {
       '已保存的外观没有被替换。修复资源后可以重试，也可以主动重置外观。重置会保留头像和已保存的配置，并切换到自定义外观。';
 
   @override
+  String settingsAppearanceAssetBackgroundFailed(String reference) {
+    return '背景图片无法加载，已使用默认背景（$reference）。';
+  }
+
+  @override
+  String settingsAppearanceAssetVideoFailed(String reference) {
+    return '背景视频无法播放，已使用默认背景（$reference）。';
+  }
+
+  @override
+  String settingsAppearanceAssetBubbleFailed(String reference) {
+    return '气泡图片无法加载，已使用默认气泡颜色（$reference）。';
+  }
+
+  @override
+  String settingsAppearanceAssetPreviousRetained(String reference) {
+    return '此主题资源无法加载，暂用上一张图片或媒体（$reference），其他主题设置仍有效。';
+  }
+
+  @override
+  String get settingsAppearanceAssetRetry => '重试';
+
+  @override
+  String get settingsAppearanceAssetReimportHint =>
+      '重试后仍无法加载时，请重新选择并导入可读取的图片或可播放的视频。';
+
+  @override
+  String settingsAppearanceAssetImportFailed(String reason) {
+    return '背景资源没有生效：$reason。请选择可读取的图片或可播放的视频。';
+  }
+
+  @override
   String get settingsAppearanceRetry => '重试';
 
   @override
@@ -4919,4 +5236,127 @@ class AppLocalizationsZh extends AppLocalizations {
 
   @override
   String get workspaceFileSaving => '文件正在保存，请保存完成后重试。';
+
+  @override
+  String get chatBackupChooseTitle => '选择你的备份目录';
+
+  @override
+  String get chatBackupTitle => '每日聊天备份';
+
+  @override
+  String get chatBackupDescription =>
+      '应用运行时每天直接复制整个 SQLite 数据库文件，保留最近 10 份自动备份。包含数据库中的全部数据；附件文件、工作区和单独存储的配置文件不随之复制。';
+
+  @override
+  String get chatRestoreTitle => '从数据库备份恢复';
+
+  @override
+  String get chatRestoreDescription => '打开存有备份的文件夹，选择要恢复的日期。';
+
+  @override
+  String get chatRestoreChooseFolder => '选择恢复来源';
+
+  @override
+  String get chatRestoreRefresh => '刷新列表';
+
+  @override
+  String get chatRestoreSelected => '恢复所选备份';
+
+  @override
+  String get chatRestoreAction => '恢复';
+
+  @override
+  String get chatRestoreCancel => '取消';
+
+  @override
+  String get chatRestoreEmpty => '此文件夹中没有数据库备份。';
+
+  @override
+  String get chatRestoreConfirmTitle => '恢复这份数据库备份？';
+
+  @override
+  String chatRestoreConfirmDescription(String name) {
+    return '将用 $name 直接覆盖当前数据库文件，数据库中的全部数据都会被替换。请先停止正在运行的对话。恢复后将以这份数据库建立新的同步基线，覆盖其他设备的旧数据。';
+  }
+
+  @override
+  String get chatRestoreSuccess => '数据库已恢复。下次同步将以这份数据为准。';
+
+  @override
+  String get chatRestoreOnboardingTitle => '从以前的备份恢复';
+
+  @override
+  String get chatRestoreOnboardingDescription => '找回重装前或卸载前保存在外部目录的聊天记录';
+
+  @override
+  String get chatBackupExternalDescription =>
+      '请选择应用外的文件夹，确保卸载后备份仍保留。iPhone 和 iPad 请在 iCloud Drive 或其他外部文件提供者中选择目录。';
+
+  @override
+  String get chatBackupChoose => '选择备份目录';
+
+  @override
+  String get chatBackupLater => '稍后设置';
+
+  @override
+  String get chatBackupChange => '更改备份目录';
+
+  @override
+  String get chatBackupMissing => '尚未设置备份目录，或原目录已不存在、无法访问。请选择目录以开启每日聊天备份。';
+
+  @override
+  String get chatBackupDirectoryUnavailable =>
+      '无法使用所选文件夹。请在可用的文件夹（如“文档”或“下载”）下新建目录，并选择该目录。';
+
+  @override
+  String get chatBackupReady => '备份目录已就绪。应用启动、回到前台及运行期间会检查每日备份。';
+
+  @override
+  String get chatBackupNow => '立即备份聊天';
+
+  @override
+  String get chatBackupNever => '尚无成功备份';
+
+  @override
+  String chatBackupLastSuccess(String time) {
+    return '最近成功备份：$time';
+  }
+
+  @override
+  String get terminalDistributionsTitle => '下载 Linux 发行版';
+
+  @override
+  String get terminalDistributionsDescription =>
+      '软件仅内置 Alpine。按需下载 ARM64 根文件系统，安装为独立实例后可设为默认；同一发行版可以安装多套。';
+
+  @override
+  String get terminalDistributionDownload => '下载安装';
+
+  @override
+  String get terminalInstallQueued => '等待安装';
+
+  @override
+  String get terminalInstallDownloading => '正在下载根文件系统';
+
+  @override
+  String get terminalInstallVerifying => '正在校验 SHA-256';
+
+  @override
+  String get terminalInstallExtracting => '正在安装根文件系统';
+
+  @override
+  String get terminalInstallCompleted => '安装完成，可在终端配置中选择';
+
+  @override
+  String get terminalInstallCancelled => '已取消安装';
+
+  @override
+  String get terminalInstallFailed => '安装失败';
+
+  @override
+  String get terminalProfileWslDistribution => 'WSL 发行版（可选）';
+
+  @override
+  String get terminalProfileWslHelp =>
+      '使用 WSL 时选择 Bash，填写 wsl.exe 的绝对路径及 wsl --list --quiet 列出的发行版名称，例如 Ubuntu-24.04。使用本机 Bash 时留空。';
 }

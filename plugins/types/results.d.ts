@@ -20,7 +20,7 @@ export interface JsonResultData {
 /**
  * Contains every concrete payload returned by the built-in tool runtime.
  */
-export type ToolResultData = UIPageResultData | UIActionResultData | JsonResultData | EdgePortResultData | BooleanResultData | StringResultData | SleepResultData | EnvironmentVariableReadResultData | EnvironmentVariableWriteResultData | ModelsListSummariesResultData | TtsSynthesizeResultData | TtsSpeakResultData | SttTranscribeResultData | TtsListConfigsResultData | TtsGetCurrentConfigIdResultData | TtsSetCurrentConfigIdResultData | ThemeListConfigsResultData | ThemeApplyConfigResultData | IntResultData | BinaryResultData | FilePartContentData | DirectoryListingData | FileContentData | BinaryFileContentData | FileExistsData | FileInfoData | FileOperationData | FileApplyResultData | StorageRequestResultData | WebSocketResultData | HttpResponseData | HttpStreamEventData | SystemSettingData | AppOperationData | AppListData | AppUsageTimeResultData | NotificationData | LocationData | DeviceInfoResultData | ChatServiceStartResultData | ChatCreationResultData | ChatListResultData | ChatFindResultData | AgentStatusResultData | ChatSwitchResultData | ChatTitleUpdateResultData | ChatDeleteResultData | MessageSendResultData | ChatSendMessageResultData | ChatObservationResultData | ChatCancelResultData | ChatReadExtensionResultData | ChatWriteExtensionResultData | ChatDeleteExtensionResultData | ChatCallResultData | ChatMessagesResultData | VisitWebResultData | TerminalInfoResultData | TerminalCommandResultData | TerminalStreamEventData | TerminalObservationResultData | HiddenTerminalCommandResultData | TerminalSessionCreationResultData | TerminalSessionCloseResultData | TerminalSessionScreenResultData | MusicPlaybackResultData | BluetoothStateData | BluetoothBondedDevicesData | BluetoothScanResultData | BluetoothSessionData | BluetoothTransferData | BluetoothReadData | BluetoothBleServicesData | BluetoothBleNotificationData | CatalogReadToolSourcesResultData | MediaRegistrationResultData | FindFilesResultData | GrepResultData;
+export type ToolResultData = UIPageResultData | UIActionResultData | JsonResultData | EdgePortResultData | BooleanResultData | StringResultData | SleepResultData | EnvironmentVariableReadResultData | EnvironmentVariableWriteResultData | ModelsListSummariesResultData | TtsSynthesizeResultData | TtsSpeakResultData | SttTranscribeResultData | TtsListConfigsResultData | TtsGetCurrentConfigIdResultData | TtsSetCurrentConfigIdResultData | ThemeListConfigsResultData | ThemeApplyConfigResultData | IntResultData | BinaryResultData | FilePartContentData | DirectoryListingData | FileContentData | BinaryFileContentData | FileExistsData | FileInfoData | FileOperationData | FileApplyResultData | StorageRequestResultData | WebSocketResultData | HttpResponseData | HttpStreamEventData | SystemSettingData | AppOperationData | AppListData | AppUsageTimeResultData | NotificationData | LocationData | DeviceInfoResultData | ChatServiceStartResultData | ChatCreationResultData | ChatListResultData | ChatFindResultData | AgentStatusResultData | ChatSwitchResultData | ChatTitleUpdateResultData | ChatDeleteResultData | MessageSendResultData | ChatSendMessageResultData | ChatObservationResultData | ChatPreparedDeliveryResultData | ChatScheduledMessagesResultData | ChatScheduleMessageResultData | ChatCancelScheduledMessageResultData | ChatCancelResultData | ChatReadExtensionResultData | ChatWriteExtensionResultData | ChatDeleteExtensionResultData | ChatCallResultData | ChatMessagesResultData | VisitWebResultData | TerminalInfoResultData | TerminalCommandResultData | TerminalStreamEventData | TerminalObservationResultData | HiddenTerminalCommandResultData | TerminalSessionCreationResultData | TerminalSessionCloseResultData | TerminalSessionScreenResultData | MusicPlaybackResultData | BluetoothStateData | BluetoothBondedDevicesData | BluetoothScanResultData | BluetoothSessionData | BluetoothTransferData | BluetoothReadData | BluetoothBleServicesData | BluetoothBleNotificationData | CatalogReadToolSourcesResultData | MediaRegistrationResultData | FindFilesResultData | GrepResultData;
 
 /**
  * Captures the UI node and Android surface reached when an automation run finishes.
@@ -855,6 +855,14 @@ export interface ChatFindResultData {
  */
 export interface AgentStatusResultData {
   /**
+   * Title of the current execution, when the chat has started real work.
+   */
+  taskTitle?: string;
+  /**
+   * Actual model response rounds in this execution; zero before the first response.
+   */
+  currentRound: number;
+  /**
    * Target chat id
    */
   chatId: string;
@@ -1044,6 +1052,51 @@ export interface ChatCancelResultData {
 }
 
 /**
+ * Reports durable immediate assistant message delivery and optional notification failure.
+ */
+export interface ChatPreparedDeliveryResultData {
+  chatId: string;
+  timestamp: number;
+  duplicate: boolean;
+  notificationError: string | null;
+  toString(): string;
+}
+
+/**
+ * Contains the platform-independent outcome of one plugin-owned scheduled message.
+ */
+export interface ChatScheduledMessage {
+  id: string;
+  chatId: string;
+  timestamp: number;
+  /**
+   * preparing, scheduled, delivered, cancelled, invalidated, skipped, or failed.
+   */
+  status: string;
+  error: string | null;
+  /**
+   * Contains the accepted prepared body, including host-generated replies.
+   */
+  text: string;
+}
+
+export interface ChatScheduleMessageResultData {
+  message: ChatScheduledMessage;
+  toString(): string;
+}
+
+export interface ChatScheduledMessagesResultData {
+  messages: ChatScheduledMessage[];
+  toString(): string;
+}
+
+export interface ChatCancelScheduledMessageResultData {
+  id: string;
+  cancelled: boolean;
+  toString(): string;
+}
+
+/**
  * Returns an owner-scoped Chat extension or its explicit absence.
  */
 export interface ChatReadExtensionResultData {
@@ -1170,6 +1223,14 @@ export interface ChatMessagesResultData {
  */
 export interface TerminalInfoResultData {
   /**
+   * ID of the user-selected default profile on the executing Core device.
+   */
+  defaultProfileId: string;
+  /**
+   * Saved configurations, including multiple instances of one interpreter or distribution.
+   */
+  profiles: TerminalProfileInfoData[];
+  /**
    * Current runtime platform, such as windows, linux, or android
    */
   platform: string;
@@ -1189,6 +1250,17 @@ export interface TerminalInfoResultData {
    * Formats the primary terminal identity and availability of each known terminal implementation.
    */
   toString(): string;
+}
+
+/**
+ * Describes a selectable profile without exposing device-local executable or rootfs paths.
+ */
+export interface TerminalProfileInfoData {
+  id: string;
+  name: string;
+  terminal: TerminalImplementation;
+  terminalType: TerminalType;
+  available: boolean;
 }
 
 /**

@@ -2,6 +2,7 @@
 
 pub mod AtomicCounter;
 pub mod FileSystemResource;
+pub mod HostFileSystemRoots;
 pub use FileSystemResource::{FileSource, FileTarget};
 pub mod RuntimeStorageLayout;
 pub mod PluginStorage;
@@ -9,6 +10,11 @@ pub mod HttpServer;
 pub mod PluginSdkIpc;
 pub mod Tcp;
 pub mod TerminalWorkingDirectory;
+pub mod TerminalCommand;
+pub mod TerminalText;
+pub mod TerminalControl;
+pub mod TerminalProfiles;
+pub use TerminalProfiles::{TerminalDistribution, TerminalInstallProgress, TerminalInstallProgressCallback, TerminalProfile, TerminalProfileSettings, TerminalProfileSupport};
 pub mod TimeUtils;
 pub mod JavaScriptExecutionInterrupt;
 pub use JavaScriptExecutionInterrupt::{
@@ -1298,12 +1304,16 @@ impl ComposeDslFilePickerRequest {
     }
 }
 
-/// A UTF-8 export saved to a destination selected by the host user.
+/// A text or binary export saved to a destination selected by the host user.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ComposeDslFileSaveOptions {
     pub suggestedName: String,
-    pub content: String,
+    /// Exactly one content representation must be present, including for empty files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contentBase64: Option<String>,
     pub mimeType: String,
     pub extensions: Vec<String>,
 }
@@ -1324,6 +1334,9 @@ impl ComposeDslFileSaveRequest {
             .map_err(|error| HostError::new(format!("Compose DSL file save request decode failed: {error}")))?;
         if request.executionContextKey.trim().is_empty() {
             return Err(HostError::new("Compose DSL file save executionContextKey is required"));
+        }
+        if request.options.content.is_some() == request.options.contentBase64.is_some() {
+            return Err(HostError::new("Compose DSL file save requires exactly one of content or contentBase64"));
         }
         let name = &request.options.suggestedName;
         if name.trim().is_empty() || name.chars().any(|value| matches!(value, '/' | '\\' | '\0')) {
@@ -1861,6 +1874,8 @@ pub struct TerminalTypeInfo {
     pub terminalType: String,
     pub available: bool,
     pub description: String,
+    /// Stable localization identity, independent of the fallback description text.
+    pub nameKey: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1876,7 +1891,60 @@ pub type TerminalOutputCallback = Box<dyn FnMut(&[u8], bool) -> HostResult<()> +
 /// Receives the original command receipt after its host execution finishes.
 pub type TerminalCompletionCallback = Box<dyn FnOnce(HostResult<TerminalCommandOutput>) + Send>;
 
+/// Whether a host-created session belongs to one managed session name, including
+/// the numbered generations used when a previous command is still running.
+pub fn terminalSessionNameMatches(actual: &str, expected: &str) -> bool {
+    if expected.is_empty() || expected.trim() != expected { return false; }
+    if actual == expected { return true; }
+    actual.strip_prefix(expected).and_then(|suffix| suffix.strip_prefix("_generation_"))
+        .is_some_and(|number| !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// Builds the canonical key used by native terminal session registries.
+#[allow(non_snake_case)]
+pub fn terminalSessionKey(terminalType: &str, name: &str) -> String {
+    format!("{terminalType}:{name}")
+}
+
 pub trait TerminalHost: Send + Sync {
+    /// Lists archives executable by this host; an empty catalog means installation is unsupported.
+    fn terminalDistributions(&self) -> HostResult<Vec<TerminalDistribution>> {
+        Ok(Vec::new())
+    }
+    /// Downloads and installs a new independent rootfs instance without replacing existing instances.
+    fn installTerminalDistribution(
+        &self, _distributionId: &str, _instanceId: &str, _name: &str,
+        _control: HttpDownloadControl, _progress: TerminalInstallProgressCallback,
+    ) -> HostResult<TerminalProfile> {
+        Err(HostError::new("This host does not support downloadable terminal distributions"))
+    }
+    /// Removes a newly installed instance when registering it in durable settings fails.
+    fn discardTerminalDistribution(&self, _instanceId: &str) -> HostResult<()> {
+        Err(HostError::new("This host does not support terminal installation rollback"))
+    }
+    /// Creates a session in an exact saved profile, preserving interpreter identities in results.
+    fn createOrGetProfileSession(&self, _name: &str, _profileId: &str) -> HostResult<TerminalSessionInfo> {
+        Err(HostError::new("Terminal profile registry is not installed"))
+    }
+
+    /// Declares editable fields for each implementation without probing or starting processes.
+    fn terminalProfileSupport(&self) -> HostResult<Vec<TerminalProfileSupport>> {
+        Ok(self.terminalInfo()?.types.into_iter().map(|entry| TerminalProfileSupport {
+            terminal: entry.terminal, terminalType: entry.terminalType, fields: Vec::new(),
+        }).collect())
+    }
+    /// Creates an isolated host with immutable launch options for new sessions.
+    fn configuredTerminal(&self, _profile: &TerminalProfile) -> HostResult<Arc<dyn TerminalHost>> {
+        Err(HostError::new("This terminal implementation does not support custom launch options"))
+    }
+    /// Reads profiles from the device-local terminal registry installed during app assembly.
+    fn terminalProfileSettings(&self) -> HostResult<TerminalProfileSettings> {
+        Err(HostError::new("Terminal profile registry is not installed"))
+    }
+    /// Saves a validated configuration while retaining ownership of existing sessions.
+    fn saveTerminalProfileSettings(&self, _settings: TerminalProfileSettings) -> HostResult<()> {
+        Err(HostError::new("Terminal profile registry is not installed"))
+    }
     /// Converts a host filesystem locator to a directory usable by this terminal.
     /// Resource backends require explicit platform support; opaque locators must never reach a shell.
     fn resolveNativeWorkingDirectory(&self, path: &str) -> HostResult<String> {
@@ -1913,6 +1981,16 @@ pub trait TerminalHost: Send + Sync {
     fn listSessions(&self) -> HostResult<Vec<TerminalSessionListEntry>>;
     /// Creates or reuses a named session in the host's configured default terminal.
     fn createOrGetSession(&self, sessionName: &str) -> HostResult<TerminalSessionInfo>;
+    /// Creates a session in the exact implementation, including hosts sharing one interpreter type.
+    fn createOrGetTerminalSession(&self, sessionName: &str, terminal: &str, terminalType: &str) -> HostResult<TerminalSessionInfo> {
+        let info = self.terminalInfo()?;
+        let entry = info.types.iter().find(|entry| entry.terminalType == terminalType)
+            .ok_or_else(|| HostError::new("Terminal interpreter is not registered"))?;
+        if entry.terminal != terminal {
+            return Err(HostError::new("Explicit terminal implementation selection is unsupported"));
+        }
+        self.createOrGetTypedSession(sessionName, terminalType)
+    }
     /// Creates or reuses a named session of exactly the requested interpreter type.
     fn createOrGetTypedSession(
         &self,
@@ -1926,8 +2004,8 @@ pub trait TerminalHost: Send + Sync {
         timeoutMs: u64,
     ) -> HostResult<TerminalCommandOutput>;
     /// Executes in the same session while forwarding raw PTY bytes before completion.
-    /// Empty frames allow cancellation checks during quiet commands. A callback error
-    /// interrupts the command and leaves the session available for subsequent work.
+    /// Output and close events wake the command observer. A callback error interrupts
+    /// the command and waits for shell readiness before releasing the session.
     /// A zero timeout disables the execution deadline; callers may stop waiting independently.
     fn executeInSessionStreaming(
         &self,
@@ -1938,23 +2016,36 @@ pub trait TerminalHost: Send + Sync {
     ) -> HostResult<TerminalCommandOutput> {
         Err(HostError::new("Terminal output streaming is not supported by this host"))
     }
-    /// Schedules native PTY work independently of the caller's foreground wait.
-    /// Event-loop hosts override this operation to poll without blocking their runtime worker.
+    /// Submits one command and returns its nonblocking observation state.
+    fn beginInSessionStreaming(
+        self: Arc<Self>,
+        _sessionId: String,
+        _command: String,
+        _timeoutMs: u64,
+    ) -> HostResult<Box<dyn TerminalCommand::TerminalCommandExecution>> {
+        Err(HostError::new("Cooperative terminal command execution is not supported by this host"))
+    }
+    /// Keeps finite submission and cleanup on blocking workers and observes output cooperatively.
     fn scheduleInSessionStreaming(
         self: Arc<Self>,
         scheduler: Arc<dyn HostRuntimeTaskSchedulerHost>,
         sessionId: String,
         command: String,
         timeoutMs: u64,
-        mut onOutput: TerminalOutputCallback,
+        onOutput: TerminalOutputCallback,
         onComplete: TerminalCompletionCallback,
     ) -> HostResult<()> where Self: 'static {
-        scheduler.scheduleHostRuntimeTask("terminal-command-stream", Box::new(move || {
-            let result = self.executeInSessionStreaming(
-                &sessionId, &command, timeoutMs, &mut |data| onOutput(data, false),
-            ).and_then(|receipt| { onOutput(&[], true)?; Ok(receipt) });
+        let commandScheduler = scheduler.clone();
+        scheduler.scheduleHostRuntimeCooperativeAsyncTask("terminal-command-stream", Box::new(move || Box::pin(async move {
+            let result = TerminalCommand::runTerminalBlocking(commandScheduler.clone(), "terminal-command-start", move || {
+                self.beginInSessionStreaming(sessionId, command, timeoutMs)
+            }).await;
+            let result = match result {
+                Ok(execution) => TerminalCommand::observeTerminalCommand(execution, commandScheduler, onOutput).await,
+                Err(error) => Err(error),
+            };
             onComplete(result);
-        }))
+        })))
     }
     fn executeHiddenCommand(
         &self,
@@ -1969,6 +2060,11 @@ pub trait TerminalHost: Send + Sync {
         control: Option<&str>,
     ) -> HostResult<TerminalInputOutput>;
     fn closeSession(&self, sessionId: &str) -> HostResult<TerminalCloseOutput>;
+    /// Close only an idle session belonging to the named session family. Hosts
+    /// without an atomic implementation must fail closed rather than emulate it.
+    fn closeSessionIfIdle(&self, _sessionId: &str, _sessionName: &str) -> HostResult<TerminalCloseOutput> {
+        Err(HostError::new("Atomic idle terminal close is not supported by this host"))
+    }
     fn getSessionScreen(&self, sessionId: &str) -> HostResult<TerminalScreenOutput>;
 }
 
@@ -2360,7 +2456,7 @@ pub type HostRuntimeTask = Box<dyn FnOnce() + Send + 'static>;
 pub type HostRuntimeAsyncTask =
     Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = ()> + 'static>> + Send + 'static>;
 
-/// Represents one host-owned asynchronous runtime turn boundary that may cross runtime schedulers.
+/// Represents one platform-owned asynchronous delay that may cross runtime schedulers.
 pub type HostRuntimeTurnFuture = Pin<Box<dyn Future<Output = HostResult<()>> + Send + 'static>>;
 
 /// Submits an owned JSON-compatible request. The request id refers to a Promise
@@ -2407,8 +2503,31 @@ pub type HostJavaScriptCallback =
 /// Returns one binary payload with small structured metadata, without Base64 or byte arrays in JSON.
 pub type HostJavaScriptBinaryCallback = Arc<dyn Fn(Vec<Value>) -> HostResult<(Value, Vec<u8>)> + Send + Sync + 'static>;
 
+/// Describes a realm operation that can execute untrusted code or Promise continuations.
+pub enum HostJavaScriptCommand<'a> {
+    Evaluate(&'a str, &'a str),
+    Call(&'a str, &'a [Value]),
+    Jobs,
+    Settle(u64, Value, bool),
+    Cancel(&'a str),
+}
+
 /// Owns one concrete JavaScript runtime created by the active platform host.
 pub trait HostJavaScriptRuntime {
+    /// Suspends the caller while its affine realm executes code and services host callbacks.
+    fn executeHostJavaScriptCommand<'a>(&'a mut self, command: HostJavaScriptCommand<'a>)
+        -> Pin<Box<dyn Future<Output = HostResult<Value>> + 'a>> {
+        Box::pin(async move {
+            match command {
+                HostJavaScriptCommand::Evaluate(name, source) => self.evaluateHostJavaScriptVoid(name, source).map(|()| Value::Null),
+                HostJavaScriptCommand::Call(name, arguments) => self.callHostJavaScriptFunction(name, arguments),
+                HostJavaScriptCommand::Jobs => self.executePendingHostJavaScriptJobs().map(|()| Value::Null),
+                HostJavaScriptCommand::Settle(id, value, reject) => self.settleHostJavaScriptPromise(id, value, reject).map(|()| Value::Null),
+                HostJavaScriptCommand::Cancel(scope) => self.cancelHostJavaScriptPromises(scope).map(|()| Value::Null),
+            }
+        })
+    }
+
     /// Installs a synchronous binary resource reader returning { metadata, bytes: Uint8Array }.
     fn registerHostJavaScriptBinaryFunction(&mut self, _name: &str, _callback: HostJavaScriptBinaryCallback) -> HostResult<()> {
         Err(HostError::new("JavaScript binary resource bindings are unavailable"))
@@ -2547,12 +2666,12 @@ pub trait HostJavaScriptRuntimeHost: Send + Sync {
         task: HostJavaScriptRuntimeStateTask,
     ) -> HostResult<HostJavaScriptRuntimeStateOutput>;
 
-    /// Enqueues one synchronous continuation directly on its owner without waiting for completion.
+    /// Enqueues one asynchronous continuation directly on its owner without waiting for completion.
     fn enqueueHostJavaScriptRuntimeStateTask(
         &self,
         handle: HostJavaScriptRuntimeStateHandle,
         interrupt: HostJavaScriptExecutionInterrupt,
-        task: HostJavaScriptRuntimeStateTask,
+        task: HostJavaScriptRuntimeStateAsyncTask,
     ) -> HostResult<()>;
 
     /// Executes one asynchronous operation against an affine JavaScript runtime state.
@@ -2617,9 +2736,6 @@ pub trait HostRuntimeTaskSchedulerHost: Send + Sync {
         delayMs: u64,
         task: HostRuntimeTask,
     ) -> HostResult<()>;
-
-    /// Waits until the platform runtime can continue work on a later event-loop turn.
-    fn waitForHostRuntimeTaskTurn(&self) -> HostRuntimeTurnFuture;
 
     /// Waits for a platform-owned delay without using a shared runtime timer.
     fn waitForHostRuntimeDelay(&self, delayMs: u64) -> HostRuntimeTurnFuture;
@@ -3310,13 +3426,22 @@ where
 }
 
 /// Owns application-independent floating surfaces requested by authenticated plugins.
+#[async_trait(?Send)]
 pub trait FloatingWindowHost: Send + Sync {
-    fn command(&self, request: Value) -> HostResult<Value>;
+    /// Awaits the application owner's response without blocking its event loop.
+    async fn command(&self, request: Value) -> HostResult<Value>;
 }
 
-impl<F> FloatingWindowHost for F
-where F: Fn(Value) -> HostResult<Value> + Send + Sync {
-    fn command(&self, request: Value) -> HostResult<Value> { self(request) }
+#[async_trait(?Send)]
+impl<F, Output> FloatingWindowHost for F
+where
+    F: Fn(Value) -> Output + Send + Sync,
+    Output: Future<Output = HostResult<Value>>,
+{
+    /// Forwards the command to an asynchronous host adapter.
+    async fn command(&self, request: Value) -> HostResult<Value> {
+        self(request).await
+    }
 }
 
 /// Identifies the native package that can update this running application.
@@ -3375,12 +3500,15 @@ pub enum ApplicationUpdateTransform {
 
 pub trait SystemOperationHost: Send + Sync {
     /// Transcodes a package into a disposable VFS target without installing or executing it.
+    /// Reports completed and total work bytes synchronously; zero total means unknown work.
+    /// Hosts may report completed independent compression units rather than encoder-internal progress.
     fn transformApplicationUpdate(
         &self,
         _source: &dyn FileSource,
         _target: &dyn FileTarget,
         _transform: ApplicationUpdateTransform,
         _control: &HttpDownloadControl,
+        _onProgress: &(dyn Fn(u64, u64) + Send + Sync),
     ) -> HostResult<()> {
         Err(HostError::new("Installer transformation is not supported by this host"))
     }
@@ -3671,6 +3799,58 @@ mod tests {
                 "{}",
                 case["name"]
             );
+        }
+    }
+
+    /// Covers the strict Rust boundary used by AIToolHandler before Flutter sees any export.
+    #[test]
+    fn composeDslFileSavePreservesTextAndBinaryOwnerPayloads() {
+        for content in [
+            serde_json::json!({"content": "混音🌍\n"}),
+            serde_json::json!({"content": ""}),
+            serde_json::json!({"contentBase64": "UklGRgD/gA0K"}),
+            serde_json::json!({"contentBase64": ""}),
+        ] {
+            let mut options = serde_json::json!({
+                "suggestedName": "mix.wav", "mimeType": "audio/wav", "extensions": ["wav"]
+            });
+            options.as_object_mut().unwrap().extend(content.as_object().unwrap().clone());
+            let payload = serde_json::json!({
+                "routeInstanceId": "music-studio", "executionContextKey": "music-owner", "options": options
+            });
+            let request = ComposeDslFileSaveRequest::fromValue(payload.clone()).expect("valid export must reach owner");
+            assert_eq!(serde_json::to_value(request).unwrap(), payload, "owner transport must preserve exact content representation");
+        }
+    }
+
+    #[test]
+    fn composeDslFileSaveRejectsInvalidRepresentationsAndPaths() {
+        let base = serde_json::json!({
+            "routeInstanceId": "music-studio", "executionContextKey": "music-owner",
+            "options": {"suggestedName": "mix.wav", "mimeType": "audio/wav", "extensions": ["wav"]}
+        });
+        for content in [
+            serde_json::json!({}),
+            serde_json::json!({"content": "", "contentBase64": ""}),
+            serde_json::json!({"content": 42}),
+            serde_json::json!({"contentBase64": 42}),
+            serde_json::json!({"contentBase64": null}),
+            serde_json::json!({"content": "", "outputPath": "/unselected/mix.wav"}),
+        ] {
+            let mut payload = base.clone();
+            payload["options"].as_object_mut().unwrap().extend(content.as_object().unwrap().clone());
+            assert!(ComposeDslFileSaveRequest::fromValue(payload).is_err());
+        }
+        for (key, value) in [
+            ("suggestedName", serde_json::json!("../mix.wav")),
+            ("suggestedName", serde_json::json!("")),
+            ("mimeType", serde_json::json!("")),
+            ("extensions", serde_json::json!(["../wav"])),
+        ] {
+            let mut payload = base.clone();
+            payload["options"]["contentBase64"] = serde_json::json!("");
+            payload["options"][key] = value;
+            assert!(ComposeDslFileSaveRequest::fromValue(payload).is_err());
         }
     }
 

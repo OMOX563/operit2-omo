@@ -81,6 +81,8 @@ pub struct SdkPackageToolParameter {
 pub struct SdkToolPackage {
     #[serde(rename = "name")]
     pub name: String,
+    #[serde(rename = "api_version")]
+    pub api_version: String,
     #[serde(rename = "description")]
     pub description: SdkLocalizedText,
     #[serde(rename = "tools")]
@@ -336,6 +338,8 @@ pub struct SdkToolPkgContainerRuntime {
     pub publicApis: Vec<SdkToolPkgRegisteredFunctionHook>,
     #[serde(rename = "requires")]
     pub requires: Vec<SdkToolPkgManifestRequirement>,
+    #[serde(rename = "optional_requires")]
+    pub optionalRequires: Vec<SdkToolPkgManifestRequirement>,
     #[serde(rename = "dependencyIssues")]
     pub dependencyIssues: Vec<SdkToolPkgDependencyIssue>,
     #[serde(rename = "manifestExtensions")]
@@ -402,6 +406,8 @@ pub struct SdkToolPkgContainerRuntime {
     pub hostEventHooks: Vec<SdkToolPkgHostEventHookRuntime>,
     #[serde(rename = "toolLifecycleHooks")]
     pub toolLifecycleHooks: Vec<SdkToolPkgFunctionHookRuntime>,
+    #[serde(rename = "toolPermissionHooks")]
+    pub toolPermissionHooks: Vec<SdkToolPkgFunctionHookRuntime>,
     #[serde(rename = "promptInputHooks")]
     pub promptInputHooks: Vec<SdkToolPkgFunctionHookRuntime>,
     #[serde(rename = "promptHistoryHooks")]

@@ -38,6 +38,9 @@ class WorkspaceTabContent extends StatelessWidget {
     this.fileClipboard,
     required this.onListWorkspaceBindingDirectories,
     required this.onReadWorkspaceTextFile,
+    this.onChooseFileOpener,
+    this.onFileQuote,
+    this.onFileDirty,
     required this.onReadWorkspaceFileBytes,
     required this.onWriteWorkspaceFileBytes,
     required this.onOpenWorkspaceFile,
@@ -46,6 +49,7 @@ class WorkspaceTabContent extends StatelessWidget {
     required this.onAddFolder,
     required this.filesListingRevision,
     required this.onOpenTerminal,
+    this.onChooseTerminal,
     required this.onOpenTerminalSessions,
     required this.onOpenBrowserSessions,
     required this.onOpenBrowser,
@@ -78,6 +82,9 @@ class WorkspaceTabContent extends StatelessWidget {
   final Future<List<WorkspaceFileEntry>> Function(String path)
   onListWorkspaceBindingDirectories;
   final Future<String> Function(String path) onReadWorkspaceTextFile;
+  final VoidCallback? onChooseFileOpener;
+  final ValueChanged<String>? onFileQuote;
+  final ValueChanged<bool>? onFileDirty;
   final Future<Uint8List> Function(String path) onReadWorkspaceFileBytes;
   final Future<void> Function(String path, Uint8List bytes)
   onWriteWorkspaceFileBytes;
@@ -87,6 +94,7 @@ class WorkspaceTabContent extends StatelessWidget {
   final VoidCallback onAddFolder;
   final int filesListingRevision;
   final VoidCallback onOpenTerminal;
+  final VoidCallback? onChooseTerminal;
   final VoidCallback onOpenTerminalSessions;
   final VoidCallback onOpenBrowserSessions;
   final void Function({
@@ -128,6 +136,7 @@ class WorkspaceTabContent extends StatelessWidget {
           onChooseExistingWorkspace: onChooseExistingWorkspace,
           onUnbindWorkspace: onUnbindWorkspace,
           onOpenTerminal: onOpenTerminal,
+          onChooseTerminal: onChooseTerminal,
           onOpenTerminalSessions: onOpenTerminalSessions,
           onOpenBrowserSessions: onOpenBrowserSessions,
           onOpenBrowser: () => onOpenBrowser(),
@@ -152,7 +161,16 @@ class WorkspaceTabContent extends StatelessWidget {
           },
         );
       case WorkspaceTabKind.files:
-        final rootPath = fileDirectory?.trim() ?? workspacePath?.trim();
+        final initialRelativePath = tab.filePath?.trim() ?? '';
+        final folder = workspaceUsage.mountedFolders
+            .where(
+              (folder) =>
+                  folder.relativePath == initialRelativePath ||
+                  initialRelativePath.startsWith('${folder.relativePath}/'),
+            )
+            .firstOrNull;
+        final rootPath = (folder?.path ?? fileDirectory ?? workspacePath)
+            ?.trim();
         if (rootPath == null || rootPath.isEmpty) {
           return _WorkspaceSimplePane(
             icon: Icons.folder_off_outlined,
@@ -160,11 +178,11 @@ class WorkspaceTabContent extends StatelessWidget {
             subtitle: l10n.noWorkspaceBound,
           );
         }
-        final initialRelativePath = tab.filePath?.trim() ?? '';
         return WorkspaceFileBrowserContent(
           key: ValueKey<String>('$filesListingRevision:${tab.filePath ?? ''}'),
           rootLabel: rootPath,
           rootRelativePath: initialRelativePath,
+          rootLabelRelativePath: folder?.relativePath ?? '',
           onListWorkspaceFiles: onListWorkspaceFiles,
           onMutateWorkspaceFile: onMutateWorkspaceFile,
           fileClipboard: fileClipboard,
@@ -216,6 +234,35 @@ class WorkspaceTabContent extends StatelessWidget {
           onFinished: (response) => onFinishWebVisit(tab, response),
         );
       case WorkspaceTabKind.filePreview:
+        if (tab.pluginPresentation case final presentation?) {
+          return PluginWorkspacePageHost(
+            key: ValueKey(presentation.identity),
+            presentation: presentation,
+            workspacePath: workspacePath,
+            unavailable: Center(
+              child: TextButton(
+                onPressed: onChooseFileOpener,
+                child: Text(AppLocalizations.of(context)!.workspaceOpenWith),
+              ),
+            ),
+            onActionResult: (result) {
+              if (result case {
+                'workspaceFileAction': 'quote',
+                'text': final String text,
+              }) {
+                if (text.trim().isNotEmpty && text.length <= 12000) {
+                  onFileQuote?.call(text);
+                }
+              }
+              if (result case {
+                'workspaceFileAction': 'dirty',
+                'dirty': final bool dirty,
+              }) {
+                onFileDirty?.call(dirty);
+              }
+            },
+          );
+        }
         return WorkspaceFilePreviewContent(
           tab: tab,
           onReadWorkspaceFileBytes: onReadWorkspaceFileBytes,

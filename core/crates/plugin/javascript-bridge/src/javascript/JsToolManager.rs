@@ -153,31 +153,13 @@ impl JsToolManager {
             );
         }
 
-        for key in [
-            "__operit_package_caller_name",
-            "__operit_package_chat_id",
-            "__operit_package_caller_participant_id",
-            "__operit_package_caller_owner",
-        ] {
-            let value = runtimeParams
-                .get(key)
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(str::to_string);
-            match value {
-                Some(value) => {
-                    runtimeParams.insert(key.to_string(), Value::String(value));
-                }
-                None => {
-                    runtimeParams.remove(key);
-                }
-            }
-        }
-
         runtimeParams.insert(
             "__operit_package_name".to_string(),
             Value::String(packageName.to_string()),
+        );
+        runtimeParams.insert(
+            "__operit_package_api_version".to_string(),
+            Value::String(selection.api_version.clone()),
         );
         runtimeParams.insert(
             "__operit_toolpkg_runtime_kind".to_string(),
@@ -253,16 +235,6 @@ impl JsToolManager {
                 .find(|item| item.name == *parameterName)
             {
                 Some(parameter) => parameter.parameter_type.as_str(),
-                None if matches!(
-                    parameterName.as_str(),
-                    "__operit_package_caller_name"
-                        | "__operit_package_chat_id"
-                        | "__operit_package_caller_participant_id"
-                        | "__operit_package_caller_owner"
-                ) =>
-                {
-                    "string"
-                }
                 None => {
                     return Err(ToolParameterConversionException {
                         message: format!(
@@ -387,6 +359,14 @@ impl JsToolManager {
         &self,
         request: &JsPackageToolCallRequest,
     ) -> JsPackageToolCallResult {
+        self.executeScriptWithOutput(request, None).await
+    }
+
+    /// Keeps the intermediate sink attached until the actual package function completes.
+    async fn executeScriptWithOutput(
+        &self, request: &JsPackageToolCallRequest,
+        onIntermediateResult: Option<Arc<dyn Fn(String) + Send + Sync>>,
+    ) -> JsPackageToolCallResult {
         let Some((packageName, functionName)) = Self::parsePackageToolName(&request.tool_name)
         else {
             return Self::failure(
@@ -406,8 +386,8 @@ impl JsToolManager {
 
         let result = self
             .withExecutionEngineForPackage(selection.toolpkg_runtime.as_ref(), |engine| {
-                engine.execute_script_function_owned(
-                    selection.definition.script, functionName, runtimeParams, BTreeMap::new(),
+                engine.execute_script_function_owned_with_output(
+                    selection.definition.script, functionName, runtimeParams, BTreeMap::new(), onIntermediateResult,
                 )
             })
             .await;
@@ -427,13 +407,14 @@ impl JsToolManager {
 
 impl JsPackageExecutor for JsToolManager {
     /// Executes one package tool through this manager's bound runtime context.
-    fn execute_package_tool(
+    fn execute_package_tool_streaming(
         &self,
         request: &JsPackageToolCallRequest,
+        on_intermediate_result: Option<Arc<dyn Fn(String) + Send + Sync>>,
     ) -> JsExecutionCompletion<JsPackageToolCallResult> {
         let manager = self.clone();
         let request = request.clone();
-        Box::pin(async move { manager.executeScript(&request).await })
+        Box::pin(async move { manager.executeScriptWithOutput(&request, on_intermediate_result).await })
     }
 }
 
@@ -629,8 +610,8 @@ mod tests {
         }
 
         /// Rejects package import in manager tests.
-        fn import_package(&self, _package_name: &str) -> Result<String, String> {
-            Err("Package import is not part of this test".to_string())
+        fn import_package(&self, _package_name: &str) -> operit_plugin_sdk::javascript::JsExecutionFuture<Result<String, String>> {
+            Box::pin(async { Err("Package import is not part of this test".to_string()) })
         }
 
         /// Rejects package removal in manager tests.
@@ -666,10 +647,6 @@ mod tests {
             Ok(())
         }
 
-        /// Completes one JavaScript runtime turn immediately in manager tests.
-        fn wait_for_javascript_runtime_turn(&self) -> operit_host_api::HostRuntimeTurnFuture {
-            Box::pin(async { Ok(()) })
-        }
     }
 
     #[derive(Clone, Copy)]
@@ -679,6 +656,8 @@ mod tests {
         /// Creates a generic isolated JavaScript engine for manager tests.
         #[allow(non_snake_case)]
         fn createExecutionEngine(&self) -> Result<Arc<dyn JsExecutionEngine>, String> {
+            operit_host_api::HostManager::setDefaultHostJavaScriptRuntimeHost(Arc::new(operit_host_native_scheduler::NativeHostJavaScriptRuntimeHost::new()));
+            operit_host_api::HostManager::setDefaultHostRuntimeTaskSchedulerHost(Arc::new(operit_host_native_scheduler::NativeHostRuntimeTaskSchedulerHost::new()));
             JsEngine::new(Arc::new(TestJsExecutionHost)).map(|engine| Arc::new(engine) as Arc<dyn JsExecutionEngine>).map_err(|error| error.to_string())
         }
 
@@ -1171,7 +1150,7 @@ mod tests {
     }
   ]
 }
-*/"use strict";exports.inspect=function(t){return"protected-flow:"+t.text+"|"+t.__operit_toolpkg_subpackage_id+"|"+t.__operit_script_screen};"#;
+*/"use strict";exports.inspect=function(t){return"protected-flow:"+t.text+"|"+Object.keys(t).sort().join(",")};"#;
         let asset_payload = b"asset-secret-value";
 
         let mut source_bytes = Vec::new();
@@ -1227,7 +1206,7 @@ mod tests {
     }
 
     /// Loads a downloaded ToolPkg through the standard external-file path.
-    fn load_downloaded_toolpkg(downloaded_bytes: Vec<u8>) -> ToolPkgLoadResult {
+    async fn load_downloaded_toolpkg(downloaded_bytes: Vec<u8>) -> ToolPkgLoadResult {
         let source_path = "/marketplace/downloaded/market_flow_toolpkg.toolpkg";
         let host = DownloadedToolPkgFileSystemHost::new(source_path, downloaded_bytes);
         let filesystem = test_filesystem(Arc::new(host));
@@ -1245,7 +1224,7 @@ mod tests {
                     .push(format!("{package_name}: {error}"));
             },
         )
-        .expect("installed market ToolPkg should load");
+        .await.expect("installed market ToolPkg should load");
         let load_errors = load_errors.lock().expect("load error mutex poisoned");
         assert!(
             load_errors.is_empty(),
@@ -1332,6 +1311,7 @@ mod tests {
                 .package(package_name)
                 .ok_or_else(|| format!("Package not registered: {package_name}"))?;
             Ok(JsPackageToolSelection {
+                api_version: package.api_version.clone(),
                 definition: operit_plugin_sdk::javascript::select_registered_package_tool(
                     package,
                     function_name,
@@ -1470,7 +1450,7 @@ mod tests {
         ));
         assert_eq!(asset_bytes, b"asset-secret-value");
 
-        let load_result = load_downloaded_toolpkg(downloaded_bytes);
+        let load_result = load_downloaded_toolpkg(downloaded_bytes).await;
         assert_eq!(
             load_result.containerRuntime.sourceType,
             ToolPkgSourceType::EXTERNAL
@@ -1505,13 +1485,15 @@ mod tests {
 
         assert_eq!(
             output,
-            "\"protected-flow:downloaded|market_flow_sub|dist/sub.js\""
+            "\"protected-flow:downloaded|text\""
         );
     }
 
     #[tokio::test(flavor = "current_thread")]
     /// Verifies a minified standalone script downloads and executes without encryption.
     async fn minified_standalone_download_executes_registered_tool() {
+        operit_host_api::HostManager::setDefaultHostJavaScriptRuntimeHost(Arc::new(operit_host_native_scheduler::NativeHostJavaScriptRuntimeHost::new()));
+        operit_host_api::HostManager::setDefaultHostRuntimeTaskSchedulerHost(Arc::new(operit_host_native_scheduler::NativeHostRuntimeTaskSchedulerHost::new()));
         register_test_runtime_storage("js-tool-manager-standalone-marketplace-flow");
         let upload_source_bytes = build_standalone_js_bytes();
         assert!(contains_bytes(
@@ -1549,18 +1531,38 @@ mod tests {
         assert_eq!(output, "\"standalone-protected:downloaded\"");
     }
 
+    /// Reuses one engine across contracts and checks actual SDK adapter dispatch for both call routes.
     #[tokio::test(flavor = "current_thread")]
-    async fn subpackage_runtime_params_match_toolpkg_context() {
+    async fn standalone_package_api_versions_select_compatibility_on_pooled_engines() {
+        register_test_runtime_storage("standalone-package-api-versions");
+        let runtime = TestPackageRuntime::new_with_package(ToolPackage::default());
+        let manager = JsToolManager::new(runtime.clone(), Arc::new(TestExecutionEngineFactory));
+        for (declaration, expected) in [("", "1.0.0"), (r#", api_version: "2.0.0""#, "2.0.0"), (r#", api_version: "1.0.1""#, "1.0.1"), ("", "1.0.0")] {
+            // HJSON packages can hold scripts without an embedded METADATA block.
+            let package = JsPackageLoader::parse_metadata(
+                &format!("{{name: versions{declaration}, tools: [{{name: inspect}}]}}"),
+                "exports.inspect = async function() { await Promise.resolve(); return {version: __operitToolPkgApi.currentVersion(), ffmpeg: typeof Tools.FFmpeg}; };",
+            ).unwrap();
+            runtime.package_manager.lock().unwrap().registerPackage(package);
+            let output = manager.executeScriptByName("versions.inspect", BTreeMap::new()).await.unwrap().unwrap();
+            let value: Value = serde_json::from_str(&output).unwrap();
+            assert_eq!(value["version"], expected);
+            assert_eq!(value["ffmpeg"], if expected == "2.0.0" { "undefined" } else { "object" });
+            let result = manager.executeScript(&operit_plugin_sdk::javascript::JsPackageToolCallRequest {
+                tool_name: "versions:inspect".into(), parameters: BTreeMap::new(),
+            }).await;
+            assert!(result.success, "{:?}", result.error);
+            assert_eq!(serde_json::from_str::<Value>(&result.result).unwrap(), value);
+        }
+        manager.destroy();
+    }
+
+    /// Separates subpackage metadata before invoking the exported business tool.
+    #[tokio::test(flavor = "current_thread")]
+    async fn subpackage_runtime_context_is_detached_from_business_params() {
         let script = r#"
             exports.inspect = function(params) {
-                return [
-                    params.__operit_execution_context_key,
-                    params.__operit_toolpkg_subpackage_id,
-                    params.containerPackageName,
-                    params.toolPkgId,
-                    params.__operit_ui_package_name,
-                    params.__operit_script_screen
-                ].join('|');
+                return { params: params, language: getLang(), context: globalThis.__operitGetCallState(globalThis.__operitCurrentCallId).params.__operit_execution_context_key };
             };
         "#;
         let (manager, _) = toolpkg_manager(script);
@@ -1572,10 +1574,10 @@ mod tests {
             "subpackage runtime params execution",
         );
 
-        assert_eq!(
-            output,
-            "\"toolpkg_main:test_toolpkg|sub|test_toolpkg|test_toolpkg|test_toolpkg|dist/sub.js\""
-        );
+        let output: Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(output["params"], serde_json::json!({}));
+        assert_eq!(output["language"], "en");
+        assert_eq!(output["context"], "toolpkg_main:test_toolpkg");
     }
 
     #[tokio::test(flavor = "current_thread")]

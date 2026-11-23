@@ -1617,8 +1617,9 @@ impl ChatHistoryDelegate {
         Ok(true)
     }
 
-    /// Clears local projections of a committed deletion without invoking configuration owners again.
+    /// Clears a committed deletion and opens the latest remaining history when the active chat was deleted.
     pub(crate) fn clearDeletedChatState(&mut self, chatId: String) -> Result<(), String> {
+        let wasCurrentChat = self.currentChatIdFlow.value().as_ref() == Some(&chatId);
         if self.chatHistoryManager.currentChatIdFlow()
             .map_err(|error| error.to_string())?
             .as_ref() == Some(&chatId)
@@ -1626,7 +1627,7 @@ impl ChatHistoryDelegate {
             self.chatHistoryManager.clearCurrentChatId()
                 .map_err(|error| error.to_string())?;
         }
-        if self.currentChatIdFlow.value().as_ref() == Some(&chatId) {
+        if wasCurrentChat {
             self.currentChatIdFlow.set_value(None);
             self.clearCurrentChatHistoryInMemory();
         }
@@ -1635,6 +1636,13 @@ impl ChatHistoryDelegate {
         });
         self.clearChatFlow(&chatId);
         self.finishDestructiveHistoryMutation(chatId);
+        if wasCurrentChat {
+            if let Some(nextChatId) = self.chatHistoryManager.mostRecentChatId()
+                .map_err(|error| error.to_string())?
+            {
+                self.openChatHistory(nextChatId, true)?;
+            }
+        }
         Ok(())
     }
 
@@ -1886,11 +1894,18 @@ impl ChatHistoryDelegate {
             }
             None => (folderPath, None),
         };
-        let folderPath = VfsPath::normalizeWorkspaceBindingPath(&folderPath)?;
+        let (nodeId, path) = match operit_util::FileUtils::FileUtils::splitQualifiedVfsPath(&folderPath) {
+            Some((owner, path)) => (owner.to_owned(), VfsPath::normalizeVfsPath(path)?),
+            None => (
+                operit_store::CoreNodeIdentityStore::CoreNodeIdentityStore::native().initialize()?.nodeId,
+                VfsPath::normalizeWorkspaceBindingPath(&folderPath)?,
+            ),
+        };
         let folderName = match mountedName {
             Some(name) => name,
-            None => operit_model::Workspace::Workspace::folderNameFromPath(&folderPath)?,
+            None => operit_model::Workspace::Workspace::folderNameFromPath(&path)?,
         };
+        let folderPath = operit_util::FileUtils::FileUtils::qualifyVfsPath(&nodeId, &path);
         let workspace = match self
             .chatHistoryManager
             .getWorkspaceForChat(&chatId)
@@ -1943,7 +1958,13 @@ impl ChatHistoryDelegate {
             .getWorkspace(workspaceId)
             .ok()
             .flatten()
-            .map(|workspace| workspace.primaryFolder().path.clone())
+            .map(|workspace| {
+                let path = &workspace.primaryFolder().path;
+                match operit_util::FileUtils::FileUtils::splitQualifiedVfsPath(path) {
+                    Some((owner, localPath)) if Some(owner) == operit_store::CoreNodeIdentityStore::CoreNodeIdentityStore::localNodeId().as_deref() => localPath.to_owned(),
+                    _ => path.clone(),
+                }
+            })
     }
 
     /// Returns every mounted folder path for a chat.
@@ -2034,7 +2055,34 @@ impl ChatHistoryDelegate {
     }
 
     #[allow(non_snake_case)]
-    /// Adds, updates, or persists a message for the current or supplied chat.
+    /// Commits completed prepared text with canonical retry detection, including messages hidden by summaries.
+    pub fn commitPreparedAssistantMessage(&mut self, chatId: &str, text: &str, timestamp: i64) -> Result<bool, String> {
+        let mut message = ChatMessage::new_with_markdown_timestamp("ai".into(), text.into(), timestamp);
+        message.sentAt = timestamp;
+        message.completedAt = operit_host_api::TimeUtils::currentTimeMillis();
+        // Tag plain-text deliveries exactly like generated scheduled replies so the host
+        // identifies every delivery uniformly; the snapshot path keeps existing tags intact.
+        message.pluginExtensions.insert("host.chat.scheduled".into(), serde_json::json!({ "preparedAt": message.completedAt }));
+        self.commitPreparedAssistantMessageSnapshot(chatId, message)
+    }
+
+    /// Commits the complete prepared reply without replacing its author, model usage or generation timing.
+    pub fn commitPreparedAssistantMessageSnapshot(&mut self, chatId: &str, message: ChatMessage) -> Result<bool, String> {
+        let timestamp = message.timestamp;
+        self.requireChatExists(chatId)?;
+        if self.chatHistoryManager.loadChatMessageIndexPosition(chatId, timestamp).map_err(|error| error.to_string())?.is_some() {
+            let existing = self.chatHistoryManager.loadChatMessageVariant(chatId, timestamp, 0).map_err(|error| error.to_string())?;
+            if existing.sender != "ai" || existing.displayText() != message.displayText() {
+                return Err("Prepared message timestamp conflicts with an existing message".into());
+            }
+            return Ok(true);
+        }
+        let message = self.chatHistoryManager.addMessage(chatId.into(), message).map_err(|error| error.to_string())?;
+        ToolPkgChatMessageHookBridge::dispatchMessagePersisted(chatId, &message);
+        self.publishChatMessage(chatId, message);
+        Ok(false)
+    }
+
     pub fn addMessageToChat(&mut self, message: ChatMessage, chatIdOverride: Option<String>) {
         let Some(targetChatId) = chatIdOverride.or_else(|| self.currentChatIdFlow.value()) else {
             return;

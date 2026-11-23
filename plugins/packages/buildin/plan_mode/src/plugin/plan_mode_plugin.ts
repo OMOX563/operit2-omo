@@ -35,13 +35,7 @@ import {
 } from "../shared/plan_mode_logging.js";
 import { onPlanaskXmlRender } from "./planask-xml-render-plugin.js";
 import { onPlantodoXmlRender } from "./plantodo-xml-render-plugin.js";
-
-const PLAN_MODE_BLOCKED_TOOL_NAMES = new Set([
-  "apply_file",
-  "create_file",
-  "edit_file",
-  "delete_file",
-]);
+import { filterPlanModeTools } from "../shared/plan_mode_tool_filter.js";
 
 const PLAN_MODE_COMMAND_ID = "plan_mode_command";
 const PLAN_MODE_COMMAND_NAME = "plan";
@@ -271,13 +265,6 @@ function registerPlanModeIpc(): void {
     PLAN_MODE_IS_PLAN_STARTED_IPC_CHANNEL,
     handleIsPlanStartedIpc
   );
-}
-
-/** Removes file mutation tools while the chat is in planning mode. */
-function filterPlanModeTools(
-  availableTools: ToolPkg.ToolPromptItem[]
-): ToolPkg.ToolPromptItem[] {
-  return availableTools.filter((tool) => !PLAN_MODE_BLOCKED_TOOL_NAMES.has(tool.name));
 }
 
 /** Injects a plan prompt into the system turn of prepared history. */

@@ -252,8 +252,8 @@ exports.run=async function(params) {{
         .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(1250)).await;
         speech.beginRecognition().unwrap();
-        speech.appendPcm(vec![0, 128, 255, 127]).unwrap();
-        speech.finishRecognition().unwrap();
+        speech.appendPcm(vec![0, 128, 255, 127]).await.unwrap();
+        speech.finishRecognition().await.unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(10), async {
             while speech.snapshot()["phase"] != 0 {
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -340,16 +340,13 @@ async fn verify_package(
     }
     archive.finish().unwrap();
     let manager = handler.getOrCreatePackageManager();
-    {
-        let mut registry = manager.lock().unwrap();
-        registry.loadAvailablePackages();
-        registry.packageRegistryReadiness().require_ready().unwrap();
-        registry
-            .addPackageFileFromExternalStorageResult(&package.to_string_lossy())
-            .unwrap();
-        let enabled = registry.enableToolPkgContainer("com.operit.device_speech_processor");
-        assert!(!enabled.contains("not found"), "{enabled}");
-    }
+    operit_tools::tools::packTool::RuntimePackageManager::RuntimePackageManager::reloadRegistry(manager.clone()).await.unwrap();
+    let imported = manager.lock().unwrap()
+        .addPackageFileFromExternalStorageResult(&package.to_string_lossy());
+    imported.await.unwrap();
+    let enabled = manager.lock().unwrap().enableToolPkgContainer("com.operit.device_speech_processor");
+    let enabled = enabled.await;
+    assert!(!enabled.contains("not found"), "{enabled}");
     let mut handler = handler.clone();
     let start = handler
         .executeTool(AITool {
@@ -369,8 +366,8 @@ async fn verify_package(
     .await
     .unwrap();
     speech.beginRecognition().unwrap();
-    speech.appendPcm(vec![0, 128, 255, 127]).unwrap();
-    speech.finishRecognition().unwrap();
+    speech.appendPcm(vec![0, 128, 255, 127]).await.unwrap();
+    speech.finishRecognition().await.unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         while speech.snapshot()["phase"] != 0 {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -410,8 +407,8 @@ async fn verify_package(
     );
     http.failStt.store(true, Ordering::Relaxed);
     speech.beginRecognition().unwrap();
-    speech.appendPcm(vec![0, 128, 255, 127]).unwrap();
-    speech.finishRecognition().unwrap();
+    speech.appendPcm(vec![0, 128, 255, 127]).await.unwrap();
+    speech.finishRecognition().await.unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         while speech.snapshot()["phase"] != 0 {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
