@@ -41,9 +41,12 @@ jobs:
 
       - name: Install Linux build dependencies
         run: |
+          # Fork 补丁：lld 是给 music_studio 的 DSP 用的——它用 clang --target=wasm32
+          # 编 studio.c 再调 wasm-ld 链接，wasm-ld 只在 lld 包里。
           sudo apt-get update
           sudo apt-get install -y \
             clang \
+            lld \
             cmake \
             gcc-aarch64-linux-gnu \
             libgstreamer-plugins-base1.0-dev \
