@@ -62,6 +62,8 @@ foreach(OPERIT_CANDIDATE
     "${OPERIT_CARGO_OUTPUT_DIRECTORY}/operit_local_llm.dll"
     "${OPERIT_CARGO_OUTPUT_DIRECTORY}/Release/operit_local_llm.dll"
     "${OPERIT_CARGO_OUTPUT_DIRECTORY}/RelWithDebInfo/operit_local_llm.dll"
+    "${OPERIT_CARGO_OUTPUT_DIRECTORY}/build/operit_local_llm.dll"
+    "${OPERIT_CARGO_OUTPUT_DIRECTORY}/build/Release/operit_local_llm.dll"
     "${OPERIT_FLUTTER_BRIDGE_CRATE}/target/local-llm/operit_local_llm.dll")
   if(EXISTS "${OPERIT_CANDIDATE}")
     set(OPERIT_LOCAL_LLM_DLL "${OPERIT_CANDIDATE}")
