@@ -23,6 +23,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import time
 import tomllib
 import urllib.request
 import zipfile
@@ -312,8 +313,18 @@ def install_linux_sysroot(source):
     linux = source / "build/linux"
     if linux.is_dir() and any(linux.glob("debian_bullseye_amd64-sysroot")):
         return
-    run([sys.executable, "build/linux/sysroot_scripts/install-sysroot.py",
-         "--arch=amd64"], cwd=source)
+    # Fork 补丁：sysroot 也从 Google 拉，偶发 5xx/超时，重试几次再接。
+    for attempt in range(1, 4):
+        try:
+            run([sys.executable, "build/linux/sysroot_scripts/install-sysroot.py",
+                 "--arch=amd64"], cwd=source)
+            return
+        except Exception as error:  # noqa: BLE001 - 网络抖动按重试处理
+            if attempt == 3:
+                raise
+            print(f"warning: sysroot install failed (attempt {attempt}/3): {error}",
+                  file=sys.stderr, flush=True)
+            time.sleep(10 * attempt)
 
 
 def prepare_icu(source):
@@ -328,8 +339,18 @@ def prepare_icu(source):
         url = ("https://chromium.googlesource.com/chromium/deps/icu/+/"
                f"{revision[1]}/{variant}/icudtl.dat?format=TEXT")
         print(f"Fetching pinned ICU data: {variant} @ {revision[1]}", file=sys.stderr, flush=True)
-        with urllib.request.urlopen(url, timeout=180) as response:
-            data = base64.b64decode(response.read(), validate=True)
+        # Fork 补丁：chromium.googlesource.com 偶发 503，一次失败就整个 Android 构建报废。
+        data = b""
+        for attempt in range(1, 5):
+            try:
+                with urllib.request.urlopen(url, timeout=180) as response:
+                    data = base64.b64decode(response.read(), validate=True)
+                break
+            except Exception as error:  # noqa: BLE001 - 网络抖动按重试处理
+                if attempt == 4:
+                    raise
+                print(f"warning: ICU fetch failed (attempt {attempt}/4): {error}", file=sys.stderr, flush=True)
+                time.sleep(10 * attempt)
         if not data:
             raise RuntimeError("Downloaded empty ICU data")
         destination.parent.mkdir(parents=True, exist_ok=True)
