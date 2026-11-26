@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import time
 from pathlib import Path
 
 from release_artifacts import release_asset_name
@@ -361,10 +362,25 @@ def dart_pub_get(enforce_lockfile: bool = False, env: dict[str, str] | None = No
 
 def flutter_pub_get(enforce_lockfile: bool = False, env: dict[str, str] | None = None) -> None:
     """Resolves app dependencies and generates native plugin registrants with FVM Flutter."""
-    command = [require_command("fvm"), "flutter", "pub", "get"]
+    command: list[str | Path] = [require_command("fvm"), "flutter", "pub", "get"]
     if enforce_lockfile:
         command.append("--enforce-lockfile")
-    run(command, cwd=FLUTTER_APP_DIR, env=env)
+    # Fork 补丁：pubspec 里 path_provider_ohos / url_launcher_ohos 指向 gitee 上的 ohos
+    # flutter_packages，GitHub runner 拉 gitee 经常 RPC failed / server closed abruptly，
+    # 一次抖动就让整个构建失败。这里做 3 次重试（每次失败后清掉可能残留的临时克隆）。
+    attempts = 3
+    for attempt in range(1, attempts + 1):
+        try:
+            run(command, cwd=FLUTTER_APP_DIR, env=env)
+            return
+        except Exception as error:  # noqa: BLE001 - 只在最后一次重新抛出
+            if attempt == attempts:
+                raise
+            print(
+                f"warning: flutter pub get failed (attempt {attempt}/{attempts}), retrying: {error}",
+                flush=True,
+            )
+            time.sleep(15 * attempt)
 
 
 def build_env_with_typescript(version: str) -> dict[str, str]:
