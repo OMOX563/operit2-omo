@@ -243,6 +243,16 @@ jobs:
           path: tools/release/work/android-v8
           key: ${{ runner.os }}-${{ runner.arch }}-android-v8-${{ hashFiles('tools/build_scripts/prepare_android_v8.py', 'apps/flutter/native/operit-flutter-bridge/Cargo.lock') }}
 
+      # Fork 补丁：character_cards 的 USearch WASM 需要 Emscripten（runner 不带）。
+      # 固定 4.0.14：latest(emcc 7.x) 编 lib.cpp 会失败。
+      - name: Install Emscripten SDK
+        run: |
+          git clone --depth 1 https://github.com/emscripten-core/emsdk.git .ci-tools/emsdk
+          .ci-tools/emsdk/emsdk install 4.0.14
+          .ci-tools/emsdk/emsdk activate 4.0.14
+          echo "EMXX=$(pwd)/.ci-tools/emsdk/upstream/emscripten/em++" >> "$GITHUB_ENV"
+          "$(pwd)/.ci-tools/emsdk/upstream/emscripten/em++" --version
+
       - name: Check build environment
         run: python3 tools/build_scripts/check_build_environment.py --products app --github-runner
 

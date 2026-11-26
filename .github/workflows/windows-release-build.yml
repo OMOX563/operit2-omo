@@ -132,6 +132,23 @@ jobs:
             if (!(Test-Path "node_modules/$m")) { throw "missing $m" }
           }
 
+      # Fork 补丁：character_cards 的 USearch WASM 需要 Emscripten（Windows runner 不带）。
+      # build.py 在 Windows 上走 fallback：用 sys.executable 跑 .ci-tools/emsdk/.../em++.py，
+      # 所以这里不设 EMXX（.bat 无法被 subprocess 直接执行），只提供 em++.py 与 EM_CONFIG。
+      - name: Install Emscripten SDK
+        shell: pwsh
+        run: |
+          git clone --depth 1 https://github.com/emscripten-core/emsdk.git .ci-tools/emsdk
+          python .ci-tools/emsdk/emsdk.py install 4.0.14
+          python .ci-tools/emsdk/emsdk.py activate 4.0.14
+          $root = (Get-Location).Path
+          $py = Join-Path $root ".ci-tools/emsdk/upstream/emscripten/em++.py"
+          $cfg = Join-Path $root ".ci-tools/emsdk/.emscripten"
+          if (!(Test-Path $py)) { throw "missing $py" }
+          "EM_CONFIG=$cfg" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          $env:EM_CONFIG = $cfg
+          python $py --version
+
       - name: Build and package Windows app
         if: inputs.products != 'cli'
         shell: pwsh
