@@ -369,11 +369,9 @@ impl MessageCoordinationDelegate {
             .iter()
             .position(|message| message.timestamp == targetMessage.timestamp)
             .ok_or_else(|| format!("Runtime message timestamp not found: {messageTimestamp}"))?;
-        let executionLease = self
-            .chatHistoryDelegate
-            .chatHistoryManager
-            .beginChatExecution(&chatId)
-            .map_err(|error| error.to_string())?;
+        let executionLease = crate::services::ChatModelBindingService::ChatModelBindingService::beginExecution(
+            &self.chatHistoryDelegate.chatHistoryManager, &chatId,
+        )?;
         executionLease
             .protectRevision(targetMessage.timestamp, targetMessage.variantCount)
             .map_err(|error| error.to_string())?;
@@ -394,8 +392,6 @@ impl MessageCoordinationDelegate {
             })
             .await
             .map_err(|error| error.to_string())?;
-        let chatProviderIdOverride = Some(configuration.profile.modelBinding.providerId.clone());
-        let chatModelIdOverride = Some(configuration.profile.modelBinding.modelId.clone());
         let requestHistory = runtimeHistory[..targetRuntimeIndex].to_vec();
         let requestMessageContent = requestHistory
             .last()
@@ -439,8 +435,8 @@ impl MessageCoordinationDelegate {
                 enableThinking: true,
                 maxTokens,
                 tokenUsageThreshold: chatContextSettings.summary.tokenThresholdRatio(),
-                chatProviderIdOverride,
-                chatModelIdOverride,
+                chatProviderIdOverride: None,
+                chatModelIdOverride: None,
             })
             .await
             .map_err(|error| error.to_string())?;
@@ -662,7 +658,9 @@ impl MessageCoordinationDelegate {
             .and_then(|chat| self.chatHistoryDelegate.primaryWorkspacePathForChat(chat));
         let executionLease = match match admittedLease {
             Some(lease) => Ok(lease),
-            None => self.chatHistoryDelegate.chatHistoryManager.beginChatExecution(&chatId),
+            None => crate::services::ChatModelBindingService::ChatModelBindingService::beginExecution(
+                &self.chatHistoryDelegate.chatHistoryManager, &chatId,
+            ),
         } {
             Ok(lease) => lease,
             Err(error) => {
@@ -947,6 +945,11 @@ impl MessageCoordinationDelegate {
             "chat-summary",
             Box::new(move || {
                 Box::pin(async move {
+                    AppLogger::v_with_level(
+                        "MessageCoordinationDelegate",
+                        &format!("chat.summary.started chatId={workerChatId}"),
+                        operit_util::AppLogger::VERBOSE_LEVEL_2,
+                    );
                     let progressDelegate = std::sync::Mutex::new(worker.messageProcessingDelegate.clone_for_core());
                     let progressChatId = workerChatId.clone();
                     let progressTaskId = workerTaskId.clone();
@@ -1003,6 +1006,11 @@ impl MessageCoordinationDelegate {
                             Err("Conversation summary cancelled".to_string())
                         }
                     };
+                    AppLogger::v_with_level(
+                        "MessageCoordinationDelegate",
+                        &format!("chat.summary.finished chatId={workerChatId} result={result:?}"),
+                        operit_util::AppLogger::VERBOSE_LEVEL_2,
+                    );
                     worker
                         .messageProcessingDelegate
                         .finishSummaryTask(&workerChatId, &workerTaskId);
@@ -1044,9 +1052,17 @@ impl MessageCoordinationDelegate {
         let afterTimestamp = messages
             .get(insertPosition)
             .map(|message| message.timestamp);
+        let chat = self.chatHistoryDelegate.chatHistoryManager
+            .loadChatHistory(request.chatId.clone()).map_err(|error| error.to_string())?
+            .ok_or_else(|| format!("Chat does not exist: {}", request.chatId))?;
+        let summaryOptions = operit_providers::chat::EnhancedAIService::SummaryConversationOptions {
+            workspacePath: self.chatHistoryDelegate.primaryWorkspacePathForChat(&chat),
+            workspaceFolders: self.chatHistoryDelegate.workspaceFolderPathsForChat(&chat),
+            promptFunctionType: request.promptFunctionType.clone(),
+        };
         let summary =
             AIMessageManager::summarizeMemory(
-                enhancedAiService, messages, request.autoContinue, request.chatId.clone(), &request.configuration, progress, request.trigger, onNonFatalError,
+                enhancedAiService, messages, request.autoContinue, request.chatId.clone(), &request.configuration, summaryOptions, progress, request.trigger, onNonFatalError,
             )
                 .await
                 .map_err(|error| error.to_string())?
@@ -1189,6 +1205,11 @@ impl MessageCoordinationDelegate {
         {
             return Err("Summary continuation no longer owns the chat turn".to_string());
         }
+        AppLogger::v_with_level(
+            "MessageCoordinationDelegate",
+            &format!("chat.summary.resume chatId={} turnId={}", request.chatId, request.turnId),
+            operit_util::AppLogger::VERBOSE_LEVEL_2,
+        );
         Box::pin(self.sendMessageInternal(
             enhancedAiService,
             request.promptFunctionType,

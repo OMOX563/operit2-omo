@@ -486,6 +486,26 @@ pub(crate) const SNAPSHOT_FIELDS: &[SnapshotField] = &[
 /// Input appearance fields added after the released saved-theme snapshot contract.
 /// Older saved configurations do not own fields they never declared.
 pub(crate) const EXTENDED_SNAPSHOT_FIELDS: &[SnapshotField] = &[
+    SnapshotField {
+        json_key: "chatContentHorizontalPadding",
+        preference_key: "chat_content_horizontal_padding",
+        kind: FieldKind::Number { min: 0.0, max: 32.0 },
+    },
+    SnapshotField {
+        json_key: "codeFontType",
+        preference_key: "code_font_type",
+        kind: FieldKind::Enum(&["system", "file", "device"]),
+    },
+    SnapshotField {
+        json_key: "codeFontSystemName",
+        preference_key: "code_font_system_name",
+        kind: FieldKind::OptionalString,
+    },
+    SnapshotField {
+        json_key: "codeFontPath",
+        preference_key: "code_font_path",
+        kind: FieldKind::OptionalString,
+    },
     SnapshotField { json_key: "themePaletteJson", preference_key: "theme_palette_json", kind: FieldKind::OptionalPalette },
     SnapshotField { json_key: "inputBackgroundColor", preference_key: "input_background_color", kind: FieldKind::OptionalColor },
     SnapshotField { json_key: "inputRoundedCornersEnabled", preference_key: "input_rounded_corners_enabled", kind: FieldKind::Boolean },
@@ -545,6 +565,7 @@ pub fn validateThemePreferenceSnapshot(
     }
     for (font_type, name, path) in [
         ("fontType", "systemFontName", "customFontPath"),
+        ("codeFontType", "codeFontSystemName", "codeFontPath"),
         ("bubbleUserFontType", "bubbleUserSystemFontName", "bubbleUserCustomFontPath"),
         ("bubbleAiFontType", "bubbleAiSystemFontName", "bubbleAiCustomFontPath"),
     ] {
@@ -765,6 +786,7 @@ pub(crate) fn migrationThemeDefaults() -> Result<BTreeMap<String, Value>, Prefer
   "bubbleUserContentPaddingRight": 12,
   "bubbleAiContentPaddingLeft": 12,
   "bubbleAiContentPaddingRight": 12,
+  "chatContentHorizontalPadding": 16,
   "customUserAvatarUri": null,
   "avatarShape": "circle",
   "avatarCornerRadius": 8,

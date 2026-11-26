@@ -1,11 +1,46 @@
-import type { MemoryQueryRequest, MemoryQueryResult, ChatConfigurationRequest, ChatConfigurationResult, DomainInput, DomainOutput, EmptyParams } from "./api";
+import type { MemoryQueryRequest, MemoryQueryResult, ChatConfigurationRequest, ChatConfigurationResult, ChatIdentityRequest, ChatDisplayIdentity, ChatPresentation, DomainInput, DomainOutput, EmptyParams } from "./api";
 import { parseDomainPayload, parseMemoryQueryRequest } from "./domain";
 import { MemoryTools } from "./runtime-tools/memory";
-import { dispatchDomain } from "./service-runtime";
+import { dispatchDomain, getService } from "./service-runtime";
 import { findChatBinding, chatSelection, readDraftBinding, commitDraftBinding, abortDraftBinding } from "./chat-storage";
+import { parseChatSelection, selectionForActive } from "./chat-bindings";
+import { resolveChatDisplay } from "./group-execution/display";
+import { requireId } from "./validation";
 export { onMemoryMessagePersisted, onMemoryInterval, registerMemoryJobHooks } from "./memory-jobs/hooks";
 
+import { groupTurnApi } from "./group-execution/public-turn";
+export { groupTurnApi } from "./group-execution/public-turn";
+
 const memoryQueries = new MemoryTools(dispatchDomain);
+
+/** Reads role presentation through the same selection and display rules used by chat creation. */
+async function readChatPresentation(input: ChatIdentityRequest, method: string): Promise<ChatPresentation> {
+  if (!input || typeof input !== "object" || Array.isArray(input) || Object.keys(input).length !== 1 || !("chatId" in input)) {
+    throw new Error(method + " requires exactly chatId");
+  }
+  if (input.chatId !== null) requireId(input.chatId, method + ".chatId");
+  const selection = input.chatId === null
+    ? selectionForActive(await dispatchDomain("activePrompt.get", {}))
+    : await chatSelection(input.chatId);
+  const kind = parseChatSelection(selection).kind;
+  if (kind === "model") return { kind, identity: null, participants: [] };
+  const result = await resolveChatDisplay({
+    purpose: "display", chatId: input.chatId, chatExtension: { version: 1, selection },
+    participantId: null, promptFunctionType: "VOICE",
+    defaultModelBinding: { providerId: "", modelId: "" }, defaultTtsConfigId: "",
+  }, await getService());
+  return { kind, identity: result.identity, participants: result.participants };
+}
+
+/** Reads the role portrait while retaining the existing identity-only contract. */
+export async function chatIdentityApi(event: ToolPkg.PublicApiEvent<ChatIdentityRequest>): Promise<ChatDisplayIdentity | null> {
+  return (await readChatPresentation(event.payload, "chat.identity")).identity;
+}
+
+/** Exposes the complete saved roster without requiring host execution defaults. */
+export function chatPresentationApi(event: ToolPkg.PublicApiEvent<ChatIdentityRequest>): Promise<ChatPresentation> {
+  return readChatPresentation(event.payload, "chat.presentation");
+}
 
 /** Resolves the provider's default avatar for dependency UIs. */
 export function defaultAvatarApi(event: ToolPkg.PublicApiEvent<EmptyParams>): Promise<string> {
@@ -76,6 +111,9 @@ export async function chatConfigurationBindingDeleteApi(event: ToolPkg.PublicApi
 
 /** Registers chat APIs without opening storage or evaluating business reads. */
 export function registerChatConfigurationApis(): void {
+  ToolPkg.registerApi({ name: "chat.identity", function: chatIdentityApi });
+  ToolPkg.registerApi({ name: "chat.presentation", function: chatPresentationApi });
+  ToolPkg.registerApi({ name: "chat.groupTurn", function: groupTurnApi });
   ToolPkg.registerApi({ name: "chat.configuration.resolve", function: chatConfigurationResolveApi });
   ToolPkg.registerApi({ name: "chat.configuration.delete", function: chatConfigurationDeleteApi });
   ToolPkg.registerApi({ name: "chat.configuration.binding.find", function: chatConfigurationBindingFindApi });
@@ -413,6 +451,11 @@ export async function memoryGraphApi(event: ToolPkg.PublicApiEvent<DomainInput<"
   return dispatchDomain("memory.graph", parseDomainPayload("memory.graph", event.payload));
 }
 
+/** Executes a bounded relationship query through a durable exported callback. */
+export async function memoryLinksApi(event: ToolPkg.PublicApiEvent<DomainInput<"memory.links">>): Promise<DomainOutput<"memory.links">> {
+  return dispatchDomain("memory.links", parseDomainPayload("memory.links", event.payload));
+}
+
 /** Validates and executes the memory.list public domain method. */
 export async function memoryListApi(event: ToolPkg.PublicApiEvent<DomainInput<"memory.list">>): Promise<DomainOutput<"memory.list">> {
   return dispatchDomain("memory.list", parseDomainPayload("memory.list", event.payload));
@@ -543,6 +586,7 @@ export function registerDomainApis(): void {
   ToolPkg.registerApi<DomainInput<"memory.searchConfig.read">, DomainOutput<"memory.searchConfig.read">>({ name: "memory.searchConfig.read", function: memorySearchConfigReadApi });
   ToolPkg.registerApi<DomainInput<"memory.searchConfig.write">, DomainOutput<"memory.searchConfig.write">>({ name: "memory.searchConfig.write", function: memorySearchConfigWriteApi });
   ToolPkg.registerApi<DomainInput<"memory.graph">, DomainOutput<"memory.graph">>({ name: "memory.graph", function: memoryGraphApi });
+  ToolPkg.registerApi<DomainInput<"memory.links">, DomainOutput<"memory.links">>({ name: "memory.links", function: memoryLinksApi });
   ToolPkg.registerApi<DomainInput<"memory.list">, DomainOutput<"memory.list">>({ name: "memory.list", function: memoryListApi });
   ToolPkg.registerApi<DomainInput<"memory.search">, DomainOutput<"memory.search">>({ name: "memory.search", function: memorySearchApi });
   ToolPkg.registerApi<DomainInput<"memory.get">, DomainOutput<"memory.get">>({ name: "memory.get", function: memoryGetApi });

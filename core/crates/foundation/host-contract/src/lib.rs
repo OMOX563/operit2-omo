@@ -912,12 +912,12 @@ fn androidOnboardingRequirements() -> Vec<HostOnboardingRequirement> {
         HostOnboardingRequirement {
             id: "android.shizuku".to_string(),
             title: "Shizuku".to_string(),
-            description: "可选。需先启动 Shizuku 或 Sui；授权后 Operit 可以使用支持 Shizuku 的 Android 系统能力。"
+            description: "可选。管理内置系统服务，可通过 Root 或无线调试激活；也可选择外部 Shizuku 或 Sui。"
                 .to_string(),
             capabilityIds: vec!["host.privilege".to_string()],
             isRequired: false,
             status: HostRequirementStatus::Missing,
-            action: HostRequirementAction::HostManaged,
+            action: HostRequirementAction::OpenSystemSettings,
         },
         HostOnboardingRequirement {
             id: "android.root".to_string(),
@@ -1930,7 +1930,7 @@ pub trait TerminalHost: Send + Sync {
     /// Declares editable fields for each implementation without probing or starting processes.
     fn terminalProfileSupport(&self) -> HostResult<Vec<TerminalProfileSupport>> {
         Ok(self.terminalInfo()?.types.into_iter().map(|entry| TerminalProfileSupport {
-            terminal: entry.terminal, terminalType: entry.terminalType, fields: Vec::new(),
+            terminal: entry.terminal, terminalType: entry.terminalType, fields: Vec::new(), fieldChoices: None,
         }).collect())
     }
     /// Creates an isolated host with immutable launch options for new sessions.
@@ -2076,6 +2076,10 @@ pub struct RuntimeStorageEntry {
 }
 
 pub trait RuntimeStorageHost: Send + Sync {
+    /// Excludes Host-private storage from portable snapshots before traversal or replacement.
+    /// Paths use the logical runtime namespace; exclusions include the entire addressed subtree.
+    fn isSnapshotExcludedPath(&self, _path: &str) -> bool { false }
+
     /// Opens a private sequential writer; commit publishes the complete file atomically.
     /// Returning None allows small legacy hosts to use their ordinary bounded write path.
     fn openWriteSession(&self, _path: &str) -> HostResult<Option<Box<dyn RuntimeStorageWriteSession>>> {
@@ -2152,6 +2156,10 @@ pub trait RuntimeStorageHost: Send + Sync {
 macro_rules! delegate_runtime_storage {
     ($host:ty, $field:ident) => {
         impl $crate::RuntimeStorageHost for $host {
+            /// Delegates portable snapshot ownership to the underlying storage Host.
+            fn isSnapshotExcludedPath(&self, path: &str) -> bool {
+                $crate::RuntimeStorageHost::isSnapshotExcludedPath(&self.$field, path)
+            }
             fn openWriteSession(&self, path: &str) -> $crate::HostResult<Option<Box<dyn $crate::RuntimeStorageWriteSession>>> {
                 $crate::RuntimeStorageHost::openWriteSession(&self.$field, path)
             }
@@ -2456,6 +2464,9 @@ pub type HostRuntimeTask = Box<dyn FnOnce() + Send + 'static>;
 pub type HostRuntimeAsyncTask =
     Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = ()> + 'static>> + Send + 'static>;
 
+/// Owns a thread-independent continuation that a Host pool may move between polls.
+pub type HostRuntimePooledTask = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
+
 /// Represents one platform-owned asynchronous delay that may cross runtime schedulers.
 pub type HostRuntimeTurnFuture = Pin<Box<dyn Future<Output = HostResult<()>> + Send + 'static>>;
 
@@ -2728,6 +2739,17 @@ pub trait HostRuntimeTaskSchedulerHost: Send + Sync {
         taskName: &str,
         task: HostRuntimeAsyncTask,
     ) -> HostResult<()>;
+
+    /// Admits movable work; an optional affine opener reserves both stages atomically.
+    /// Native Hosts use coordination capacity without an opener, blocking capacity with one.
+    fn scheduleHostRuntimePooledTask(
+        &self,
+        _taskName: &str,
+        _opening: Option<HostRuntimeAsyncTask>,
+        _task: HostRuntimePooledTask,
+    ) -> HostResult<()> {
+        Err(HostError::new("Pooled runtime tasks are not supported by this host"))
+    }
 
     /// Schedules a named runtime task after a platform-owned delay.
     fn scheduleDelayedHostRuntimeTask(
@@ -3515,6 +3537,10 @@ pub trait SystemOperationHost: Send + Sync {
     /// Selects the platform's package source; desktop installers use node-local retained packages.
     fn applicationUpdateBase(&self) -> HostResult<ApplicationUpdateBase> {
         Ok(ApplicationUpdateBase::RetainedPackage)
+    }
+    /// Reports cache retention policy without querying an installer or its owner UI.
+    fn retainsApplicationUpdatePackages(&self) -> bool {
+        true
     }
     /// Reports the running application's distribution; None disables in-app updates.
     fn applicationUpdateTarget(&self) -> HostResult<Option<ApplicationUpdateTarget>> {

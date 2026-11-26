@@ -155,7 +155,7 @@ export function parseMemoryQueryRequest(payload: unknown): MemoryQueryRequest {
 }
 
 const validators: Record<DomainOperation, Validator> = {
-  "memory.chunks": shape({ ownerKey: required(owner), memoryId: required(nonblank), query: required(nonblank), count: required(nonnegativeInteger) }),
+  "memory.chunks": shape({ ownerKey: required(owner), memoryId: required(nonblank), query: required(nonblank), count: required(nonnegativeInteger), start: optional(nonnegativeInteger) }),
   "memory.searchWithOptions": shape({ limit: optional(integer), excludeIds: optional(strings), ownerKey: required(owner), query: required(nonblank), folderPath: required(nullable(text)), relevanceThreshold: required(nonnegative), createdAtStartMs: required(nullable(integer)), createdAtEndMs: required(nullable(integer)) }),
   "memory.chat.list": ownerOnly,
   "memory.chat.pruneMissing": ownerOnly,
@@ -221,8 +221,9 @@ const validators: Record<DomainOperation, Validator> = {
   "memory.settings.write": shape({ ownerKey: required(owner), settings: required(settings) }),
   "memory.searchConfig.read": ownerOnly,
   "memory.searchConfig.write": shape({ ownerKey: required(owner), config: required(searchConfig) }),
-  "memory.graph": ownerOnly,
-  "memory.list": ownerOnly,
+  "memory.graph": shape({ ownerKey: required(owner), after: optional(memoryIdentifier), offset: optional(number), limit: optional(number), folderPath: optional(nullable(text)), ids: optional(array(memoryIdentifier)), titles: optional(array(nonblank)) }),
+  "memory.list": shape({ ownerKey: required(owner), after: optional(memoryIdentifier), offset: optional(number), limit: optional(number), folderPath: optional(nullable(text)), ids: optional(array(memoryIdentifier)), titles: optional(array(nonblank)) }),
+  "memory.links": shape({ ownerKey: required(owner), linkId: optional(memoryIdentifier), sourceTitle: optional(nonblank), targetTitle: optional(nonblank), linkType: optional(nonblank), limit: required(number) }),
   "memory.search": shape({ ownerKey: required(owner), query: required(nonblank) }),
   "memory.get": shape({ ownerKey: required(owner), title: required(nonblank) }),
   "memory.create": shape({ ownerKey: required(owner), values: required(shape({ ...memoryFields, id: optional(memoryIdentifier), title: required(nonblank), content: required(text) })) }),
@@ -282,6 +283,8 @@ export function jsonValue(value: unknown, path = "result"): JsonValue {
 export interface ChatConfigurationService extends Pick<CharacterRepository,
   "getCharacter" | "getGroup" | "getTag" | "getStore" | "listModels" | "listTtsConfigs" | "readGlobalMemoryPreferences"
 > {
+  /** Reuses a runtime-only user profile for an exact conversation, participant and memory owner. */
+  readConversationUserPreferences(chatId: string | null, participantId: string, ownerKey: string): Promise<string>;
   /** Resolves group portrait bytes through the main runtime's existing image services. */
   groupAvatar(group: GroupRecord, cards: readonly CharacterRecord[]): Promise<string | null>;
   /** Calls a typed business operation without invoking another command. */
@@ -355,7 +358,7 @@ async function chatParticipant(
   }
   const prompt = await combineCharacterPrompt(card, [], request.promptFunctionType, service);
   const userPreferencesText = (await service.readGlobalMemoryPreferences()).userDescriptionEnabled
-    ? (await service.dispatchDomain("memory.user.read", { ownerKey: primary })).content : "";
+    ? await service.readConversationUserPreferences(request.chatId, card.id, primary) : "";
   return {
     id: card.id, name: card.name, avatarUri: card.avatarUri,
     introPrompt: prompt, userPreferencesText,
@@ -368,11 +371,20 @@ async function chatParticipant(
   };
 }
 
-/** Resolves an explicit execution participant without moving domain selection rules into Core. */
+/** Resolves chat profiles through shared reads and reapplies live privacy after execution preparation. */
 export async function resolveChatConfiguration(request: ChatConfigurationRequest, service: ChatConfigurationService): Promise<ChatConfigurationResult> {
   const reads = configurationReadScope(service);
   if (request.purpose === "display") return resolveChatDisplay(request, reads);
-  return resolveChatExecution(request, reads);
+  const result = await resolveChatExecution(request, reads);
+  if ((await service.readGlobalMemoryPreferences()).userDescriptionEnabled) return result;
+  return {
+    ...result,
+    profile: { ...result.profile, userPreferencesText: "" },
+    participants: result.participants.map(
+      /** Masks every participant when privacy changes during asynchronous profile reads. */
+      profile => ({ ...profile, userPreferencesText: "" }),
+    ),
+  };
 }
 
 /** Resolves only an explicitly requested execution from current configuration. */

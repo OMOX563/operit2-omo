@@ -422,6 +422,13 @@ pub const TOOLPKG_LOG_PATH: &str = "runtime/logs/toolpkg.log";
 
 pub const USER_PREFERENCES_PATH: &str =
     "runtime/config/preferences/user_preferences.preferences.json";
+/// Owns application language on this device independently of Space preferences.
+pub const APP_LANGUAGE_PREFERENCES: RuntimeStoragePathDefinition =
+    RuntimeStoragePathDefinition::exact(
+        "runtime/config/preferences/app_language.preferences.json",
+        RuntimeStorageOwnership::CoreNode,
+    );
+pub const APP_LANGUAGE_PREFERENCES_PATH: &str = APP_LANGUAGE_PREFERENCES.path;
 pub const ONBOARDING_PREFERENCES_PATH: &str =
     "runtime/config/preferences/onboarding_preferences";
 pub const REMOTE_ANNOUNCEMENT_PREFERENCES_PATH: &str =
@@ -442,7 +449,8 @@ pub const CHARACTER_GROUPS_PREFERENCES_PATH: &str =
     "runtime/config/preferences/character_groups.preferences.json";
 pub const WORKSPACES_PREFERENCES_PATH: &str =
     "runtime/config/preferences/workspaces.preferences.json";
-/// Device-local rootfs instances and private installation staging directories.
+/// Runtime-backed rootfs storage used by OpenHarmony; Android and iOS own separate private roots.
+/// Retains node ownership for existing runtime-backed installations on all native hosts.
 pub const TERMINAL_ROOTFS: RuntimeStoragePathDefinition = RuntimeStoragePathDefinition::tree(
     "runtime/terminal/rootfs",
     RuntimeStorageOwnership::CoreNode,
@@ -538,6 +546,7 @@ pub const RUNTIME_STORAGE_PATH_DEFINITIONS: &[RuntimeStoragePathDefinition] = &[
     RuntimeStoragePathDefinition::exact(CURRENT_CHAT_ID_PREFERENCES_PATH, RuntimeStorageOwnership::CoreNode),
     CLIENT_RUNTIME_BOOTSTRAP,
     RUNTIME_APPLICATION_ZOOM,
+    APP_LANGUAGE_PREFERENCES,
     RUNTIME_MODEL_CONNECTION_TESTS,
     // Model weights, native runtimes and installation inventories belong to this node.
     RuntimeStoragePathDefinition::tree(RUNTIME_LOCAL_MODELS_DIR_PATH, RuntimeStorageOwnership::CoreNode),
@@ -641,6 +650,10 @@ mod tests {
 
     #[test]
     fn resolves_registered_runtime_storage_ownership() {
+        assert_eq!(
+            runtimeStorageOwnership(APP_LANGUAGE_PREFERENCES_PATH).unwrap(),
+            RuntimeStorageOwnership::CoreNode
+        );
         assert_eq!(
             runtimeStorageOwnership(RUNTIME_MODEL_CONNECTION_TESTS_PATH).unwrap(),
             RuntimeStorageOwnership::CoreNode

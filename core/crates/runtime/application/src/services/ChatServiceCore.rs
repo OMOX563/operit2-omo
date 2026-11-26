@@ -2,7 +2,7 @@ use crate::plugins::toolpkg::ToolPkgMessageTransformBridge::ToolPkgMessageTransf
 use operit_tools::tools::packTool::RuntimePackageManager::RuntimePackageManager;
 use crate::core::chat::AIMessageManager::AIMessageManager;
 use crate::data::preferences::ApiPreferences::ApiPreferences;
-use crate::data::preferences::FunctionalConfigManager::FunctionalConfigManager;
+use crate::data::preferences::FunctionalConfigManager::{FunctionModelBinding, FunctionalConfigManager};
 use crate::data::preferences::ModelConfigManager::ModelConfigManager;
 use crate::plugins::toolpkg::ToolPkgChatInputHookBridge::{
     ChatInputHookContext, ChatInputHookResult, ToolPkgChatInputHookBridge,
@@ -20,6 +20,7 @@ use crate::services::core::MessageProcessingDelegate::{
     ChatExecutionState, ChatTurnSubmission, MessageProcessingDelegate, SendUserMessageProcessingRequest,
 };
 use crate::services::core::TokenStatisticsDelegate::TokenStatisticsDelegate;
+use crate::services::ChatModelBindingService::ChatModelBindingService;
 use crate::services::ProviderRuntimeSupportService::{ChatConfigurationApi, MODEL_CONFIGURATION_OWNER};
 use crate::services::RuntimeHostInteractionService::{
     chatToolPermissionRequestsFlow, respondChatToolPermission,
@@ -862,11 +863,9 @@ impl ChatServiceCore {
         self.chatHistoryDelegate.openChatHistory(chatId.clone(), false)?;
         delegate.chatHistoryDelegate = self.chatHistoryDelegate.clone_for_core();
         delegate.messageProcessingDelegate = self.messageProcessingDelegate.clone_for_core();
-        let executionLease = self
-            .chatHistoryDelegate
-            .chatHistoryManager
-            .beginChatExecution(&chatId)
-            .map_err(|error| error.to_string())?;
+        let executionLease = ChatModelBindingService::beginExecution(
+            &self.chatHistoryDelegate.chatHistoryManager, &chatId,
+        )?;
         let mut api = ChatConfigurationApi::ready(&service.tool_handler).await;
         let support = service.provider_runtime_context.support();
         let configuration = api
@@ -877,7 +876,7 @@ impl ChatServiceCore {
                 participantId: Some(resumeContext.participantId.clone()),
                 promptFunctionType: resumeContext.promptFunctionType.clone(),
                 defaultModelBinding: support
-                    .modelBindingForFunction(FunctionType::CHAT)?,
+                    .modelBindingForChat(Some(&chatId), FunctionType::CHAT)?,
                 defaultTtsConfigId: support.defaultTtsConfigId()?,
             })
             .await?;
@@ -1212,6 +1211,45 @@ impl ChatServiceCore {
         Ok(())
     }
 
+    /// Returns the effective conversation model without modifying the global chat binding.
+    #[operit_route_macros::operit_core_route(binding = chatId)]
+    pub fn chatModelBinding(&self, chatId: String) -> Result<FunctionModelBinding, String> {
+        self.chatHistoryDelegate.requireChatExists(&chatId)?;
+        let models = ModelConfigManager::default();
+        if let Some(binding) = ChatModelBindingService::read(
+            &self.chatHistoryDelegate.chatHistoryManager,
+            &models,
+            &chatId,
+        )? {
+            return Ok(binding);
+        }
+        FunctionalConfigManager::default()
+            .getModelBindingForFunction(FunctionType::CHAT)
+            .map_err(|error| error.to_string())
+    }
+
+    /// Persists a model for this exact conversation; selecting the global pair resumes global updates.
+    #[operit_route_macros::operit_core_route(binding = chatId)]
+    pub fn setChatModelBinding(
+        &self,
+        chatId: String,
+        binding: Option<FunctionModelBinding>,
+    ) -> Result<(), String> {
+        self.chatHistoryDelegate.requireChatExists(&chatId)?;
+        let global = FunctionalConfigManager::default()
+            .getModelBindingForFunction(FunctionType::CHAT)
+            .map_err(|error| error.to_string())?;
+        let binding = binding.filter(|binding| {
+            binding.providerId != global.providerId || binding.modelId != global.modelId
+        });
+        ChatModelBindingService::write(
+            &self.chatHistoryDelegate.chatHistoryManager,
+            &ModelConfigManager::default(),
+            &chatId,
+            binding,
+        )
+    }
+
     /// Resolves and publishes only generic display identity, ordered participants and plugin-authored initialization data.
     #[operit_route_macros::operit_core_route(binding = chatId)]
     pub fn chatConfiguration(
@@ -1233,7 +1271,7 @@ impl ChatServiceCore {
                 chatExtension: None,
                 participantId: None,
                 promptFunctionType: PromptFunctionType::CHAT,
-                defaultModelBinding: support.modelBindingForFunction(FunctionType::CHAT)?,
+                defaultModelBinding: support.modelBindingForChat(Some(&chatId), FunctionType::CHAT)?,
                 defaultTtsConfigId: support.defaultTtsConfigId()?,
             }).await?;
             history
@@ -1270,12 +1308,12 @@ impl ChatServiceCore {
         let support = service.provider_runtime_context.support();
         api.resolve(ChatConfigurationRequest {
             purpose: ChatConfigurationPurpose::Execution,
-            chatId: Some(chatId),
+            chatId: Some(chatId.clone()),
             chatExtension: None,
             participantId,
             promptFunctionType: PromptFunctionType::CHAT,
             defaultModelBinding: support
-                .modelBindingForFunction(FunctionType::CHAT)?,
+                .modelBindingForChat(Some(&chatId), FunctionType::CHAT)?,
             defaultTtsConfigId: support.defaultTtsConfigId()?,
         })
         .await
@@ -1566,6 +1604,16 @@ impl ChatServiceCore {
             }
         };
         // Generation must not persist a summary boundary before valid content exists.
+        let chat = match self.chatHistoryDelegate.chatHistoryManager.loadChatHistory(currentChatId.clone()) {
+            Ok(Some(chat)) => chat,
+            Ok(None) => return self.summaryInsertionFailed(Some(currentChatId), "对话不存在".into()),
+            Err(error) => return self.summaryInsertionFailed(Some(currentChatId), error.to_string()),
+        };
+        let summaryOptions = operit_providers::chat::EnhancedAIService::SummaryConversationOptions {
+            workspacePath: self.chatHistoryDelegate.primaryWorkspacePathForChat(&chat),
+            workspaceFolders: self.chatHistoryDelegate.workspaceFolderPathsForChat(&chat),
+            promptFunctionType: PromptFunctionType::CHAT,
+        };
         let summaryToast = self.messageProcessingDelegate.toastEventFlow.clone();
         let summaryMessage = match AIMessageManager::summarizeMemory(
             &mut enhancedAiService,
@@ -1573,6 +1621,7 @@ impl ChatServiceCore {
             false,
             currentChatId.clone(),
             &configuration,
+            summaryOptions,
             None,
             None,
             std::sync::Arc::new(move |error| {
@@ -1648,11 +1697,9 @@ impl ChatServiceCore {
             Some(id) if !id.trim().is_empty() => id,
             _ => self.chatHistoryDelegate.currentChatIdFlow.value().ok_or_else(|| "No chat is active".to_string())?,
         };
-        let executionLease = self
-            .chatHistoryDelegate
-            .chatHistoryManager
-            .beginChatExecution(&targetChatId)
-            .map_err(|error| error.to_string())?;
+        let executionLease = ChatModelBindingService::beginExecution(
+            &self.chatHistoryDelegate.chatHistoryManager, &targetChatId,
+        )?;
         let Some(mut enhancedAiService) = self.newEnhancedAiServiceForChat(&targetChatId) else {
             return Ok(false);
         };
@@ -1856,8 +1903,8 @@ impl ChatServiceCore {
 
     /// Removes the workspace binding from a chat without deleting workspace files.
     #[allow(non_snake_case)]
-    pub fn unbindChatFromWorkspace(&mut self, chatId: String) {
-        self.chatHistoryDelegate.unbindChatFromWorkspace(chatId);
+    pub fn unbindChatFromWorkspace(&mut self, chatId: String) -> Result<(), String> {
+        self.chatHistoryDelegate.unbindChatFromWorkspace(chatId)
     }
 
     /// Renames the workspace binding and chat title together.
@@ -1923,80 +1970,80 @@ impl ChatServiceCore {
             .restoreWorkspaceForMessage(workspacePath, messageTimestamp, Some(chatId))
     }
 
-    /// Rolls an explicit chat back to a prior message timestamp.
+    /// Captures shared state so plugin cancellation can reenter Core after Holder is released.
+    fn captureHistoryTruncate(
+        &self, chatId: String, messageTimestamp: i64,
+    ) -> impl std::future::Future<Output = Result<ChatMessage, String>> + 'static {
+        let target = self.chatHistoryDelegate.chatMessagesSnapshotForChat(chatId.clone())
+            .into_iter().find(|message| message.timestamp == messageTimestamp && message.sender == "user")
+            .ok_or_else(|| "History truncation requires an existing user message".to_string());
+        let workspace = self.resolveWorkspaceRewindTarget(chatId.clone(), messageTimestamp);
+        let context = self.runtimeToolHandler().getContext();
+        let mut history = self.chatHistoryDelegate.clone_for_core();
+        let mut processing = self.messageProcessingDelegate.clone_for_core();
+        async move {
+            let target = target?;
+            crate::plugins::toolpkg::ToolPkgChatLifecycleHookBridge::ToolPkgChatLifecycleHookBridge::dispatchBeforeHistoryTruncate(&chatId, messageTimestamp).await?;
+            processing.cancelMessageForDestructiveMutation(chatId.clone()).await?;
+            if let Some((workspaceChatId, workspacePath)) = workspace {
+                if matches!(WorkspaceBackupManager::getInstance(context)
+                    .restoreWorkspaceForMessage(workspacePath, messageTimestamp, Some(workspaceChatId)),
+                    WorkspaceRewindOutcome::Unavailable) {
+                    return Err("Workspace history snapshot is unavailable".to_string());
+                }
+            }
+            history.truncateChatHistoryForChat(chatId, Some(messageTimestamp));
+            Ok(target)
+        }
+    }
+
+    /// Rolls back history after disposing prior work outside the chat runtime Holder lock.
     #[allow(non_snake_case)]
     #[operit_route_macros::operit_core_route(binding = chatId)]
-    pub async fn rollbackToMessage(
+    pub fn rollbackToMessage(
         &mut self,
         chatId: String,
         messageTimestamp: i64,
-    ) -> Option<String> {
-        let currentMessages = self
-            .chatHistoryDelegate
-            .chatMessagesSnapshotForChat(chatId.clone());
-        let Some(targetMessage) = currentMessages
-            .into_iter()
-            .find(|message| message.timestamp == messageTimestamp)
-        else {
-            return None;
-        };
-        if targetMessage.sender != "user" {
-            return None;
+    ) -> impl std::future::Future<Output = Option<String>> + 'static {
+        let pending = self.captureHistoryTruncate(chatId, messageTimestamp);
+        async move {
+            match pending.await {
+                Ok(message) => Some(stripXmlLikeTags(&message.displayText())),
+                Err(error) => {
+                    AppLogger::e("ChatServiceCore", &format!("History rollback preparation failed: {error}"));
+                    None
+                }
+            }
         }
-        if matches!(
-            self.rewindWorkspaceForMessageTimestamp(chatId.clone(), messageTimestamp),
-            WorkspaceRewindOutcome::Unavailable
-        ) {
-            return None;
-        }
-        self.chatHistoryDelegate
-            .truncateChatHistoryForChat(chatId.clone(), Some(messageTimestamp));
-        Some(stripXmlLikeTags(&targetMessage.displayText()))
     }
 
-    /// Rewinds a user message and sends edited content as a new turn.
+    /// Rewinds and resends through captured native state without retaining Holder across plugin calls.
     #[allow(non_snake_case)]
     #[operit_route_macros::operit_core_route(binding = chatId)]
-    pub async fn rewindAndResendMessage(
+    pub fn rewindAndResendMessage(
         &mut self,
         chatId: String,
         messageTimestamp: i64,
         editedContent: String,
-    ) -> bool {
-        let currentMessages = self
-            .chatHistoryDelegate
-            .chatMessagesSnapshotForChat(chatId.clone());
-        let Some(targetMessage) = currentMessages
-            .into_iter()
-            .find(|message| message.timestamp == messageTimestamp)
-        else {
-            return false;
-        };
-        if targetMessage.sender != "user" {
-            return false;
+    ) -> impl std::future::Future<Output = bool> + 'static {
+        let pending = self.captureHistoryTruncate(chatId.clone(), messageTimestamp);
+        let starter = self.captureUserMessageStarter(Some(chatId), &ChatTurnOptions::default(), None);
+        async move {
+            let result = async {
+                let starter = starter?;
+                pending.await?;
+                starter.start(PromptFunctionType::CHAT, None, editedContent,
+                    None, None, None, Vec::new(), None, ChatTurnOptions::default(), None).await?;
+                Ok::<(), String>(())
+            }.await;
+            match result {
+                Ok(()) => true,
+                Err(error) => {
+                    AppLogger::e("ChatServiceCore", &format!("History resend preparation failed: {error}"));
+                    false
+                }
+            }
         }
-        if matches!(
-            self.rewindWorkspaceForMessageTimestamp(chatId.clone(), messageTimestamp),
-            WorkspaceRewindOutcome::Unavailable
-        ) {
-            return false;
-        }
-        self.chatHistoryDelegate
-            .truncateChatHistoryForChat(chatId.clone(), Some(messageTimestamp));
-        self.sendUserMessage(
-            PromptFunctionType::CHAT,
-            None,
-            Some(chatId),
-            editedContent,
-            None,
-            None,
-            None,
-            Vec::new(),
-            None,
-            ChatTurnOptions::default(),
-        )
-        .await;
-        true
     }
 
     /// Regenerates one AI message in place while preserving the surrounding chat history.
@@ -3038,14 +3085,18 @@ impl ChatServiceCore {
             .triggerToggleForFlutter(toggleId, chatId, Some("main".into()))
     }
 
+    /// Returns usage and context limits for the effective conversation model.
     #[operit_route_macros::operit_core_route(binding = chatId)]
     pub async fn chatInputMenuSummary(
         &self,
         chatId: Option<String>,
     ) -> Result<ChatInputMenuSummary, String> {
-        let binding = FunctionalConfigManager::default()
-            .getModelBindingForFunction(FunctionType::CHAT)
-            .map_err(|e| e.to_string())?;
+        let binding = match &chatId {
+            Some(id) => self.chatModelBinding(id.clone())?,
+            None => FunctionalConfigManager::default()
+                .getModelBindingForFunction(FunctionType::CHAT)
+                .map_err(|error| error.to_string())?,
+        };
         let config = ModelConfigManager::default()
             .getResolvedModelConfig(&binding.providerId, &binding.modelId)
             .map_err(|e| e.to_string())?;

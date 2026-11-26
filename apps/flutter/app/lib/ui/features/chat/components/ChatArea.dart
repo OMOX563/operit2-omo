@@ -1,5 +1,7 @@
 // ignore_for_file: file_names
 
+import 'package:operit2/l10n/generated/app_localizations.dart';
+
 import 'dart:async';
 import 'dart:math' as math;
 
@@ -242,6 +244,11 @@ class _ChatAreaState extends State<ChatArea>
 
   /// Prepares nearby rows while keeping distant history unmounted.
   Widget _buildTranscript(BuildContext context) {
+    // 消息列表两侧留白来自主题设置（默认 16dp），两段 sliver 用同一个值，
+    // 保证向上滚动时左右边界不跳变。
+    final horizontalInset = OperitTheme.of(
+      context,
+    ).themePreferenceSnapshot.chatContentHorizontalPadding;
     final showLoadingIndicator = _shouldShowLoadingIndicator();
     final itemCount =
         widget.messages.length +
@@ -326,7 +333,12 @@ class _ChatAreaState extends State<ChatArea>
                   slivers: [
                     if (centerIndex > 0)
                       SliverPadding(
-                        padding: const EdgeInsets.fromLTRB(16, 16, 16, 0),
+                        padding: EdgeInsets.fromLTRB(
+                      horizontalInset,
+                      16,
+                      horizontalInset,
+                      0,
+                    ),
                         sliver: ChatMessageSliverList(
                           extents: rowExtents
                               .take(centerIndex)
@@ -342,11 +354,11 @@ class _ChatAreaState extends State<ChatArea>
                     SliverPadding(
                       key: _centerSliverKey,
                       padding: EdgeInsets.fromLTRB(
-                        16,
-                        _layoutOriginTopPadding,
-                        16,
-                        16 + widget.bottomContentInset,
-                      ),
+            horizontalInset,
+            _layoutOriginTopPadding,
+            horizontalInset,
+            16 + widget.bottomContentInset,
+          ),
                       sliver: ChatMessageSliverList(
                         extents: rowExtents.skip(centerIndex).toList(),
                         preserveViewport: _shouldPreserveManualViewport,
@@ -374,28 +386,34 @@ class _ChatAreaState extends State<ChatArea>
                 return ValueListenableBuilder<bool>(
                   valueListenable: _showNavigatorChipNotifier,
                   builder: (context, showNavigatorChip, _) {
-                    return ChatScrollNavigator(
-                      messages: widget.messages,
-                      currentChatId: widget.currentChatId,
-                      scrollController: widget.scrollController,
-                      messageAnchors: messageAnchors,
-                      viewportHeight: _viewportHeight,
-                      autoScrollToBottom: autoScrollToBottom,
-                      hasNewerDisplayHistory: widget.hasNewerDisplayHistory,
-                      messageNavigation: widget.messageNavigation,
-                      loadLocatorEntries: widget.loadLocatorEntries,
-                      onRequestLatestMessages: widget.onShowLatestDisplayWindow,
-                      onAutoScrollToBottomChanged:
-                          widget.onAutoScrollToBottomChanged,
-                      onJumpToMessageTimestamp: _jumpToMessageTimestamp,
-                      onJumpToMessage: _jumpToMessageIndex,
-                      onToggleFavoriteMessage: widget.onToggleFavoriteMessage,
-                      onRequestScrollToBottom: _scrollToBottomFromNavigator,
-                      showNavigatorChip: showNavigatorChip,
-                      onNavigatorChipHidden: () {
-                        _showNavigatorChipNotifier.value = false;
-                        _userScrollSessionActive = false;
-                      },
+                    return ValueListenableBuilder<bool>(
+                      valueListenable:
+                          UserPreferencesManager.chatScrollNavigatorOnLeft,
+                      builder: (context, onLeft, _) => ChatScrollNavigator(
+                        onLeft: onLeft,
+                        messages: widget.messages,
+                        currentChatId: widget.currentChatId,
+                        scrollController: widget.scrollController,
+                        messageAnchors: messageAnchors,
+                        viewportHeight: _viewportHeight,
+                        autoScrollToBottom: autoScrollToBottom,
+                        hasNewerDisplayHistory: widget.hasNewerDisplayHistory,
+                        messageNavigation: widget.messageNavigation,
+                        loadLocatorEntries: widget.loadLocatorEntries,
+                        onRequestLatestMessages:
+                            widget.onShowLatestDisplayWindow,
+                        onAutoScrollToBottomChanged:
+                            widget.onAutoScrollToBottomChanged,
+                        onJumpToMessageTimestamp: _jumpToMessageTimestamp,
+                        onJumpToMessage: _jumpToMessageIndex,
+                        onToggleFavoriteMessage: widget.onToggleFavoriteMessage,
+                        onRequestScrollToBottom: _scrollToBottomFromNavigator,
+                        showNavigatorChip: showNavigatorChip,
+                        onNavigatorChipHidden: () {
+                          _showNavigatorChipNotifier.value = false;
+                          _userScrollSessionActive = false;
+                        },
+                      ),
                     );
                   },
                 );
@@ -1598,7 +1616,7 @@ class _StatusMessage extends StatelessWidget {
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
       child: SelectableText(
-        isError ? apiErrorText(text) : text,
+        isError ? apiErrorText(text, AppLocalizations.of(context)!) : text,
         style: theme.textTheme.bodySmall?.copyWith(
           color: isError
               ? theme.colorScheme.error

@@ -179,6 +179,36 @@ impl PathMapper {
         Self::normalizeWorkspaceBindingPathForHost(path, HostFileSystemRoots::current())
     }
 
+    /// Accepts only workspace VFS addresses without interpreting unknown roots as native paths.
+    pub fn normalizeWorkspaceVfsPath(path: &str) -> Result<String, String> {
+        let path = normalizeAbsoluteVfsPath(path)?;
+        normalizeWorkspaceBindingVfsPath(&path, HostFileSystemRoots::current())?
+            .ok_or_else(|| format!("Unknown workspace VFS path: {path}"))
+    }
+
+    /// Maps an explicitly native absolute path without interpreting reserved VFS root names.
+    pub fn nativePathToVfs(path: &str) -> Result<String, String> {
+        Self::nativePathToVfsForHost(path, HostFileSystemRoots::current())
+    }
+
+    /// Uses the host declaration for native ingress, including the native filesystem root.
+    fn nativePathToVfsForHost(path: &str, hostRoots: HostFileSystemRoots) -> Result<String, String> {
+        let path = path.replace('\\', "/");
+        if path.contains('\0') {
+            return Err("Native paths must not contain a null byte".into());
+        }
+        if let Some(path) = normalizeWindowsHostWorkspacePath(&path)? {
+            return Ok(path);
+        }
+        if !path.starts_with('/') {
+            return Err("Native paths must be absolute".into());
+        }
+        let path = normalizeAbsoluteVfsPath(&path)?;
+        let segments = pathSegments(&path);
+        let (mount, consumed) = hostRoots.nativePosixMount(&segments)?;
+        Ok(joinNormalizedSegments(&pathSegments(mount), &segments[consumed..]))
+    }
+
     /// Applies native workspace ingress under the same host layout as storage selection.
     fn normalizeWorkspaceBindingPathForHost(path: &str, hostRoots: HostFileSystemRoots) -> Result<String, String> {
         let text = path.trim().replace('\\', "/");
@@ -1058,6 +1088,45 @@ mod tests {
         }
     }
 
+    /// Keeps native directories distinct from every reserved virtual namespace on each host.
+    #[test]
+    fn explicitNativeIngressPreservesReservedDirectoryNames() {
+        for (roots, mount) in [
+            (HostFileSystemRoots::Linux, "/virtual/linux"),
+            (HostFileSystemRoots::Macos, "/virtual/macos"),
+            (HostFileSystemRoots::Ios, "/virtual/ios"),
+            (HostFileSystemRoots::Ohos, "/virtual/ohos"),
+            (HostFileSystemRoots::Android, "/virtual/android/root"),
+        ] {
+            for native in ["/", "/app", "/app/project", "/operitapp", "/mnt", "/virtual", "/workspace", "/data", "/中文 project"] {
+                let expected = format!("{mount}{}", if native == "/" { "" } else { native });
+                let actual = PathMapper::nativePathToVfsForHost(native, roots).unwrap();
+                assert_eq!(actual, expected, "{roots:?}: {native}");
+                let mut mapper = mapper();
+                mapper.hostRoots = roots;
+                assert_eq!(mapper.resolve(&actual).unwrap().nativePath().unwrap(), native);
+            }
+        }
+        assert_eq!(PathMapper::nativePathToVfsForHost("D:\\项目 folder", HostFileSystemRoots::Windows).unwrap(), "/virtual/windows/d/项目 folder");
+        assert_eq!(PathMapper::nativePathToVfsForHost("/sdcard/Projects", HostFileSystemRoots::Android).unwrap(), "/virtual/android/sdcard/Projects");
+        for path in ["relative", "./app", "D:relative", "", "/app\0secret"] {
+            assert!(PathMapper::nativePathToVfsForHost(path, HostFileSystemRoots::Linux).is_err());
+        }
+        assert!(PathMapper::nativePathToVfsForHost("/app", HostFileSystemRoots::Windows).is_err());
+        assert!(PathMapper::nativePathToVfsForHost("/app", HostFileSystemRoots::Browser).is_err());
+    }
+
+    /// Explicit virtual ingress must not guess a native interpretation for an unknown root.
+    #[test]
+    fn explicitWorkspaceVfsIngressRejectsNativeDirectories() {
+        for path in ["/app", "/operitapp", "/mnt", "/workspace", "/home/user/project", "D:/project"] {
+            assert!(PathMapper::normalizeWorkspaceVfsPath(path).is_err(), "{path}");
+        }
+        for path in ["/operitapp/workspaces/demo", "/virtual/linux/app", "/virtual/windows/c/project"] {
+            assert_eq!(PathMapper::normalizeWorkspaceVfsPath(path).unwrap(), path);
+        }
+    }
+
     /// Keeps workspace bindings rooted in the app collection or host mounts.
     #[test]
     fn workspaceBindingPathUsesExplicitVfsRoots() {
@@ -1119,6 +1188,34 @@ mod tests {
                 if foreign != name {
                     assert!(mapper.resolve(&format!("/virtual/{foreign}/data")).is_err(), "{platform:?}: {foreign}");
                 }
+            }
+        }
+    }
+
+    /// Resolves application aliases and native platform addresses to the same selected directories.
+    #[test]
+    fn customStorageAliasesResolveToNativePlatformDirectories() {
+        use operit_host_contract::HostPlatform;
+        for (platform, selectedRoot, platformRoot) in [
+            (HostPlatform::Android, "/storage/emulated/0/Download/Operit data", "/virtual/android/root"),
+            (HostPlatform::Linux, "/home/user/Operit data", "/virtual/linux"),
+            (HostPlatform::Macos, "/Users/user/Operit data", "/virtual/macos"),
+            (HostPlatform::Ios, "/private/var/mobile/Containers/Shared/AppGroup/UUID/Operit data", "/virtual/ios"),
+            (HostPlatform::Ohos, "/data/storage/el2/base/files/Operit data", "/virtual/ohos"),
+        ] {
+            let runtimeRoot = format!("{selectedRoot}/runtime");
+            let workspaceRoot = format!("{selectedRoot}/workspaces");
+            let mut mapper = PathMapper::builtinOnly(runtimeRoot.clone().into(), workspaceRoot.clone().into());
+            mapper.hostRoots = HostFileSystemRoots::forPlatform(&platform);
+            for (applicationPath, nativePath) in [
+                ("/operitapp/data/config", format!("{runtimeRoot}/config")),
+                ("/operitapp/outputs/chat", format!("{runtimeRoot}/data/chat_outputs/chat")),
+                ("/operitapp/workspaces/project", format!("{workspaceRoot}/project")),
+            ] {
+                let directory = mapper.resolve(applicationPath).unwrap().nativePath().unwrap();
+                assert_eq!(directory, nativePath, "{platform:?}: {applicationPath}");
+                let platformPath = format!("{platformRoot}{nativePath}");
+                assert_eq!(mapper.resolve(&platformPath).unwrap().nativePath().unwrap(), directory);
             }
         }
     }

@@ -1511,8 +1511,6 @@ impl MessageProcessingDelegate {
         executionLease: &ChatExecutionLease,
         configuration: &ChatConfigurationResult,
         workspacePath: Option<String>,
-        chatProviderIdOverride: Option<String>,
-        chatModelIdOverride: Option<String>,
     ) -> Result<Option<i64>, String> {
         let mut pending = inbox.drainOrClose();
         if pending.is_empty() {
@@ -1533,8 +1531,8 @@ impl MessageProcessingDelegate {
                         replyToMessage: None,
                         chatId: chatId.to_string(),
                         participantId: configuration.profile.id.clone(),
-                        chatProviderIdOverride: chatProviderIdOverride.clone(),
-                        chatModelIdOverride: chatModelIdOverride.clone(),
+                        chatProviderIdOverride: Some(configuration.profile.modelBinding.providerId.clone()),
+                        chatModelIdOverride: Some(configuration.profile.modelBinding.modelId.clone()),
                     })
                     .await
                     .map_err(|error| error.to_string())?;
@@ -1714,7 +1712,14 @@ impl MessageProcessingDelegate {
     /// Cancels an active message turn before destructive history mutation.
     #[allow(non_snake_case)]
     pub async fn cancelMessageForDestructiveMutation(&mut self, chatId: String) -> Result<(), String> {
-        self.cancelMessageInternal(chatId, false).await.map(|_| ())
+        let processing = self.clone_for_core();
+        self.cancelMessageInternalForTurn(chatId.clone(), false, None, move |result| {
+            match &result {
+                Ok(_) => processing.completeCancelledTurnReceipt(&chatId, None),
+                Err(error) => processing.failTurnReceipt(&chatId, error.clone()),
+            }
+            result
+        }).await.map(|_| ())
     }
 
     /// Returns the observable set of chat ids with active streaming turns.
@@ -1851,7 +1856,7 @@ impl MessageProcessingDelegate {
     #[allow(non_snake_case)]
     pub async fn sendUserMessage(
         &mut self,
-        mut request: SendUserMessageProcessingRequest<'_>,
+        request: SendUserMessageProcessingRequest<'_>,
     ) -> Result<
         SendUserMessageProcessingResult,
         operit_providers::chat::llmprovider::AIService::AiServiceError,
@@ -1865,9 +1870,6 @@ impl MessageProcessingDelegate {
         configuration.validate().map_err(
             operit_providers::chat::llmprovider::AIService::AiServiceError::RequestFailed,
         )?;
-        request.chatProviderIdOverride =
-            Some(configuration.profile.modelBinding.providerId.clone());
-        request.chatModelIdOverride = Some(configuration.profile.modelBinding.modelId.clone());
         let originalMessageText = request.messageText.trim().to_string();
         ChainLogger::verbose_with_level(
             SEND_CHAIN,
@@ -1931,8 +1933,8 @@ impl MessageProcessingDelegate {
                 replyToMessage: request.replyToMessage.clone(),
                 chatId: chatId.clone(),
                 participantId: configuration.profile.id.clone(),
-                chatProviderIdOverride: request.chatProviderIdOverride.clone(),
-                chatModelIdOverride: request.chatModelIdOverride.clone(),
+                chatProviderIdOverride: Some(configuration.profile.modelBinding.providerId.clone()),
+                chatModelIdOverride: Some(configuration.profile.modelBinding.modelId.clone()),
             })
             .await
         {
@@ -2085,6 +2087,14 @@ impl MessageProcessingDelegate {
 
         let participantName = configuration.profile.name.clone();
         let requestMessageContent = finalMessageContent;
+        let summaryContextBase = {
+            let mut source = request.chatHistory.clone();
+            if shouldAddUserMessageToChat && userMessage.displayMode != ChatMessageDisplayMode::HIDDEN_PLACEHOLDER {
+                source.push(userMessage.clone());
+            }
+            let source = AIMessageManager::getMemoryFromMessages(source, &configuration)?;
+            operit_providers::chat::enhance::ConversationContext::sourceFingerprint(&source)
+        };
         let assistantMessageTimestamp = ChatMessageTimestampAllocator::next();
         let mut aiMessage = ChatMessage {
             sender: "ai".to_string(), timestamp: assistantMessageTimestamp,
@@ -2642,6 +2652,25 @@ impl MessageProcessingDelegate {
                             completionMessageProcessingDelegate.lock()
                                 .expect("worker message processing delegate mutex poisoned")
                                 .recordCommittedAssistant(&completionChatId, completionTurnId, &completedMessage, 0);
+                            // Bind the cached provider prefix only to history that actually committed.
+                            match AIMessageManager::committedConversationContextSource(
+                                workerChatHistoryDelegate.getRuntimeChatHistory(completionChatId.clone()),
+                                &completionContextConfiguration, assistantMessageTimestamp, summaryContextBase,
+                            ) {
+                                Ok(Some(source)) => workerService.commitConversationContext(
+                                    &completionChatId, &completionContextConfiguration.profile.id, source,
+                                ),
+                                Ok(None) => {
+                                    AppLogger::v_with_level("ChatSummary",
+                                        "History changed while the response was running; its prepared context is not committed",
+                                        operit_util::AppLogger::VERBOSE_LEVEL_2);
+                                }
+                                Err(error) => {
+                                    AppLogger::e("ChatSummary", &format!(
+                                        "Failed to bind completed conversation context: {error}",
+                                    ));
+                                }
+                            }
                         }
                         drop(workerChatHistoryDelegate);
                         let guidanceContinuationTimestamp = if let Some(inbox) = workerGuidanceInbox.as_ref() {
@@ -2676,8 +2705,6 @@ impl MessageProcessingDelegate {
                                     &executionLease,
                                     &completionContextConfiguration,
                                     completionContextWorkspacePath.clone(),
-                                    completionContextProviderIdOverride.clone(),
-                                    completionContextModelIdOverride.clone(),
                                 )
                                 .await
                             {
@@ -2850,6 +2877,8 @@ impl MessageProcessingDelegate {
                                     history,
                                     completionContextConfiguration.clone(),
                                     completionContextPromptFunctionType.clone(),
+                                    completionContextProviderIdOverride.clone(),
+                                    completionContextModelIdOverride.clone(),
                                     options,
                                     completionChatId.clone(),
                                     completionTurnId,
@@ -3056,6 +3085,8 @@ impl MessageProcessingDelegate {
         history: ChatHistoryDelegate,
         configuration: ChatConfigurationResult,
         promptFunctionType: PromptFunctionType,
+        chatProviderIdOverride: Option<String>,
+        chatModelIdOverride: Option<String>,
         turnOptions: ChatTurnOptions,
         chatId: String,
         turnId: u64,
@@ -3072,8 +3103,8 @@ impl MessageProcessingDelegate {
                     turnId,
                     participantId: Some(configuration.profile.id.clone()),
                     promptFunctionType,
-                    chatProviderIdOverride: Some(configuration.profile.modelBinding.providerId),
-                    chatModelIdOverride: Some(configuration.profile.modelBinding.modelId),
+                    chatProviderIdOverride,
+                    chatModelIdOverride,
                     turnOptions,
                     executionLease,
                 },

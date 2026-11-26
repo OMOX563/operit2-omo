@@ -296,6 +296,29 @@ copy that file into their own source tree, import it locally and declare
 `characterCards.defaultAvatar()` requires `com.operit.character_cards >= 0.2.8`.
 It returns the shared VFS path of the default Operit avatar for dependency UIs.
 
+`characterCards.chat.identity({ chatId })` requires version 0.2.9 and returns
+`{ title, avatarUri }` for a role or role group. Pass `null` to preview the active
+selection, or an existing chat ID to read its persisted binding. It uses the same
+display resolver as chat creation without reading model, speech or memory
+configuration. Model-only mode returns `null`; an unset portrait stays `null`.
+Deleted references and storage errors propagate to the caller.
+
+`characterCards.chat.presentation({ chatId })` requires version 0.2.12 and returns
+`{ kind, identity, participants }`. `kind` is `model`, `card` or `group`;
+`participants` contains every saved member in presentation order, including
+members who have not spoken. Each entry has its actual `id`, `name` and nullable
+`avatarUri`. The same `null`/existing-chat binding rules apply as for `identity`.
+Model-only mode returns a null identity and an empty roster. This read does not
+resolve execution settings or select a group speaker.
+
+`characterCards.chat.groupTurn(request)` requires version 0.2.11. Start with
+`{ action: "start", chatId, requestId, text, attachments }`, then query the same
+`chatId` and `requestId` with `action: "status"` or stop it with `action: "cancel"`.
+The provider reuses the existing group planner and native turn transport. It
+returns completed member replies in speaking order, including names, portraits
+and configured TTS IDs. Non-group chats return `not_group` without submitting
+input. Status and cancellation require the original authenticated caller.
+
 `characterCards.memory.query({ participantId, query, limit, snapshotId })`
 resolves the explicit participant's actual memory binding and reuses the
 plugin's existing query implementation. Results contain complete typed
@@ -379,6 +402,14 @@ or native Rust-engine acceptance test and does not require external credentials.
 Remaining memory/editor entry points use the same real main IPC rather than disabled
 placeholder controls:
 
+- Chat execution retains the first resolved USER.md bytes in memory for each
+  conversation ID, participant and primary memory owner. Later profile writes do
+  not rewrite that conversation's system prefix during the same plugin runtime;
+  new conversations read the current document. Empty profiles are retained too.
+  Restarting the app or reloading the plugin discards these snapshots. Reads
+  without a conversation ID stay current, and disabling user descriptions still
+  suppresses the profile immediately. Role prompts, model choices and permissions
+  continue to resolve from their current records.
 - Global `memoryPreferences` live in the existing v3 metadata transaction. New live
   execution profiles omit USER.md when disabled. Historical re-execution also
   suppresses the runtime profile text, without modifying its saved opaque marker. Disabling automatic updates stops automatic candidate enqueueing
@@ -391,9 +422,8 @@ placeholder controls:
 - Retrieval debugging reuses the production database search and real provider embeddings.
   Draft weights are not saved. Each candidate reports actual lexical/tag/vector/edge
   contributions and its threshold decision; normal retrieval filters the same results.
-- Graph export/import invokes the full owner backup codec, including records, document
-  chunks, relationships, settings and USER.md. Relationship tools read one owner-scoped
-  graph snapshot containing the actual record and link identities and descriptions.
+- Backup export/import includes full records, chunks, relationships, settings and USER.md.
+  Relationship tools query exact IDs or endpoint titles directly in SQLite.
 - Character imports select Operit or Tavern JSON; exports invoke the corresponding
   production serializer. Preview avatars use the existing host-loaded image resources.
   Export dialogs only report success after the real host file operation acknowledges it.
@@ -404,18 +434,46 @@ mutations use the same domain operations as dependency clients. Extraction follo
 Kotlin query budgets, duplicate-title prompt and new-identity merge behavior; the
 scheduler orders candidates by source timestamp before applying its twenty-record cap.
 
+Before retrieval or extraction, the shared memory-job source projection removes
+attachment bodies (including recalled memories and pasted files), workspace
+attachments, legacy memory blocks, media locators, `meta`, `think` and `thinking`
+blocks. Nested internal blocks are removed together, and an unfinished internal
+block suppresses its remaining body. Cleanup runs before retrieval
+length limits and before assembling the MEMORY request; automatic candidates,
+manual updates and history rebuilds use the same projection. The saved conversation
+is retained. A window with no authored user text after cleanup completes without
+retrieval, model calls or profile updates; an orphan assistant source remains invalid.
+
 Kotlin remains the behavior reference, with explicit implementation differences:
 lexical expansion uses bounded Unicode terms and Han unigrams/bigrams rather than
 Jieba; imported document chunks also participate in node recall; vectors use the
-configured HTTP provider and exact database-side dot products over normalized source
-vectors. Source text and its vector occupy one synchronized, versioned row; query
-vectors are ephemeral. SQL applies owner/folder/time scope, scoring, graph expansion,
-snapshot exclusions and result limits before returning records. There is no retained
-TypeScript corpus or query-time construction of historical vectors. HTTP batches
+configured HTTP provider and a derived USearch vector index. Source text and its vector
+occupy one synchronized, versioned row; query vectors are ephemeral. SQLite matches
+text and tags and returns only matching identities and term bitsets. Ranking retains
+metadata and vectors, hydrates only the selected results, and reads relationships only
+for its ten seeds. Full bodies and character postings are never retained in the search
+index. HTTP batches
 use the owner's saved input batch size (20 by default) and at most four concurrent workers.
 The history rebuild window size is also saved per owner (32 by default, range 8–48). Failed jobs stay
 terminal without automatic retry. Merge removes source
 chunks and internal links that would become self-links under this domain's invariant.
+
+Ordinary reads have explicit bounds: `memory.list` and `memory.graph` default to at most
+200 memories, accept `offset`, `after`, `limit`, exact `folderPath`, `ids` and `titles`,
+and return `total`. Graphs include at most 1000 relationships within that page. The CLI
+accepts `item list [offset]` and `graph [offset]`; native browsing filters before reading
+and loads each page from SQLite. Memory attachments attach the displayed page (up to
+200 records). Mutation responses acknowledge the write without returning a full graph.
+The old `listMemories`, `listMemoryLinks` and `readMemoryGraph` repository methods are
+removed. Full owner snapshots are reserved for backup/import operations; classification
+and folder moves advance by record key through bounded batches. Document selectors
+read the requested chunk offset and at most five displayed chunks; wildcard counts
+do not initialize search indexes or hydrate the document corpus.
+
+`node --test --test-name-pattern="50000" tests/management-native.test.mjs` exercises
+real SQLite, production IPC, native paging/filtering, cold/warm search and canvas
+serialization with 50,000 memories and 49,999 relationships. It reports elapsed time
+and process heap use. This desktop fixture does not establish device performance.
 
 The browser/main-IPC suite covers these flows, failed writes, runtime reopening,
 owner isolation and a real local HTTP vector provider. `cargo check -p operit-runtime
