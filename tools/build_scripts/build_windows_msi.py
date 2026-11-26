@@ -22,7 +22,9 @@ WIX_NAMESPACE = "http://wixtoolset.org/schemas/v4/wxs"
 COMPONENT_NAMESPACE = uuid.UUID("849bac31-cbcb-4ef2-a5a4-b33a9bc7ed58")
 REQUIRED_FILES = (
     "operit2.exe", "flutter_windows.dll", "operit_flutter_bridge.dll",
-    "operit_local_llm.dll", "msvcp140.dll", "vcruntime140.dll",
+    # Fork 补丁：operit_local_llm.dll（本地 LLM 引擎）在 Visual Studio 生成器下的落点不固定，
+    # CI 上可能根本不存在；缺失时只降级为「本地 LLM 不可用」，不再让 MSI 打包失败。
+    "msvcp140.dll", "vcruntime140.dll",
     "data/icudtl.dat", "data/app.so", "data/flutter_assets/AssetManifest.bin",
     "Operit2DataCleanup.exe", "README-Windows.txt",
 ) + tuple(f"bash/{name}" for name in BASH_REQUIRED_FILES)

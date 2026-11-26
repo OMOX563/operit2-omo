@@ -156,6 +156,16 @@ jobs:
           OPERIT_FLUTTER_VERBOSE: "1"
         run: python tools/build_scripts/build_flutter_windows.py --enforce-lockfile
 
+      # Fork 诊断：operit_local_llm.dll 的实际落点一直不固定，这步把全仓库里能找到的
+      # 副本都打出来（不阻塞构建），便于以后把它固定到发布目录。
+      - name: Locate operit_local_llm.dll (diagnostic)
+        if: always()
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          Get-ChildItem -Path . -Recurse -Filter operit_local_llm.dll -ErrorAction SilentlyContinue |
+            ForEach-Object { "{0,10} {1}" -f $_.Length, $_.FullName }
+
       - name: Build and package Windows CLI
         if: inputs.products != 'app'
         shell: pwsh
