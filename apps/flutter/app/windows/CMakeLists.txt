@@ -141,6 +141,8 @@ install(FILES "${FLUTTER_LIBRARY}" DESTINATION "${INSTALL_BUNDLE_LIB_DIR}"
   COMPONENT Runtime)
 
 set(OPERIT_FLUTTER_BRIDGE_CRATE "${CMAKE_CURRENT_SOURCE_DIR}/../../native/operit-flutter-bridge")
+# <repo> = apps/flutter/app/windows/../../../../ ；本地推理引擎的构建产物落在 <repo>/target/local-llm。
+set(OPERIT_LLM_REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../../../")
 install(FILES
   "${OPERIT_FLUTTER_BRIDGE_CRATE}/target/$<IF:$<CONFIG:Debug>,debug,release>/operit_flutter_bridge.dll"
   DESTINATION "${INSTALL_BUNDLE_LIB_DIR}"
@@ -166,6 +168,24 @@ install(CODE "
       break()
     endif()
   endforeach()
+  if(NOT _operit_llm_found)
+    # cmake-rs 的 out_dir 在 <repo>/target/local-llm/<hash>，VS 生成器还会再加配置子目录，
+    # 所以这些 candidate 之外还要全局搜一遍。
+    file(GLOB_RECURSE _operit_llm_globbed
+      \"${OPERIT_LLM_REPO_ROOT}/target/local-llm/operit_local_llm.dll\"
+      \"${OPERIT_LLM_REPO_ROOT}/target/local-llm/*/operit_local_llm.dll\"
+      \"${OPERIT_LLM_REPO_ROOT}/target/local-llm/*/*/operit_local_llm.dll\"
+      \"${OPERIT_LLM_REPO_ROOT}/target/local-llm/*/*/*/operit_local_llm.dll\"
+      \"${OPERIT_LLM_REPO_ROOT}/target/local-llm/*/*/*/*/operit_local_llm.dll\")
+    list(LENGTH _operit_llm_globbed _operit_llm_globbed_count)
+    if(_operit_llm_globbed_count GREATER 0)
+      list(GET _operit_llm_globbed 0 _operit_llm_candidate)
+      message(STATUS \"Installing \${_operit_llm_candidate} (globbed)\")
+      file(INSTALL DESTINATION \"${INSTALL_BUNDLE_LIB_DIR}\" TYPE FILE
+        FILES \"\${_operit_llm_candidate}\")
+      set(_operit_llm_found TRUE)
+    endif()
+  endif()
   if(NOT _operit_llm_found)
     message(WARNING \"operit_local_llm.dll not found; local LLM will be unavailable\")
   endif()
