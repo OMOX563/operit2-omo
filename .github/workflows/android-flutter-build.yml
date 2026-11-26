@@ -9,7 +9,7 @@ permissions:
 jobs:
   build-android-runtime:
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 120
 
     defaults:
       run:
@@ -73,7 +73,7 @@ jobs:
   build-android:
     needs: build-android-runtime
     runs-on: ubuntu-24.04
-    timeout-minutes: 180
+    timeout-minutes: 300
     env:
       RUSTFLAGS: -Awarnings
       RUST_TOOLCHAIN_VERSION: 1.95.0
