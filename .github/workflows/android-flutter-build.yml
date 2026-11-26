@@ -257,6 +257,9 @@ jobs:
         run: python3 tools/build_scripts/check_build_environment.py --products app --github-runner
 
       - name: Build and package Android app
+        env:
+          # Fork 补丁：runner 在国内镜像 502 时会让 Gradle 直接失败，CI 上只用官方 maven 仓库。
+          OPERIT_GRADLE_NO_ALIYUN: "1"
         run: |
           version=$(grep -E '^version:[[:space:]]*[0-9]+\.[0-9]+\.[0-9]+\+[0-9]+' apps/flutter/app/pubspec.yaml)
           count=$(printf '%s\n' "$version" | grep -c .)

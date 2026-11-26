@@ -10,10 +10,15 @@ pluginManagement {
 
     includeBuild("$flutterSdkPath/packages/flutter_tools/gradle")
 
+    // Fork 补丁：与 android/build.gradle.kts 一致，CI 上设 OPERIT_GRADLE_NO_ALIYUN=1 跳过国内镜像。
+    val useAliyunMirror = System.getenv("OPERIT_GRADLE_NO_ALIYUN").isNullOrEmpty()
+
     repositories {
-        maven { url = uri("https://maven.aliyun.com/repository/google") }
-        maven { url = uri("https://maven.aliyun.com/repository/gradle-plugin") }
-        maven { url = uri("https://maven.aliyun.com/repository/public") }
+        if (useAliyunMirror) {
+            maven { url = uri("https://maven.aliyun.com/repository/google") }
+            maven { url = uri("https://maven.aliyun.com/repository/gradle-plugin") }
+            maven { url = uri("https://maven.aliyun.com/repository/public") }
+        }
         google()
         mavenCentral()
         gradlePluginPortal()

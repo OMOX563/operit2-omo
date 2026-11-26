@@ -1,19 +1,31 @@
+// Fork 补丁：CI（GitHub runner）在国内镜像 maven.aliyun.com 返回 5xx 时，Gradle 会把该仓库
+// 整条禁用并直接失败，后面的 google()/mavenCentral() 不会再兜底。设 OPERIT_GRADLE_NO_ALIYUN=1
+// 可跳过国内镜像，只用官方仓库；本地构建不设该变量，行为不变。
+val useAliyunMirror = System.getenv("OPERIT_GRADLE_NO_ALIYUN").isNullOrEmpty()
+
 allprojects {
     buildscript {
         repositories {
-            maven { url = uri("https://maven.aliyun.com/repository/google") }
-            maven { url = uri("https://maven.aliyun.com/repository/gradle-plugin") }
-            maven { url = uri("https://maven.aliyun.com/repository/public") }
+            if (useAliyunMirror) {
+                maven { url = uri("https://maven.aliyun.com/repository/google") }
+                maven { url = uri("https://maven.aliyun.com/repository/gradle-plugin") }
+                maven { url = uri("https://maven.aliyun.com/repository/public") }
+            }
             google()
             mavenCentral()
         }
     }
     repositories {
-        maven { url = uri("https://maven.aliyun.com/repository/google") }
-        maven { url = uri("https://maven.aliyun.com/repository/public") }
-        maven { url = uri("https://jitpack.io") }
+        if (useAliyunMirror) {
+            maven { url = uri("https://maven.aliyun.com/repository/google") }
+            maven { url = uri("https://maven.aliyun.com/repository/public") }
+            maven { url = uri("https://jitpack.io") }
+        }
         google()
         mavenCentral()
+        if (!useAliyunMirror) {
+            maven { url = uri("https://jitpack.io") }
+        }
     }
 }
 
