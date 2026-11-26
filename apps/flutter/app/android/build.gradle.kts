@@ -10,6 +10,8 @@ allprojects {
                 maven { url = uri("https://maven.aliyun.com/repository/google") }
                 maven { url = uri("https://maven.aliyun.com/repository/gradle-plugin") }
                 maven { url = uri("https://maven.aliyun.com/repository/public") }
+            } else {
+                maven { url = uri("https://maven-central.storage-download.googleapis.com/maven2") }
             }
             google()
             mavenCentral()
@@ -20,6 +22,8 @@ allprojects {
             maven { url = uri("https://maven.aliyun.com/repository/google") }
             maven { url = uri("https://maven.aliyun.com/repository/public") }
             maven { url = uri("https://jitpack.io") }
+        } else {
+            maven { url = uri("https://maven-central.storage-download.googleapis.com/maven2") }
         }
         google()
         mavenCentral()
