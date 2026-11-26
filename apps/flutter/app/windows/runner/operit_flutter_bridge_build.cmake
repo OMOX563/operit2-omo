@@ -53,9 +53,44 @@ if(NOT OPERIT_CARGO_RESULT EQUAL 0)
   message(FATAL_ERROR "operit flutter bridge ${OPERIT_CARGO_LABEL} build failed: ${OPERIT_CARGO_RESULT}")
 endif()
 get_filename_component(OPERIT_CARGO_OUTPUT_DIRECTORY "${OPERIT_CARGO_DLL}" DIRECTORY)
-foreach(OPERIT_RUNTIME_DLL IN ITEMS
-    "${OPERIT_CARGO_DLL}"
-    "${OPERIT_CARGO_OUTPUT_DIRECTORY}/operit_local_llm.dll")
+
+# Fork 补丁：CMake 的 RUNTIME_OUTPUT_DIRECTORY 在 Visual Studio 生成器下会被追加配置名，
+# 导致 operit_local_llm.dll 落在 target/release/Release/ 而不是 target/release/，原来的
+# 固定路径 copy 就直接失败（MSB8066）。这里改成先按候选路径找，再递归兜底。
+set(OPERIT_LOCAL_LLM_DLL "")
+foreach(OPERIT_CANDIDATE
+    "${OPERIT_CARGO_OUTPUT_DIRECTORY}/operit_local_llm.dll"
+    "${OPERIT_CARGO_OUTPUT_DIRECTORY}/Release/operit_local_llm.dll"
+    "${OPERIT_CARGO_OUTPUT_DIRECTORY}/RelWithDebInfo/operit_local_llm.dll"
+    "${OPERIT_FLUTTER_BRIDGE_CRATE}/target/local-llm/operit_local_llm.dll")
+  if(EXISTS "${OPERIT_CANDIDATE}")
+    set(OPERIT_LOCAL_LLM_DLL "${OPERIT_CANDIDATE}")
+    break()
+  endif()
+endforeach()
+if(NOT OPERIT_LOCAL_LLM_DLL)
+  file(GLOB_RECURSE OPERIT_LOCAL_LLM_SEARCH
+    "${OPERIT_FLUTTER_BRIDGE_CRATE}/target/release/operit_local_llm.dll"
+    "${OPERIT_REPO_ROOT}/target/local-llm/operit_local_llm.dll"
+    "${OPERIT_REPO_ROOT}/target/local-llm/*/operit_local_llm.dll"
+    "${OPERIT_REPO_ROOT}/target/local-llm/*/*/operit_local_llm.dll"
+    "${OPERIT_REPO_ROOT}/target/local-llm/*/*/*/operit_local_llm.dll")
+  list(LENGTH OPERIT_LOCAL_LLM_SEARCH OPERIT_LOCAL_LLM_COUNT)
+  if(OPERIT_LOCAL_LLM_COUNT GREATER 0)
+    list(GET OPERIT_LOCAL_LLM_SEARCH 0 OPERIT_LOCAL_LLM_DLL)
+  endif()
+endif()
+if(NOT OPERIT_LOCAL_LLM_DLL)
+  message(WARNING "operit_local_llm.dll not found; local LLM will be unavailable in this build")
+  file(GLOB_RECURSE OPERIT_RELEASE_DLLS "${OPERIT_CARGO_OUTPUT_DIRECTORY}/*.dll")
+  message(STATUS "DLLs present under ${OPERIT_CARGO_OUTPUT_DIRECTORY}: ${OPERIT_RELEASE_DLLS}")
+endif()
+
+set(OPERIT_RUNTIME_DLLS "${OPERIT_CARGO_DLL}")
+if(OPERIT_LOCAL_LLM_DLL)
+  list(APPEND OPERIT_RUNTIME_DLLS "${OPERIT_LOCAL_LLM_DLL}")
+endif()
+foreach(OPERIT_RUNTIME_DLL IN LISTS OPERIT_RUNTIME_DLLS)
   execute_process(
     COMMAND "${CMAKE_COMMAND}" -E copy_if_different
       "${OPERIT_RUNTIME_DLL}" "${OPERIT_OUTPUT_DIRECTORY}/"
