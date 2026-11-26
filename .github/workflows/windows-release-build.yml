@@ -152,6 +152,8 @@ jobs:
       - name: Build and package Windows app
         if: inputs.products != 'cli'
         shell: pwsh
+        env:
+          OPERIT_FLUTTER_VERBOSE: "1"
         run: python tools/build_scripts/build_flutter_windows.py --enforce-lockfile
 
       - name: Build and package Windows CLI

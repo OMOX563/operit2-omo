@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import os
 import sys
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -50,6 +51,10 @@ def main() -> int:
     prepare_plugin_assets()
     flutter_pub_get(enforce_lockfile=args.enforce_lockfile)
     command = [flutter_command(), "build", "windows", "--release", "--no-pub"]
+    # Fork 补丁：MSBuild 只回传 "CUSTOMBUILD : warning :" 行，真正的 cargo/CMake 错误会被吞掉，
+    # 设 OPERIT_FLUTTER_VERBOSE=1 打开 flutter -v 以拿到完整子进程输出。
+    if os.environ.get("OPERIT_FLUTTER_VERBOSE"):
+        command.append("-v")
     if args.build_name:
         command.extend(["--build-name", args.build_name])
     if args.build_number:
