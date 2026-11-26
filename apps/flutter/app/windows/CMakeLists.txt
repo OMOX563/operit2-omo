@@ -143,9 +143,33 @@ install(FILES "${FLUTTER_LIBRARY}" DESTINATION "${INSTALL_BUNDLE_LIB_DIR}"
 set(OPERIT_FLUTTER_BRIDGE_CRATE "${CMAKE_CURRENT_SOURCE_DIR}/../../native/operit-flutter-bridge")
 install(FILES
   "${OPERIT_FLUTTER_BRIDGE_CRATE}/target/$<IF:$<CONFIG:Debug>,debug,release>/operit_flutter_bridge.dll"
-  "${OPERIT_FLUTTER_BRIDGE_CRATE}/target/$<IF:$<CONFIG:Debug>,debug,release>/operit_local_llm.dll"
   DESTINATION "${INSTALL_BUNDLE_LIB_DIR}"
   COMPONENT Runtime)
+
+# Fork 补丁：本地推理 DLL 的位置受 CMake 生成器影响（VS 生成器会给 RUNTIME_OUTPUT_DIRECTORY
+# 追加配置名），固定的 target/<profile>/operit_local_llm.dll 在 runner 上可能不存在，
+# 导致 cmake --install 直接失败。改成安装阶段按候选路径查找，找不到只降级为警告
+# （本地 LLM 不可用，但 GUI 仍可构建和打包）。
+install(CODE "
+  set(_operit_llm_candidates
+    \"${OPERIT_FLUTTER_BRIDGE_CRATE}/target/release/operit_local_llm.dll\"
+    \"${OPERIT_FLUTTER_BRIDGE_CRATE}/target/release/Release/operit_local_llm.dll\"
+    \"${OPERIT_FLUTTER_BRIDGE_CRATE}/target/debug/operit_local_llm.dll\"
+    \"${OPERIT_FLUTTER_BRIDGE_CRATE}/target/debug/Debug/operit_local_llm.dll\")
+  set(_operit_llm_found FALSE)
+  foreach(_operit_llm_candidate IN LISTS _operit_llm_candidates)
+    if(EXISTS \"\${_operit_llm_candidate}\")
+      message(STATUS \"Installing \${_operit_llm_candidate}\")
+      file(INSTALL DESTINATION \"${INSTALL_BUNDLE_LIB_DIR}\" TYPE FILE
+        FILES \"\${_operit_llm_candidate}\")
+      set(_operit_llm_found TRUE)
+      break()
+    endif()
+  endforeach()
+  if(NOT _operit_llm_found)
+    message(WARNING \"operit_local_llm.dll not found; local LLM will be unavailable\")
+  endif()
+")
 
 if(PLUGIN_BUNDLED_LIBRARIES)
   install(FILES "${PLUGIN_BUNDLED_LIBRARIES}"
